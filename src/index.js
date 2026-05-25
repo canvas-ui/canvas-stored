@@ -205,6 +205,8 @@ export default class Stored extends EventEmitter {
         const results = [];
         for (const backend of backends) {
             const files = await backend.scan({ algorithms: this.#config.checksums });
+            const presentKeys = new Set(files.map(file => file.key));
+
             for (const file of files) {
                 if (file.checksums) {
                     const id = formatId(file.checksums, this.#config.primaryChecksum);
@@ -224,6 +226,7 @@ export default class Stored extends EventEmitter {
                     });
                 }
             }
+            this.#removeMissingLocations(backend.name, presentKeys);
             results.push(...files);
         }
         return results;
@@ -327,6 +330,23 @@ export default class Stored extends EventEmitter {
             container,
             path: key,
         };
+    }
+
+    #removeMissingLocations(backendName, presentKeys) {
+        for (const [id, meta] of this.#index.entries()) {
+            const nextLocations = (meta.locations || []).filter(location =>
+                location.backend !== backendName || presentKeys.has(location.key)
+            );
+
+            if (nextLocations.length === (meta.locations || []).length) continue;
+
+            if (nextLocations.length === 0) {
+                this.#index.delete(id);
+                continue;
+            }
+
+            this.#index.put(id, { ...meta, locations: nextLocations });
+        }
     }
 
     #handleFileEvent(event, data) {

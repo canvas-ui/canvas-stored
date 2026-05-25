@@ -32,6 +32,14 @@ export default class Index {
             created: existing?.created || Date.now(),
         };
 
+        const nextPathKeys = new Set((meta.locations || []).map(loc => `${loc.backend}:${loc.key}`));
+        for (const loc of existing?.locations || []) {
+            const pathKey = `${loc.backend}:${loc.key}`;
+            if (!nextPathKeys.has(pathKey)) {
+                this.#pathDb.removeSync(pathKey);
+            }
+        }
+
         this.#db.putSync(id, meta);
 
         // Index by path for each location
