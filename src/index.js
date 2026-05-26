@@ -1,4 +1,4 @@
-import { EventEmitter } from 'events';
+import EventEmitter2 from 'eventemitter2';
 import path from 'path';
 import Debug from 'debug';
 import Cache from './cache/index.js';
@@ -11,7 +11,7 @@ import { detectMimeType } from './utils/mime.js';
 
 const debug = Debug('stored');
 
-export default class Stored extends EventEmitter {
+export default class Stored extends EventEmitter2 {
     #cache;
     #backends;
     #index;
@@ -19,7 +19,8 @@ export default class Stored extends EventEmitter {
     #syncQueue;
 
     constructor(config = {}) {
-        super();
+        // Wildcards (':' delimiter) let consumers bind `object:*` across backends.
+        super({ wildcard: true, delimiter: ':', maxListeners: 100, verboseMemoryLeak: false });
         this.#config = {
             defaultBackends: config.defaultBackends || [],
             checksums: config.checksums || ['sha256'],
@@ -60,6 +61,12 @@ export default class Stored extends EventEmitter {
         backend.on('file:add', e => this.#handleFileEvent('file:add', e));
         backend.on('file:change', e => this.#handleFileEvent('file:change', e));
         backend.on('file:unlink', e => this.#handleFileEvent('file:unlink', e));
+        // Generic change events from non-file backends (e.g. imap message:add) —
+        // forwarded as-is for the workspace indexer; they carry {backend, kind, key, ...}.
+        backend.on('object:add', e => this.emit('object:add', e));
+        backend.on('object:change', e => this.emit('object:change', e));
+        backend.on('object:unlink', e => this.emit('object:unlink', e));
+        backend.on('backend:state', e => this.emit('backend:state', e));
         backend.on('scan:start', e => this.emit('scan:start', e));
         backend.on('scan:complete', e => this.emit('scan:complete', e));
         backend.on('error', e => this.emit('error', e));
@@ -393,6 +400,13 @@ export default class Stored extends EventEmitter {
         }
     }
 
+    // Emit a file event under both its typed name (`file:<suffix>`) and the
+    // generic `object:<suffix>` (kind:'file') so consumers can bind either.
+    #emitObject(suffix, payload) {
+        this.emit(`file:${suffix}`, payload);
+        this.emit(`object:${suffix}`, { kind: 'file', ...payload });
+    }
+
     #handleFileEvent(event, data) {
         const pathKey = `${data.backend}:${data.key}`;
         const location = this.#buildLocation(data.backend, data.key, true);
@@ -412,7 +426,7 @@ export default class Stored extends EventEmitter {
                 mimeType: data.mimeType,
                 locations,
             });
-            this.emit(event, { ...data, id, locations });
+            this.#emitObject('add', { ...data, id, locations });
 
         } else if (event === 'file:change' && data.checksums) {
             const oldMeta = this.#index.get(pathKey);
@@ -425,7 +439,7 @@ export default class Stored extends EventEmitter {
                 } else {
                     this.#index.put(oldMeta.id, oldMeta);
                 }
-                this.emit('file:unlink', { ...data, id: oldMeta.id, checksums: oldMeta.checksums });
+                this.#emitObject('unlink', { ...data, id: oldMeta.id, checksums: oldMeta.checksums });
             }
 
             const newId = formatId(data.checksums, this.#config.primaryChecksum);
@@ -441,7 +455,7 @@ export default class Stored extends EventEmitter {
                 mimeType: data.mimeType,
                 locations,
             });
-            this.emit('file:add', { ...data, id: newId, locations });
+            this.#emitObject('add', { ...data, id: newId, locations });
 
         } else if (event === 'file:unlink') {
             const meta = this.#index.get(pathKey);
@@ -454,9 +468,9 @@ export default class Stored extends EventEmitter {
                 } else {
                     this.#index.put(meta.id, meta);
                 }
-                this.emit(event, { ...data, id: meta.id, checksums: meta.checksums, locations: meta.locations });
+                this.#emitObject('unlink', { ...data, id: meta.id, checksums: meta.checksums, locations: meta.locations });
             } else {
-                this.emit(event, data);
+                this.#emitObject('unlink', data);
             }
         }
     }

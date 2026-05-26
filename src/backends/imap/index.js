@@ -4,29 +4,42 @@ import StorageBackend from '../StorageBackend.js';
 
 const debug = Debug('stored:backend:imap');
 
+const DEFAULT_FOLDER = 'INBOX';
+const DEFAULT_POLL_INTERVAL = 60000;
+const DEFAULT_INITIAL_SYNC_DAYS = 180;
+const FETCH_BATCH_SIZE = 200;
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
 /**
- * IMAP storage backend.
+ * IMAP storage backend — owns the IMAP protocol for one account/folder.
  *
- * Addresses messages by `<folder>;UID=<n>` (RFC 5092 path part) — the `key`
- * portion of a `stored://imap:<account>/<folder>;UID=<n>` URL (or the path of
- * the equivalent `imap://<account>/<folder>;UID=<n>` provenance URL).
+ * Addresses messages by `<folder>;UID=<n>` (RFC 5092). Emits `object:add` per
+ * fetched message (kind:'message') so the workspace indexer can build documents;
+ * change-detection is `scan()` (incremental search by UID) driven by `watch()`
+ * (poll loop). Read + delete (EXPUNGE) supported; append (write) is not.
  *
- * Phase 1 implements `get` (fetch raw RFC 5322 message) and `delete`
- * (mark `\Deleted` + EXPUNGE). `list`/`watch`/`scan` (ingest) still live in the
- * canvas-server ImapService and move here in a later phase.
- *
- * config: { user, password, host, port=993, tls=true, allowSelfSigned=false, account }
+ * config: { host, port=993, tls=true, allowSelfSigned=false, user, password,
+ *           folder='INBOX', account?, pollInterval?, initialSyncDays?, lastUid? }
  */
 export default class ImapBackend extends StorageBackend {
+    #pollTimer = null;
+    #lastUid = 0;
+    #syncing = false;
+
     constructor(name, config = {}) {
         super(name, config);
         this.type = 'remote';
-        debug(`ImapBackend "${name}" initialized (account=${config.account ?? config.user ?? '?'})`);
+        this.#lastUid = Math.max(0, Number(config.lastUid || 0));
+        debug(`ImapBackend "${name}" initialized (account=${config.account ?? config.user ?? '?'}, folder=${this.#folder})`);
     }
 
-    // Read messages + remove them; appending (write) is not supported here.
     get capabilities() { return { read: true, write: false, delete: true }; }
+    get watching() { return !!this.#pollTimer; }
+    get lastUid() { return this.#lastUid; }
+    get #folder() { return this.config.folder || DEFAULT_FOLDER; }
+    get #account() { return this.config.account || this.config.user; }
 
+    // ── connection ────────────────────────────────────────────────────────────
     #options() {
         const c = this.config;
         return {
@@ -41,14 +54,6 @@ export default class ImapBackend extends StorageBackend {
         };
     }
 
-    // `<folder>;UID=<n>` → { folder, uid }. Folder segments are URL-decoded.
-    #parseKey(key) {
-        const m = String(key || '').match(/^(.*);UID=(\d+)$/i);
-        if (!m) throw new Error(`imap key must be "<folder>;UID=<n>", got: ${key}`);
-        const folder = m[1].split('/').map((s) => decodeURIComponent(s)).join('/');
-        return { folder, uid: Number(m[2]) };
-    }
-
     // Connect, run `fn(imap)`, always end the connection.
     #withConnection(fn) {
         return new Promise((resolve, reject) => {
@@ -61,10 +66,7 @@ export default class ImapBackend extends StorageBackend {
                 err ? reject(err) : resolve(val);
             };
             imap.once('ready', () => {
-                Promise.resolve()
-                    .then(() => fn(imap))
-                    .then((v) => done(null, v))
-                    .catch((e) => done(e));
+                Promise.resolve().then(() => fn(imap, done)).catch((e) => done(e));
             });
             imap.once('error', (e) => done(e));
             imap.connect();
@@ -77,12 +79,24 @@ export default class ImapBackend extends StorageBackend {
         });
     }
 
+    // ── key parsing ─────────────────────────────────────────────────────────
+    #parseKey(key) {
+        const m = String(key || '').match(/^(.*);UID=(\d+)$/i);
+        if (!m) throw new Error(`imap key must be "<folder>;UID=<n>", got: ${key}`);
+        const folder = m[1].split('/').map((s) => decodeURIComponent(s)).join('/');
+        return { folder, uid: Number(m[2]) };
+    }
+
+    #encodeFolder(value) {
+        return String(value || DEFAULT_FOLDER).split('/').map(encodeURIComponent).join('/') || DEFAULT_FOLDER;
+    }
+
+    // ── CRUD ──────────────────────────────────────────────────────────────────
     async get(key, options = {}) {
         const { folder, uid } = this.#parseKey(key);
         return this.#withConnection((imap) => new Promise((resolve, reject) => {
             this.#openBox(imap, folder, true).then(() => {
-                // Top-level fetch is UID-based in node-imap.
-                const f = imap.fetch(uid, { bodies: '' });
+                const f = imap.fetch(uid, { bodies: '' }); // top-level fetch is UID-based
                 let found = false;
                 f.on('message', (msg) => {
                     const chunks = [];
@@ -92,8 +106,7 @@ export default class ImapBackend extends StorageBackend {
                 f.once('error', reject);
                 f.once('end', () => { if (!found) resolve(null); });
             }).catch(reject);
-            // `options.stream` not supported for IMAP; buffer is returned regardless.
-            void options;
+            void options; // streaming not supported for IMAP; buffer returned
         }));
     }
 
@@ -111,5 +124,155 @@ export default class ImapBackend extends StorageBackend {
     async stat(key) {
         const data = await this.get(key);
         return data ? { key, size: data.length, modified: null, created: null } : null;
+    }
+
+    // ── connectivity / discovery ────────────────────────────────────────────
+    async verify() {
+        return this.#withConnection((imap) => this.#openBox(imap, this.#folder, true)
+            .then((box) => ({ folder: box?.name || this.#folder, messageCount: box?.messages?.total || 0 })));
+    }
+
+    async listFolders() {
+        return this.#withConnection((imap) => new Promise((resolve, reject) => {
+            imap.getBoxes((err, boxes) => (err ? reject(err) : resolve(this.#flattenBoxes(boxes))));
+        }));
+    }
+
+    #flattenBoxes(boxes = {}, parentPath = '', parentDelimiter = '/') {
+        const folders = [];
+        for (const [name, box] of Object.entries(boxes || {})) {
+            const delimiter = box?.delimiter || parentDelimiter || '/';
+            const folderPath = parentPath ? `${parentPath}${delimiter}${name}` : name;
+            const attribs = (box?.attribs || []).map((a) => String(a).toLowerCase());
+            folders.push({
+                name, path: folderPath, delimiter,
+                selectable: !attribs.includes('\\noselect'),
+                attributes: box?.attribs || [],
+            });
+            if (box?.children) folders.push(...this.#flattenBoxes(box.children, folderPath, delimiter));
+        }
+        return folders.sort((a, b) => a.path.localeCompare(b.path));
+    }
+
+    // ── search / fetch helpers ────────────────────────────────────────────────
+    #formatSearchDate(date) {
+        return `${MONTHS[date.getMonth()]} ${date.getDate()}, ${date.getFullYear()}`;
+    }
+
+    #searchCriteria() {
+        if (this.#lastUid > 0) return [['UID', `${this.#lastUid + 1}:*`]];
+        const days = Number(this.config.initialSyncDays ?? DEFAULT_INITIAL_SYNC_DAYS);
+        if (days > 0) {
+            const since = new Date();
+            since.setDate(since.getDate() - days);
+            return [['SINCE', this.#formatSearchDate(since)]];
+        }
+        return ['ALL'];
+    }
+
+    #fetchBatches(uids = [], batchSize = FETCH_BATCH_SIZE) {
+        const values = uids.map(Number).filter((v) => Number.isInteger(v) && v > 0).sort((a, b) => a - b);
+        const batches = [];
+        for (let i = 0; i < values.length; i += batchSize) {
+            batches.push(this.#rangeOf(values.slice(i, i + batchSize)));
+        }
+        return batches.filter(Boolean);
+    }
+
+    #rangeOf(values = []) {
+        if (!values.length) return '';
+        const ranges = [];
+        let start = values[0], end = values[0];
+        for (let i = 1; i < values.length; i++) {
+            if (values[i] === end + 1) { end = values[i]; continue; }
+            ranges.push(start === end ? `${start}` : `${start}:${end}`);
+            start = end = values[i];
+        }
+        ranges.push(start === end ? `${start}` : `${start}:${end}`);
+        return ranges.join(',');
+    }
+
+    #fetchBatch(imap, source) {
+        return new Promise((resolve, reject) => {
+            const fetch = imap.fetch(source, { bodies: '' });
+            const pending = [];
+            fetch.on('message', (msg, seqno) => {
+                const chunks = [];
+                let attrs = {};
+                let resolveMsg;
+                pending.push(new Promise((r) => { resolveMsg = r; }));
+                msg.on('body', (stream) => stream.on('data', (c) => chunks.push(Buffer.from(c))));
+                msg.once('attributes', (a) => { attrs = a || {}; });
+                msg.once('end', () => {
+                    const uid = Number(attrs.uid) || 0;
+                    if (uid > this.#lastUid) this.#lastUid = uid;
+                    const folderKey = this.#encodeFolder(this.#folder);
+                    // Generic change event consumed by the workspace indexer.
+                    this.emit('object:add', {
+                        backend: this.name,
+                        kind: 'message',
+                        key: `${folderKey};UID=${uid}`,
+                        raw: Buffer.concat(chunks),
+                        uid,
+                        seqno,
+                        flags: attrs.flags || [],
+                        folder: this.#folder,
+                        account: this.#account,
+                    });
+                    resolveMsg();
+                });
+            });
+            fetch.once('error', reject);
+            fetch.once('end', () => Promise.all(pending).then(() => resolve()).catch(reject));
+        });
+    }
+
+    /**
+     * Incremental sync: search since last UID (or initialSyncDays / ALL), fetch
+     * in batches, emit `object:add` per message. Returns { inserted, lastUid }.
+     */
+    async scan(options = {}) {
+        if (typeof options.lastUid === 'number') this.#lastUid = Math.max(this.#lastUid, options.lastUid);
+        return this.#withConnection((imap) => new Promise((resolve, reject) => {
+            this.#openBox(imap, this.#folder, true).then(() => {
+                imap.search(this.#searchCriteria(), (err, results) => {
+                    if (err) return reject(err);
+                    if (!results || results.length === 0) return resolve({ inserted: 0, lastUid: this.#lastUid });
+                    const before = this.#lastUid;
+                    void before;
+                    const batches = this.#fetchBatches(results);
+                    (async () => {
+                        try {
+                            for (const range of batches) await this.#fetchBatch(imap, range);
+                            this.emit('backend:state', { backend: this.name, lastUid: this.#lastUid });
+                            resolve({ inserted: results.length, lastUid: this.#lastUid });
+                        } catch (e) { reject(e); }
+                    })();
+                });
+            }).catch(reject);
+        }));
+    }
+
+    /**
+     * Start polling (watchd-style change detection). Each tick runs an
+     * incremental scan; messages surface as `object:add` events.
+     */
+    async watch() {
+        if (this.#pollTimer) return true;
+        const interval = Number(this.config.pollInterval || DEFAULT_POLL_INTERVAL);
+        const tick = async () => {
+            if (this.#syncing) return;
+            this.#syncing = true;
+            try { await this.scan(); }
+            catch (e) { this.emit('error', e); }
+            finally { this.#syncing = false; }
+        };
+        this.#pollTimer = setInterval(tick, interval);
+        debug(`Polling ${this.name} every ${interval}ms`);
+        return true;
+    }
+
+    async stop() {
+        if (this.#pollTimer) { clearInterval(this.#pollTimer); this.#pollTimer = null; debug(`Stopped polling ${this.name}`); }
     }
 }
