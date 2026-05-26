@@ -72,6 +72,28 @@ export default class Stored extends EventEmitter {
     listBackends() { return this.#backends.list(); }
     getBackend(name) { return this.#backends.get(name); }
 
+    /**
+     * Fetch a blob directly by its canonical `stored://<backend>/<key>` URL,
+     * bypassing the content index. The backend name may itself contain colons
+     * (e.g. `fs:data:email`), so we split on the first `/` after the scheme.
+     * Returns the backend's `get` result (Buffer, or stream with {stream:true}),
+     * or null if the URL is malformed or the backend is unknown.
+     */
+    async getByUrl(url, options = {}) {
+        const prefix = 'stored://';
+        if (typeof url !== 'string' || !url.startsWith(prefix)) {
+            throw new Error(`getByUrl expects a stored:// URL, got: ${url}`);
+        }
+        const rest = url.slice(prefix.length);
+        const slash = rest.indexOf('/');
+        if (slash < 0) return null;
+        const backendName = rest.slice(0, slash);
+        const key = rest.slice(slash + 1);
+        const backend = this.#backends.get(backendName);
+        if (!backend) return null;
+        return backend.get(key, options);
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Core API — cache-first writes, cache-first reads
     // ─────────────────────────────────────────────────────────────────────────
