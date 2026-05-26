@@ -94,6 +94,28 @@ export default class Stored extends EventEmitter {
         return backend.get(key, options);
     }
 
+    /**
+     * Delete the bytes behind a `stored://<backend>/<key>` URL.
+     * Returns { deleted:boolean, reason?:string }. Does not touch the document
+     * index (synapsd owns that) — callers trim `locations[]` themselves.
+     */
+    async deleteByUrl(url) {
+        const prefix = 'stored://';
+        if (typeof url !== 'string' || !url.startsWith(prefix)) {
+            throw new Error(`deleteByUrl expects a stored:// URL, got: ${url}`);
+        }
+        const rest = url.slice(prefix.length);
+        const slash = rest.indexOf('/');
+        if (slash < 0) return { deleted: false, reason: 'malformed-url' };
+        const backendName = rest.slice(0, slash);
+        const key = rest.slice(slash + 1);
+        const backend = this.#backends.get(backendName);
+        if (!backend) return { deleted: false, reason: 'unknown-backend' };
+        if (!backend.canDelete) return { deleted: false, reason: 'read-only-backend' };
+        const ok = await backend.delete(key);
+        return { deleted: !!ok };
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Core API — cache-first writes, cache-first reads
     // ─────────────────────────────────────────────────────────────────────────
