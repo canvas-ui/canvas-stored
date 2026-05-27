@@ -5,7 +5,7 @@ import Cache from './cache/index.js';
 import BackendManager from './backends/BackendManager.js';
 import Index from './index/index.js';
 import SyncQueue from './sync/SyncQueue.js';
-import { isBuffer, isFile, isStream } from './utils/common.js';
+import { isBuffer, isFile, isStream, resolveStoredPaths } from './utils/common.js';
 import { checksumBuffer, checksumFile, formatId } from './utils/checksum.js';
 import { detectMimeType } from './utils/mime.js';
 
@@ -16,11 +16,13 @@ export default class Stored extends EventEmitter2 {
     #backends;
     #index;
     #config;
+    #paths;
     #syncQueue;
 
     constructor(config = {}) {
         // Wildcards (':' delimiter) let consumers bind `object:*` across backends.
         super({ wildcard: true, delimiter: ':', maxListeners: 100, verboseMemoryLeak: false });
+        this.#paths = resolveStoredPaths(config);
         this.#config = {
             defaultBackends: config.defaultBackends || [],
             checksums: config.checksums || ['sha256'],
@@ -28,12 +30,20 @@ export default class Stored extends EventEmitter2 {
             ...config,
         };
 
-        // Cache is mandatory — derive path from index path if not provided
-        const cachePath = config.cache?.path || (config.index?.path ? config.index.path + '-cache' : './.stored-cache');
-        this.#cache = new Cache({ path: cachePath, algorithms: config.checksums || ['sha256'] });
-
+        this.#cache = new Cache({ path: this.#paths.cache, algorithms: this.#config.checksums });
         this.#backends = new BackendManager();
-        this.#index = new Index(config.index?.path);
+        this.#index = new Index(this.#paths.index);
+
+        if (config.data?.backend) {
+            const { backend: name, watch, ignored, algorithms } = config.data;
+            this.addBackend(name, {
+                driver: 'file',
+                root: this.#paths.data,
+                watch: watch ?? false,
+                ignored,
+                algorithms,
+            });
+        }
 
         // Background sync queue for remote backends (worker spawned lazily)
         this.#syncQueue = new SyncQueue();
@@ -47,6 +57,9 @@ export default class Stored extends EventEmitter2 {
     // Getters
     // ─────────────────────────────────────────────────────────────────────────
 
+    get root() { return this.#paths.root; }
+    get paths() { return { ...this.#paths }; }
+    get dataPath() { return this.#paths.data; }
     get cache() { return this.#cache; }
     get index() { return this.#index; }
     get backends() { return this.#backends; }

@@ -10,7 +10,7 @@ export default class Index {
     #db;
     #pathDb;
 
-    constructor(path = './.stored-index') {
+    constructor(path = './.stored/index') {
         this.#db = open({ path, name: 'metadata', compression: true });
         this.#pathDb = this.#db.openDB('paths');
         debug(`Index opened at ${path}`);

@@ -6,7 +6,7 @@ import { Readable } from 'stream';
 import Stored from '../src/index.js';
 
 const TEST_DIR = './test-fixtures';
-const INDEX_DIR = './test-index';
+const STORED_ROOT = './test-stored';
 
 describe('Stored', async () => {
     let stored;
@@ -14,7 +14,7 @@ describe('Stored', async () => {
     before(async () => {
         await fs.ensureDir(TEST_DIR);
         stored = new Stored({
-            index: { path: INDEX_DIR },
+            root: STORED_ROOT,
             checksums: ['sha256', 'md5'],
         });
     });
@@ -22,7 +22,7 @@ describe('Stored', async () => {
     after(async () => {
         await stored.stop();
         await fs.remove(TEST_DIR);
-        await fs.remove(INDEX_DIR);
+        await fs.remove(STORED_ROOT);
     });
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -281,7 +281,7 @@ describe('Stored', async () => {
 
             // Close and reopen
             await stored.stop();
-            stored = new Stored({ index: { path: INDEX_DIR }, checksums: ['sha256', 'md5'] });
+            stored = new Stored({ root: STORED_ROOT, checksums: ['sha256', 'md5'] });
             stored.addBackend('fs:test', { driver: 'file', root: TEST_DIR });
 
             const persisted = stored.stat(id);
