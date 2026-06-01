@@ -34,6 +34,9 @@ export default class ImapBackend extends StorageBackend {
     }
 
     get capabilities() { return { read: true, write: false, delete: true }; }
+
+    // imap://<account>/<folder>;UID=<n> — matches the provenance grammar.
+    nativeUrl(key) { return `imap://${this.#account}/${key}`; }
     get watching() { return !!this.#pollTimer; }
     get lastUid() { return this.#lastUid; }
     get #folder() { return this.config.folder || DEFAULT_FOLDER; }

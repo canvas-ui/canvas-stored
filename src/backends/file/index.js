@@ -1,5 +1,6 @@
 import fs from 'fs-extra';
 import path from 'path';
+import { pathToFileURL } from 'url';
 import chokidar from 'chokidar';
 import Debug from 'debug';
 import StorageBackend from '../StorageBackend.js';
@@ -7,6 +8,12 @@ import { checksumFile } from '../../utils/checksum.js';
 import { detectMimeType } from '../../utils/mime.js';
 
 const debug = Debug('stored:backend:file');
+
+// Per-backend staging dir for streaming puts. Lives inside the backend root so
+// temp files share a filesystem with their final destination (cheap rename /
+// hardlink), and is always excluded from the watcher.
+const TMP_DIR = '.stored-tmp';
+const TMP_IGNORE = /(^|[/\\])\.stored-tmp([/\\]|$)/;
 
 export default class FileBackend extends StorageBackend {
     #root;
@@ -28,7 +35,12 @@ export default class FileBackend extends StorageBackend {
     }
 
     get root() { return this.#root; }
+    get tempDir() { return path.join(this.#root, TMP_DIR); }
     get watching() { return !!this.#watcher; }
+
+    // Truthful server-side location. Consumers decide whether to surface a local
+    // path to clients (it leaks the server fs layout); stored:// is the address.
+    nativeUrl(key) { return pathToFileURL(this.#resolvePath(key)).href; }
 
     // ─────────────────────────────────────────────────────────────────────────
     // CRUD Operations
@@ -42,6 +54,24 @@ export default class FileBackend extends StorageBackend {
         await fs.writeFile(filePath, data);
         const stats = await fs.stat(filePath);
         debug(`PUT ${key} (${stats.size} bytes)`);
+        return { key, size: stats.size };
+    }
+
+    // Place an already-written file (e.g. a streamed temp) at `key`. Hardlinks
+    // when on the same filesystem (zero copy, shared inode), falling back to a
+    // byte copy across filesystems. Used by the streaming put path.
+    async commit(key, srcPath) {
+        const dest = this.#resolvePath(key);
+        await fs.ensureDir(path.dirname(dest));
+        await fs.remove(dest);
+        try {
+            await fs.link(srcPath, dest);
+        } catch (err) {
+            if (err.code === 'EXDEV') await fs.copyFile(srcPath, dest);
+            else throw err;
+        }
+        const stats = await fs.stat(dest);
+        debug(`COMMIT ${key} (${stats.size} bytes)`);
         return { key, size: stats.size };
     }
 
@@ -95,7 +125,7 @@ export default class FileBackend extends StorageBackend {
             ignoreInitial: true,
             awaitWriteFinish: { stabilityThreshold: 200, pollInterval: 50 },
         };
-        if (this.#ignored) watchOpts.ignored = this.#ignored;
+        watchOpts.ignored = this.#ignored ? [TMP_IGNORE, this.#ignored] : [TMP_IGNORE];
 
         this.#watcher = chokidar.watch(this.#root, watchOpts);
 
@@ -109,7 +139,7 @@ export default class FileBackend extends StorageBackend {
                     detectMimeType(p).catch(() => null),
                     fs.stat(p).catch(() => null),
                 ]);
-                this.emit('file:add', { backend: this.name, key, path: p, checksums, mimeType, size: stats?.size });
+                this.emit('file:add', { backend: this.name, key, path: p, checksums, mimeType, size: stats?.size, modified: stats?.mtimeMs });
             })
             .on('change', async p => {
                 const key = toKey(p);
@@ -118,7 +148,7 @@ export default class FileBackend extends StorageBackend {
                     detectMimeType(p).catch(() => null),
                     fs.stat(p).catch(() => null),
                 ]);
-                this.emit('file:change', { backend: this.name, key, path: p, checksums, mimeType, size: stats?.size });
+                this.emit('file:change', { backend: this.name, key, path: p, checksums, mimeType, size: stats?.size, modified: stats?.mtimeMs });
             })
             .on('unlink', p => {
                 this.emit('file:unlink', { backend: this.name, key: toKey(p), path: p });
@@ -131,16 +161,26 @@ export default class FileBackend extends StorageBackend {
 
     async scan(options = {}) {
         const algorithms = options.algorithms || this.#defaultAlgorithms;
+        // Optional skip-hash predicate: (key, { size, mtime }) => { checksums, mimeType } | null.
+        // When it returns a cached descriptor the (expensive) file read is skipped.
+        const known = typeof options.knownChecksums === 'function' ? options.knownChecksums : null;
         const results = [];
         debug(`Scanning ${this.#root}...`);
         this.emit('scan:start', { backend: this.name });
 
         for await (const entry of this.list(options)) {
-            const filePath = this.#resolvePath(entry.key);
-            const [checksums, mimeType] = await Promise.all([
-                checksumFile(filePath, algorithms).catch(() => null),
-                detectMimeType(filePath).catch(() => null),
-            ]);
+            const cached = known ? known(entry.key, { size: entry.size, mtime: entry.modified }) : null;
+            let checksums, mimeType;
+            if (cached) {
+                checksums = cached.checksums;
+                mimeType = cached.mimeType ?? null;
+            } else {
+                const filePath = this.#resolvePath(entry.key);
+                [checksums, mimeType] = await Promise.all([
+                    checksumFile(filePath, algorithms).catch(() => null),
+                    detectMimeType(filePath).catch(() => null),
+                ]);
+            }
             results.push({ ...entry, checksums, mimeType, backend: this.name });
         }
 

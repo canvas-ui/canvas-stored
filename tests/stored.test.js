@@ -53,6 +53,14 @@ describe('Stored', async () => {
         test('addBackend() throws on unknown driver', () => {
             assert.throws(() => stored.addBackend('unknown', { driver: 'unknown', root: TEST_DIR }));
         });
+
+        test('remote backends render real native URLs', () => {
+            const http = stored.addBackend('http:cdn', { driver: 'http', baseUrl: 'https://cdn.example/' });
+            assert.strictEqual(http.nativeUrl('music/rec.mp3'), 'https://cdn.example/music/rec.mp3');
+
+            const s3 = stored.addBackend('s3:prod', { driver: 's3', bucket: 'blobs' });
+            assert.strictEqual(s3.nativeUrl('ab/cd/rec.mp3'), 's3://blobs/ab/cd/rec.mp3');
+        });
     });
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -60,9 +68,16 @@ describe('Stored', async () => {
     // ─────────────────────────────────────────────────────────────────────────
 
     describe('put()', () => {
-        test('stores Buffer and returns metadata', async () => {
-            const meta = await stored.put(Buffer.from('test content'), { key: 'buffer.txt' });
+        test('requires target backends', async () => {
+            const result = await stored.put(Buffer.from('no targets'), { key: 'x.txt' });
+            assert.strictEqual(result.ok, false);
+            assert.strictEqual(result.reason, 'no-targets');
+        });
 
+        test('stores Buffer and returns metadata', async () => {
+            const meta = await stored.put(Buffer.from('test content'), { key: 'buffer.txt', backends: ['fs:test'] });
+
+            assert.strictEqual(meta.ok, true);
             assert.ok(meta.id.startsWith('sha256:'));
             assert.ok(meta.checksums.sha256);
             assert.ok(meta.checksums.md5);
@@ -80,26 +95,36 @@ describe('Stored', async () => {
         });
 
         test('stores string and returns metadata', async () => {
-            const meta = await stored.put('string content', { key: 'string.txt' });
+            const meta = await stored.put('string content', { key: 'string.txt', backends: ['fs:test'] });
             assert.ok(meta.id);
             assert.strictEqual(meta.mimeType, 'text/plain');
         });
 
         test('stores stream and returns metadata', async () => {
             const stream = Readable.from([Buffer.from('stream '), Buffer.from('content')]);
-            const meta = await stored.put(stream, { key: 'stream.txt' });
+            const meta = await stored.put(stream, { key: 'stream.txt', backends: ['fs:test'] });
             assert.ok(meta.id);
             assert.strictEqual(meta.size, 14);
+            assert.strictEqual((await stored.get(meta.id)).toString(), 'stream content');
+        });
+
+        test('stores a filesystem path without buffering', async () => {
+            const src = path.join(TEST_DIR, 'source-file.bin');
+            await fs.writeFile(src, 'from disk');
+            const meta = await stored.put(src, { key: 'path.bin', backends: ['fs:test'] });
+            assert.strictEqual(meta.size, 9);
+            assert.strictEqual((await stored.get(meta.id)).toString(), 'from disk');
         });
 
         test('auto-generates key from checksum if not provided', async () => {
-            const meta = await stored.put(Buffer.from('auto-key'));
+            const meta = await stored.put(Buffer.from('auto-key'), { backends: ['fs:test'] });
             assert.ok(meta.locations[0].key.includes('/'));
         });
 
         test('stores custom metadata', async () => {
             const meta = await stored.put(Buffer.from('custom'), {
                 key: 'custom.txt',
+                backends: ['fs:test'],
                 metadata: { tag: 'important' }
             });
             assert.strictEqual(meta.custom.tag, 'important');
@@ -114,7 +139,7 @@ describe('Stored', async () => {
         let testMeta;
 
         before(async () => {
-            testMeta = await stored.put(Buffer.from('get test data'), { key: 'get-test.txt' });
+            testMeta = await stored.put(Buffer.from('get test data'), { key: 'get-test.txt', backends: ['fs:test'] });
         });
 
         test('retrieves data by id', async () => {
@@ -132,8 +157,8 @@ describe('Stored', async () => {
             assert.strictEqual(data, null);
         });
 
-        test('returns stream when requested', async () => {
-            const stream = await stored.get(testMeta.id, { stream: true });
+        test('getStream() returns a readable', async () => {
+            const stream = await stored.getStream(testMeta.id);
             assert.ok(stream.pipe);
         });
     });
@@ -146,26 +171,40 @@ describe('Stored', async () => {
         let testMeta;
 
         before(async () => {
-            testMeta = await stored.put(Buffer.from('stat test'), { key: 'stat-test.txt' });
+            testMeta = await stored.put(Buffer.from('stat test'), { key: 'stat-test.txt', backends: ['fs:test'] });
         });
 
-        test('stat() returns metadata by id', () => {
-            const meta = stored.stat(testMeta.id);
+        test('stat() returns metadata by id', async () => {
+            const meta = await stored.stat(testMeta.id);
             assert.strictEqual(meta.id, testMeta.id);
             assert.strictEqual(meta.size, testMeta.size);
         });
 
-        test('stat() returns null for non-existent', () => {
-            const meta = stored.stat('sha256:nonexistent');
+        test('stat() returns null for non-existent', async () => {
+            const meta = await stored.stat('sha256:nonexistent');
             assert.strictEqual(meta, null);
         });
 
-        test('has() returns true for existing', () => {
-            assert.strictEqual(stored.has(testMeta.id), true);
+        test('has() returns true for existing', async () => {
+            assert.strictEqual(await stored.has(testMeta.id), true);
         });
 
-        test('has() returns false for non-existent', () => {
-            assert.strictEqual(stored.has('sha256:nonexistent'), false);
+        test('has() returns false for non-existent', async () => {
+            assert.strictEqual(await stored.has('sha256:nonexistent'), false);
+        });
+
+        test('locations() returns resolvable stored:// URLs', async () => {
+            const locations = await stored.locations(testMeta.id);
+            assert.strictEqual(locations.length, 1);
+            assert.strictEqual(locations[0].url, 'stored://fs:test/stat-test.txt');
+            assert.strictEqual(locations[0].backend, 'fs:test');
+            assert.strictEqual(locations[0].synced, true);
+            const data = await stored.getByUrl(locations[0].url);
+            assert.strictEqual(data.toString(), 'stat test');
+        });
+
+        test('locations() returns [] for non-existent', async () => {
+            assert.deepStrictEqual(await stored.locations('sha256:nonexistent'), []);
         });
     });
 
@@ -183,9 +222,9 @@ describe('Stored', async () => {
             assert.ok(entries[0].id);
         });
 
-        test('lists backend files directly', async () => {
+        test('listBackend() lists backend files directly', async () => {
             const entries = [];
-            for await (const entry of stored.list({ backend: 'fs:test' })) {
+            for await (const entry of stored.listBackend('fs:test')) {
                 entries.push(entry);
             }
             assert.ok(entries.length > 0);
@@ -199,16 +238,18 @@ describe('Stored', async () => {
 
     describe('delete()', () => {
         test('deletes data and returns deleted backends', async () => {
-            const meta = await stored.put(Buffer.from('delete me'), { key: 'delete-test.txt' });
+            const meta = await stored.put(Buffer.from('delete me'), { key: 'delete-test.txt', backends: ['fs:test'] });
             const result = await stored.delete(meta.id);
 
+            assert.strictEqual(result.ok, true);
             assert.ok(result.deleted.includes('fs:test'));
-            assert.strictEqual(stored.has(meta.id), false);
+            assert.strictEqual(await stored.has(meta.id), false);
         });
 
-        test('returns empty array for non-existent', async () => {
+        test('returns not-found for non-existent', async () => {
             const result = await stored.delete('sha256:nonexistent');
-            assert.deepStrictEqual(result.deleted, []);
+            assert.strictEqual(result.ok, false);
+            assert.strictEqual(result.reason, 'not-found');
         });
     });
 
@@ -223,8 +264,8 @@ describe('Stored', async () => {
         });
 
         test('indexes existing files', async () => {
-            const results = await stored.scan('fs:test');
-            const scanFiles = results.filter(r => r.key.startsWith('scan'));
+            const { files } = await stored.scan('fs:test');
+            const scanFiles = files.filter(r => r.key.startsWith('scan'));
 
             assert.ok(scanFiles.length >= 2);
             assert.ok(scanFiles[0].checksums);
@@ -232,12 +273,12 @@ describe('Stored', async () => {
         });
 
         test('scanned files are retrievable by id', async () => {
-            const results = await stored.scan('fs:test');
-            const file = results.find(r => r.key === 'scan1.txt');
+            const { files } = await stored.scan('fs:test');
+            const file = files.find(r => r.key === 'scan1.txt');
 
             if (file?.checksums) {
                 const id = `sha256:${file.checksums.sha256}`;
-                const meta = stored.stat(id);
+                const meta = await stored.stat(id);
                 assert.ok(meta);
                 assert.deepStrictEqual(meta.locations[0].source, {
                     provider: 'fs',
@@ -250,6 +291,34 @@ describe('Stored', async () => {
     });
 
     // ─────────────────────────────────────────────────────────────────────────
+    // removeBackend()
+    // ─────────────────────────────────────────────────────────────────────────
+
+    describe('removeBackend()', () => {
+        test('unregisters and prunes index entries with no surviving location', async () => {
+            stored.addBackend('fs:temp', { driver: 'file', root: path.join(TEST_DIR, 'temp') });
+            const meta = await stored.put(Buffer.from('temp data'), { key: 't.txt', backends: ['fs:temp'] });
+            assert.strictEqual(await stored.has(meta.id), true);
+
+            assert.strictEqual(await stored.removeBackend('fs:temp'), true);
+            assert.strictEqual(stored.getBackend('fs:temp'), undefined);
+            assert.strictEqual(await stored.has(meta.id), false);
+        });
+
+        test('keeps content that still lives on another backend', async () => {
+            stored.addBackend('fs:a', { driver: 'file', root: path.join(TEST_DIR, 'a') });
+            stored.addBackend('fs:b', { driver: 'file', root: path.join(TEST_DIR, 'b') });
+            const meta = await stored.put(Buffer.from('shared content'), { key: 's.txt', backends: ['fs:a', 'fs:b'] });
+
+            await stored.removeBackend('fs:a');
+
+            const surviving = await stored.stat(meta.id);
+            assert.ok(surviving);
+            assert.deepStrictEqual(surviving.locations.map(l => l.backend), ['fs:b']);
+        });
+    });
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Events
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -257,12 +326,12 @@ describe('Stored', async () => {
         test('emits put event', async () => {
             let emitted = false;
             stored.once('put', () => { emitted = true; });
-            await stored.put(Buffer.from('event test'), { key: 'event.txt' });
+            await stored.put(Buffer.from('event test'), { key: 'event.txt', backends: ['fs:test'] });
             assert.strictEqual(emitted, true);
         });
 
         test('emits delete event', async () => {
-            const meta = await stored.put(Buffer.from('delete event'), { key: 'delete-event.txt' });
+            const meta = await stored.put(Buffer.from('delete event'), { key: 'delete-event.txt', backends: ['fs:test'] });
             let emitted = false;
             stored.once('delete', () => { emitted = true; });
             await stored.delete(meta.id);
@@ -276,7 +345,7 @@ describe('Stored', async () => {
 
     describe('Persistence', () => {
         test('index persists after reopen', async () => {
-            const meta = await stored.put(Buffer.from('persist test'), { key: 'persist.txt' });
+            const meta = await stored.put(Buffer.from('persist test'), { key: 'persist.txt', backends: ['fs:test'] });
             const id = meta.id;
 
             // Close and reopen
@@ -284,7 +353,7 @@ describe('Stored', async () => {
             stored = new Stored({ root: STORED_ROOT, checksums: ['sha256', 'md5'] });
             stored.addBackend('fs:test', { driver: 'file', root: TEST_DIR });
 
-            const persisted = stored.stat(id);
+            const persisted = await stored.stat(id);
             assert.ok(persisted);
             assert.strictEqual(persisted.id, id);
         });

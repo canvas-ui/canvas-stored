@@ -23,32 +23,36 @@ export default class Index {
     // ─────────────────────────────────────────────────────────────────────────
 
     put(id, metadata) {
-        const existing = this.#db.get(id);
-        const meta = {
-            ...existing,
-            ...metadata,
-            id,
-            modified: Date.now(),
-            created: existing?.created || Date.now(),
-        };
+        // Both the metadata write and the path-index writes commit atomically:
+        // a crash can never leave the path index pointing at a missing id.
+        return this.#db.transactionSync(() => {
+            const existing = this.#db.get(id);
+            const meta = {
+                ...existing,
+                ...metadata,
+                id,
+                modified: Date.now(),
+                created: existing?.created || Date.now(),
+            };
 
-        const nextPathKeys = new Set((meta.locations || []).map(loc => `${loc.backend}:${loc.key}`));
-        for (const loc of existing?.locations || []) {
-            const pathKey = `${loc.backend}:${loc.key}`;
-            if (!nextPathKeys.has(pathKey)) {
-                this.#pathDb.removeSync(pathKey);
+            const nextPathKeys = new Set((meta.locations || []).map(loc => `${loc.backend}:${loc.key}`));
+            for (const loc of existing?.locations || []) {
+                const pathKey = `${loc.backend}:${loc.key}`;
+                if (!nextPathKeys.has(pathKey)) {
+                    this.#pathDb.removeSync(pathKey);
+                }
             }
-        }
 
-        this.#db.putSync(id, meta);
+            this.#db.putSync(id, meta);
 
-        // Index by path for each location
-        for (const loc of meta.locations || []) {
-            this.#pathDb.putSync(`${loc.backend}:${loc.key}`, id);
-        }
+            // Index by path for each location
+            for (const loc of meta.locations || []) {
+                this.#pathDb.putSync(`${loc.backend}:${loc.key}`, id);
+            }
 
-        debug(`Indexed ${id.slice(0, 19)}...`);
-        return meta;
+            debug(`Indexed ${id.slice(0, 19)}...`);
+            return meta;
+        });
     }
 
     get(idOrPath) {
@@ -66,16 +70,18 @@ export default class Index {
     }
 
     delete(id) {
-        const meta = this.#db.get(id);
-        if (!meta) return false;
+        return this.#db.transactionSync(() => {
+            const meta = this.#db.get(id);
+            if (!meta) return false;
 
-        for (const loc of meta.locations || []) {
-            this.#pathDb.removeSync(`${loc.backend}:${loc.key}`);
-        }
+            for (const loc of meta.locations || []) {
+                this.#pathDb.removeSync(`${loc.backend}:${loc.key}`);
+            }
 
-        this.#db.removeSync(id);
-        debug(`Removed ${id.slice(0, 19)}...`);
-        return true;
+            this.#db.removeSync(id);
+            debug(`Removed ${id.slice(0, 19)}...`);
+            return true;
+        });
     }
 
     // ─────────────────────────────────────────────────────────────────────────

@@ -5,9 +5,11 @@ Cache-first blob storage with a content-addressable local cache, LMDB metadata i
 Used with canvas-server/synapsd to build virtual context trees over indexed data: checksum-based identity, multi-location replication, and `stored://` URLs as the canonical fetch form.
 
 ```
-put(blob)  → cacache → local backends (immediate) → remote backends (SyncQueue / worker_threads)
+put(blob)  → stream hash → local backends (hardlink/rename) + remote (cacache → SyncQueue / worker_threads)
 get(id)    → cacache → synced backend location → cache on read (buffers only)
 ```
+
+Paths and streams are ingested without buffering the whole blob in memory (safe for 10GB+ files). Local-only puts never touch the cache; the cache + sync queue are used only when a remote backend is targeted.
 
 ## Quick start
 
@@ -16,22 +18,15 @@ get(id)    → cacache → synced backend location → cache on read (buffers on
 import Stored from './src/index.js';
 
 const stored = new Stored({ root: './.stored' });
-
-// manual data backend
 stored.addBackend('fs:data', { driver: 'file', root: stored.dataPath });
-
-// or auto-register
-new Stored({ root: './.stored', data: { backend: 'fs:data', watch: true } });
 ```
 
 ### Backend configuration
 ```js
 const stored = new Stored({
   root: './.stored',                    // → ./.stored/{index,cache,data}
-  checksums: ['sha256'],
+  checksums: ['sha256'],                // sha256 is the default and the id/cache algorithm
   primaryChecksum: 'sha256',
-  defaultBackends: ['fs:home'],
-  // data: { backend: 'fs:data', watch: true },  // optional local file backend at root/data
 });
 
 stored.addBackend('fs:home', {
@@ -41,14 +36,12 @@ stored.addBackend('fs:home', {
   ignored: /node_modules/,
 });
 
-// Or use the built-in data dir:
-// stored.addBackend('fs:data', { driver: 'file', root: stored.dataPath });
-
 stored.on('object:add', ({ kind, id, key }) => { /* index in synapsd */ });
 stored.on('synced', ({ id, results }) => { /* remote write finished */ });
 
-const meta = await stored.put(Buffer.from('hello'), { key: 'docs/hello.txt' });
-const data = await stored.get(meta.id);
+// `backends` is required — there is no implicit fan-out.
+const res = await stored.put(Buffer.from('hello'), { key: 'docs/hello.txt', backends: ['fs:home'] });
+const data = await stored.get(res.id);
 await stored.getByUrl('stored://fs:home/docs/hello.txt');
 
 await stored.stop();
@@ -73,11 +66,8 @@ All paths hang off a single **`root`** (default `./.stored`):
 | `index.path` | `<root>/index` | Override index location |
 | `cache.path` | `<root>/cache` | Override cacache location |
 | `data.path` | `<root>/data` | Override local data directory |
-| `data.backend` | — | If set (e.g. `'fs:data'`), registers a `file` backend at `data.path` |
-| `data.watch` | `false` | Passed to the auto-registered data backend |
-| `checksums` | `['sha256']` | Algorithms computed on `put` / `scan` |
+| `checksums` | `['sha256']` | Algorithms computed on `put` / `scan`. sha256 is mandatory (id + cache); extra algorithms are optional |
 | `primaryChecksum` | `'sha256'` | Algorithm used for content `id` (`<algo>:<hex>`) |
-| `defaultBackends` | `[]` | Backend names for `put()` when `options.backends` is omitted; if empty, all registered backends are targeted |
 
 The constructor extends **eventemitter2** with `wildcard: true` and `delimiter: ':'`, so listeners can bind patterns like `object:*` or `scan:*`.
 
@@ -134,10 +124,9 @@ Canonical fetch/delete form: `stored://<backend>/<key>`. Backend names may conta
 
 | Method | Description |
 |--------|-------------|
-| `getByUrl(url, options?)` | `backend.get(key, options)` — bypasses the content index. Throws if `url` is not `stored://…`. Returns `null` for unknown backend or malformed URL. |
-| `deleteByUrl(url)` | Deletes bytes on the backend only (does not update the LMDB index). Returns `{ deleted: boolean, reason?: string }` where `reason` is `malformed-url`, `unknown-backend`, or `read-only-backend`. |
-
-`options` for `getByUrl`: `{ stream: true }` returns a stream when the backend supports it.
+| `getByUrl(url)` | `backend.get(key)` — bypasses the content index. Returns `Buffer \| null` (never throws on bad input). |
+| `getStreamByUrl(url)` | Same as `getByUrl` but returns a `Readable \| null`. |
+| `deleteByUrl(url)` | Deletes bytes on the backend only (does not update the LMDB index). Returns `{ ok: boolean, reason?: string }` where `reason` is `malformed-url`, `unknown-backend`, or `read-only-backend`. |
 
 ---
 
@@ -166,55 +155,60 @@ Throws if the name exists or the driver is unknown.
 
 ### Core
 
-#### `put(blob, options?) → Promise<Metadata>`
+#### `put(blob, options?) → Promise<{ ok, id, key, size, mimeType, checksums, locations, … }>`
 
-Accepts `Buffer`, `string`, filesystem path (`string` path readable as file), or `Readable` stream.
+Accepts `Buffer`, `string` (content), filesystem path (`string` path readable as file), or `Readable` stream. Paths and streams are hashed and written in a single streaming pass — the whole blob is never held in memory.
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `key` | auto from checksum | Storage key on backends |
-| `backends` | `defaultBackends`, or all registered if that is empty | Target backend names |
+| `backends` | **required** | Target backend names. Empty/missing → `{ ok:false, reason:'no-targets' }` |
 | `metadata` | `{}` | Stored as `custom` on the index entry |
+| `mimeType` | sniffed | Override the detected mime type |
 
-Flow: normalize blob → checksum + mime → cache → local backends (synced) + remote placeholders → index → enqueue remote sync.
+Flow: stream → hash (+ head peek for mime) → local backends (hardlink/rename from a same-fs temp) + remote placeholders (streamed into cacache) → index → enqueue remote sync. Returns `{ ok:false, reason }` on failure (`no-targets`, `unknown-backend`).
 
 Emits `put` with `{ id, key, metadata }`.
 
-#### `get(idOrKey, options?) → Promise<Buffer \| Stream \| null>`
+#### `get(idOrKey) → Promise<Buffer \| null>` / `getStream(idOrKey) → Promise<Readable \| null>`
 
-Lookup order: path index (`backend:key`) or id → cacache → first **synced** location on a backend.
+Lookup order: path index (`backend:key`) or id → cacache → first **synced** location on a backend. On a backend buffer hit, bytes are written back to cache asynchronously.
 
-| Option | Description |
-|--------|-------------|
-| `stream: true` | Return a read stream (cache or backend) |
+#### `delete(idOrKey, options?) → Promise<{ ok, deleted, kept } \| { ok:false, reason:'not-found' }>`
 
-On backend hit, buffers are written back to cache asynchronously.
-
-#### `delete(idOrKey, options?) → Promise<{ deleted: string[] }>`
-
-Removes from cache and backends. Updates or removes the index entry.
+Removes from cache and backends. The index entry is removed only when no locations remain.
 
 | Option | Description |
 |--------|-------------|
-| `backends` | If set, only delete from these backends; index entry kept until all locations are gone |
+| `backends` | Only delete locations on these backends |
+| `urls` | Only delete the listed `stored://<backend>/<key>` locations (precise multi-name targeting) |
 
 Emits `delete` with `{ id, backends }` (names deleted).
 
-#### `stat(idOrKey) → Metadata | null`
+#### `stat(idOrKey) → Promise<Metadata | null>`
 
-#### `has(idOrKey) → boolean`
+#### `has(idOrKey) → Promise<boolean>`
 
-#### `list(options?) → AsyncIterable`
+#### `locations(idOrKey) → Promise<Location[]>`
 
-| Option | Behavior |
-|--------|----------|
-| *(none)* | Yield all index metadata entries |
-| `backend` | Yield `{ key, size, … }` from that backend’s `list()` |
-| `prefix` | Passed to backend `list()` when listing a backend |
+Where the content actually lives: `{ url, nativeUrl, backend, key, driver, synced, size, source }` per location.
 
-#### `scan(backendName?) → Promise<ScanResult[]>`
+- `url` — canonical `stored://<backend>/<key>`, the fetch form (`getByUrl`). Single source of truth for the grammar.
+- `nativeUrl` — the real protocol URL for provenance/UI: `https://…`, `s3://bucket/…`, `imap://account/…`, `file://…` (local), or `null` when the backend has none.
 
-Index existing objects from one backend or all. Updates locations, prunes index entries for keys removed on disk, returns per-file scan rows `{ key, size, checksums, mimeType, backend, … }`.
+Returns `[]` when unknown. Backend drivers render `nativeUrl(key)`; remote backends are the interesting case (a blob can live under several names across backends).
+
+#### `list() → AsyncIterable<Metadata>`
+
+Yields all index metadata entries.
+
+#### `listBackend(name, options?) → AsyncIterable`
+
+Yields `{ key, size, … }` from that backend’s native `list()`. `options` (`prefix`, `recursive`) are passed through.
+
+#### `scan(backendName?, options?) → Promise<{ ok, backend, count, files }>`
+
+Index existing objects from one backend or all. `options` is forwarded verbatim to each backend's `scan()` (per-driver knobs). File backends skip re-hashing files whose size+mtime are unchanged. Updates locations, prunes index entries for keys removed on disk; `files` are per-file scan rows `{ key, size, checksums, mimeType, backend, … }`.
 
 ### Lifecycle
 
@@ -235,7 +229,7 @@ Registered in `BackendManager` via `DRIVERS`:
 | `s3` | `remote` | skeleton | Registered for URL parsing; CRUD not implemented |
 | `imap` | `remote` | functional | Poll + `scan`; keys `<folder>;UID=<n>`; emits `object:add` (`kind: 'message'`) |
 
-Each backend implements `StorageBackend`: `put`, `get`, `delete`, `stat`, `list`; optional `watch`, `scan`, `stop`.
+Each backend implements `StorageBackend`: `put`, `get`, `delete`, `stat`, `list`; optional `commit` (local, for streaming put), `watch`, `scan`, `stop`.
 
 | Capability | Meaning |
 |------------|---------|

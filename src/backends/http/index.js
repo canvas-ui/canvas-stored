@@ -24,6 +24,11 @@ export default class HttpBackend extends StorageBackend {
     // Read-only source: bytes can't be removed remotely, only the reference dropped.
     get capabilities() { return { read: true, write: false, delete: false }; }
 
+    nativeUrl(key) {
+        try { return this.#baseUrl ? new URL(key, this.#baseUrl).href : key; }
+        catch { return null; }
+    }
+
     async get(key, options = {}) {
         const url = this.#baseUrl ? new URL(key, this.#baseUrl).toString() : key;
         const res = await fetch(url, { headers: this.config.headers || {} });

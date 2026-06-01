@@ -17,4 +17,9 @@ export default class S3Backend extends StorageBackend {
         this.type = 'remote';
         debug(`S3Backend "${name}" registered (skeleton; bucket=${config.bucket ?? '?'})`);
     }
+
+    nativeUrl(key) {
+        const { bucket, prefix = '' } = this.config;
+        return bucket ? `s3://${bucket}/${prefix}${key}` : null;
+    }
 }

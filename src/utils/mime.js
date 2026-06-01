@@ -64,6 +64,26 @@ async function sniffHead(input, bytes = 4096) {
     } finally { await fh.close(); }
 }
 
+// Streaming variant: detect from an already-captured head buffer (first few KB)
+// plus the storage key's extension. Used by the streaming put path where the
+// full blob is never materialized.
+export async function detectMimeFromHead(head, key) {
+    try {
+        if (head && head.length) {
+            const result = await fileTypeFromBuffer(head);
+            if (result?.mime) return result.mime;
+        }
+        if (typeof key === 'string') {
+            const ext = path.extname(key).toLowerCase();
+            if (TEXT_MIME_TYPES[ext]) return TEXT_MIME_TYPES[ext];
+        }
+        if (head && looksLikeText(head)) return 'text/plain';
+        return 'application/octet-stream';
+    } catch {
+        return 'application/octet-stream';
+    }
+}
+
 export async function detectMimeType(input) {
     try {
         const result = Buffer.isBuffer(input)

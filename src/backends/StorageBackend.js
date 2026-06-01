@@ -22,8 +22,16 @@ export default class StorageBackend extends EventEmitter {
     get capabilities() { return { read: true, write: true, delete: true }; }
     get canDelete() { return this.capabilities.delete !== false; }
 
+    // The real, protocol-native URL for `key` (e.g. https://…, s3://…, smb://…,
+    // file://…), used for provenance/UI. `stored://<backend>/<key>` remains the
+    // canonical fetch form. Returns null when the backend has no meaningful one.
+    nativeUrl(key) { return null; }
+
     // Required methods - must be implemented by subclasses
     async put(key, data) { throw new Error('Not implemented'); }
+    // Place an already-written file at `key` (streaming put commit). Local
+    // backends implement this; remote backends are fed via the cache + SyncQueue.
+    async commit(key, srcPath) { throw new Error('Not implemented'); }
     async get(key, options = {}) { throw new Error('Not implemented'); }
     async delete(key) { throw new Error('Not implemented'); }
     async stat(key) { throw new Error('Not implemented'); }

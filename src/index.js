@@ -1,15 +1,21 @@
 import EventEmitter2 from 'eventemitter2';
 import path from 'path';
+import crypto from 'crypto';
+import { createReadStream, createWriteStream, promises as fsp } from 'fs';
+import { once } from 'events';
+import { pipeline } from 'stream/promises';
 import Debug from 'debug';
 import Cache from './cache/index.js';
 import BackendManager from './backends/BackendManager.js';
 import Index from './index/index.js';
 import SyncQueue from './sync/SyncQueue.js';
 import { isBuffer, isFile, isStream, resolveStoredPaths } from './utils/common.js';
-import { checksumBuffer, checksumFile, formatId } from './utils/checksum.js';
-import { detectMimeType } from './utils/mime.js';
+import { checksumBuffer, formatId } from './utils/checksum.js';
+import { detectMimeType, detectMimeFromHead } from './utils/mime.js';
 
 const debug = Debug('stored');
+
+const HEAD_BYTES = 4096;
 
 export default class Stored extends EventEmitter2 {
     #cache;
@@ -24,7 +30,6 @@ export default class Stored extends EventEmitter2 {
         super({ wildcard: true, delimiter: ':', maxListeners: 100, verboseMemoryLeak: false });
         this.#paths = resolveStoredPaths(config);
         this.#config = {
-            defaultBackends: config.defaultBackends || [],
             checksums: config.checksums || ['sha256'],
             primaryChecksum: config.primaryChecksum || 'sha256',
             ...config,
@@ -33,17 +38,6 @@ export default class Stored extends EventEmitter2 {
         this.#cache = new Cache({ path: this.#paths.cache, algorithms: this.#config.checksums });
         this.#backends = new BackendManager();
         this.#index = new Index(this.#paths.index);
-
-        if (config.data?.backend) {
-            const { backend: name, watch, ignored, algorithms } = config.data;
-            this.addBackend(name, {
-                driver: 'file',
-                root: this.#paths.data,
-                watch: watch ?? false,
-                ignored,
-                algorithms,
-            });
-        }
 
         // Background sync queue for remote backends (worker spawned lazily)
         this.#syncQueue = new SyncQueue();
@@ -88,212 +82,224 @@ export default class Stored extends EventEmitter2 {
         return backend;
     }
 
-    removeBackend(name) { return this.#backends.remove(name); }
+    // Unregister a backend and drop its now-dangling locations from the index.
+    // Entries left with no locations are removed (the index is derived state —
+    // synapsd documents are durable and rebuildable via scan()).
+    async removeBackend(name) {
+        const removed = await this.#backends.remove(name);
+        if (removed) this.#removeMissingLocations(name, new Set());
+        return removed;
+    }
+
     listBackends() { return this.#backends.list(); }
     getBackend(name) { return this.#backends.get(name); }
 
     /**
-     * Fetch a blob directly by its canonical `stored://<backend>/<key>` URL,
-     * bypassing the content index. The backend name may itself contain colons
-     * (e.g. `fs:data:email`), so we split on the first `/` after the scheme.
-     * Returns the backend's `get` result (Buffer, or stream with {stream:true}),
-     * or null if the URL is malformed or the backend is unknown.
+     * Parse a canonical `stored://<backend>/<key>` URL. The backend name may
+     * itself contain colons (e.g. `fs:data:email`), so we split on the first
+     * `/` after the scheme. Returns { backend, key } or null if malformed.
      */
-    async getByUrl(url, options = {}) {
+    #parseStoredUrl(url) {
         const prefix = 'stored://';
-        if (typeof url !== 'string' || !url.startsWith(prefix)) {
-            throw new Error(`getByUrl expects a stored:// URL, got: ${url}`);
-        }
+        if (typeof url !== 'string' || !url.startsWith(prefix)) return null;
         const rest = url.slice(prefix.length);
         const slash = rest.indexOf('/');
         if (slash < 0) return null;
-        const backendName = rest.slice(0, slash);
-        const key = rest.slice(slash + 1);
-        const backend = this.#backends.get(backendName);
-        if (!backend) return null;
-        return backend.get(key, options);
+        return { backend: rest.slice(0, slash), key: rest.slice(slash + 1) };
+    }
+
+    // Fetch bytes directly by `stored://` URL, bypassing the content index.
+    // Returns Buffer | null (never throws on bad input).
+    async getByUrl(url) {
+        const p = this.#parseStoredUrl(url);
+        const backend = p && this.#backends.get(p.backend);
+        return backend ? backend.get(p.key) : null;
+    }
+
+    // Same as getByUrl but returns a Readable | null.
+    async getStreamByUrl(url) {
+        const p = this.#parseStoredUrl(url);
+        const backend = p && this.#backends.get(p.backend);
+        return backend ? backend.get(p.key, { stream: true }) : null;
     }
 
     /**
-     * Delete the bytes behind a `stored://<backend>/<key>` URL.
-     * Returns { deleted:boolean, reason?:string }. Does not touch the document
-     * index (synapsd owns that) — callers trim `locations[]` themselves.
+     * Delete the bytes behind a `stored://<backend>/<key>` URL. Does not touch
+     * the document index (synapsd owns that) — callers trim `locations[]`.
+     * Returns { ok:boolean, reason?:'malformed-url'|'unknown-backend'|'read-only-backend' }.
      */
     async deleteByUrl(url) {
-        const prefix = 'stored://';
-        if (typeof url !== 'string' || !url.startsWith(prefix)) {
-            throw new Error(`deleteByUrl expects a stored:// URL, got: ${url}`);
-        }
-        const rest = url.slice(prefix.length);
-        const slash = rest.indexOf('/');
-        if (slash < 0) return { deleted: false, reason: 'malformed-url' };
-        const backendName = rest.slice(0, slash);
-        const key = rest.slice(slash + 1);
-        const backend = this.#backends.get(backendName);
-        if (!backend) return { deleted: false, reason: 'unknown-backend' };
-        if (!backend.canDelete) return { deleted: false, reason: 'read-only-backend' };
-        const ok = await backend.delete(key);
-        return { deleted: !!ok };
+        const p = this.#parseStoredUrl(url);
+        if (!p) return { ok: false, reason: 'malformed-url' };
+        const backend = this.#backends.get(p.backend);
+        if (!backend) return { ok: false, reason: 'unknown-backend' };
+        if (!backend.canDelete) return { ok: false, reason: 'read-only-backend' };
+        return { ok: !!(await backend.delete(p.key)) };
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Core API — cache-first writes, cache-first reads
     // ─────────────────────────────────────────────────────────────────────────
 
+    /**
+     * Store a blob. Accepts Buffer | string (content) | filesystem path |
+     * Readable. Paths and streams are ingested without ever materializing the
+     * whole blob in memory. `backends` is required (no implicit fan-out).
+     * Returns { ok:true, id, key, size, mimeType, checksums, locations, ... }
+     * or { ok:false, reason:'no-targets'|'unknown-backend' }.
+     */
     async put(blob, options = {}) {
-        const { key, backends = this.#config.defaultBackends, metadata = {} } = options;
+        const { key, backends, metadata = {} } = options;
+        if (!Array.isArray(backends) || backends.length === 0) return { ok: false, reason: 'no-targets' };
 
-        const { data, checksums, size, mimeType } = await this.#normalizeBlob(blob);
-        const id = formatId(checksums, this.#config.primaryChecksum);
-        const finalKey = key || this.#generateKey(checksums);
+        const targets = backends
+            .map(name => ({ name, backend: this.#backends.get(name) }))
+            .filter(t => t.backend);
+        if (!targets.length) return { ok: false, reason: 'unknown-backend' };
 
-        // 1. Write to cache first (always, fast)
-        await this.#cache.put(id, data, { key: finalKey, checksums, size, mimeType });
+        const ingest = (isBuffer(blob) || (typeof blob === 'string' && !isFile(blob)))
+            ? await this.#ingestMemory(blob, targets, key, options.mimeType)
+            : await this.#ingestStream(blob, targets, key, options.mimeType);
 
-        // 2. Write to backends — local immediately, remote via queue
-        const targetNames = backends.length ? backends : this.#backends.list();
-        const locations = [];
-        const remoteTargets = [];
+        const meta = this.#index.put(ingest.id, {
+            checksums: ingest.checksums,
+            size: ingest.size,
+            mimeType: ingest.mimeType,
+            locations: ingest.locations,
+            custom: metadata,
+        });
 
-        for (const name of targetNames) {
-            const backend = this.#backends.get(name);
-            if (!backend) continue;
-
-            if (backend.type === 'local') {
-                await backend.put(finalKey, data);
-                locations.push(this.#buildLocation(name, finalKey, true));
-            } else {
-                locations.push(this.#buildLocation(name, finalKey, false));
-                remoteTargets.push({ name, driver: backend.config.driver, root: backend.config.root, key: finalKey });
-            }
+        if (ingest.remoteTargets.length) {
+            this.#syncQueue.enqueue({ id: ingest.id, cacheRoot: this.#cache.root, cacheKey: ingest.id, targets: ingest.remoteTargets });
         }
 
-        // 3. Update index
-        const meta = this.#index.put(id, { checksums, size, mimeType, locations, custom: metadata });
-
-        // 4. Enqueue remote backend sync
-        if (remoteTargets.length) {
-            this.#syncQueue.enqueue({ id, cacheRoot: this.#cache.root, cacheKey: id, targets: remoteTargets });
-        }
-
-        this.emit('put', { id, key: finalKey, metadata: meta });
-        debug(`PUT ${id.slice(0, 19)}... → cache + ${targetNames.join(', ')}`);
-        return meta;
+        this.emit('put', { id: ingest.id, key: ingest.finalKey, metadata: meta });
+        debug(`PUT ${ingest.id.slice(0, 19)}... → ${targets.map(t => t.name).join(', ')}`);
+        return { ok: true, key: ingest.finalKey, ...meta };
     }
 
-    async get(idOrKey, options = {}) {
-        const meta = this.#index.get(idOrKey);
-        if (!meta) return null;
-
-        // 1. Cache by content ID
-        if (options.stream) {
-            try {
-                return this.#cache.getStream(meta.id);
-            } catch { /* cache miss */ }
-        }
-        try {
-            const { data } = await this.#cache.get(meta.id);
-            return data;
-        } catch { /* cache miss */ }
-
-        // 2. Backend fallback
-        const location = meta.locations?.find(l => l.synced);
-        if (!location) return null;
-
-        const backend = this.#backends.get(location.backend);
-        if (!backend) return null;
-
-        const data = await backend.get(location.key, options);
-
-        // 3. Cache on read (buffer only)
-        if (data && Buffer.isBuffer(data)) {
-            this.#cache.put(meta.id, data).catch(() => {});
-        }
-
-        return data;
-    }
+    async get(idOrKey) { return this.#read(idOrKey, false); }
+    async getStream(idOrKey) { return this.#read(idOrKey, true); }
 
     async delete(idOrKey, options = {}) {
         const meta = this.#index.get(idOrKey);
-        if (!meta) return { deleted: [] };
+        if (!meta) return { ok: false, reason: 'not-found' };
 
-        // Remove from cache
         this.#cache.delete(meta.id).catch(() => {});
 
-        const targets = options.backends
-            ? meta.locations.filter(l => options.backends.includes(l.backend))
-            : meta.locations;
-
-        const deleted = [];
-        for (const loc of targets) {
-            const backend = this.#backends.get(loc.backend);
-            if (backend && await backend.delete(loc.key)) deleted.push(loc.backend);
+        let targets = meta.locations || [];
+        if (Array.isArray(options.urls)) {
+            const set = new Set(options.urls);
+            targets = targets.filter(l => set.has(`stored://${l.backend}/${l.key}`));
+        } else if (Array.isArray(options.backends)) {
+            targets = targets.filter(l => options.backends.includes(l.backend));
         }
 
-        if (!options.backends || deleted.length === meta.locations.length) {
+        const deleted = [];
+        const removed = new Set();
+        for (const loc of targets) {
+            const backend = this.#backends.get(loc.backend);
+            if (backend && await backend.delete(loc.key)) {
+                deleted.push(loc.backend);
+                removed.add(loc);
+            }
+        }
+
+        const remaining = (meta.locations || []).filter(l => !removed.has(l));
+        if (remaining.length === 0) {
             this.#index.delete(meta.id);
         } else {
-            meta.locations = meta.locations.filter(l => !deleted.includes(l.backend));
+            meta.locations = remaining;
             this.#index.put(meta.id, meta);
         }
 
         this.emit('delete', { id: meta.id, backends: deleted });
-        return { deleted };
+        return { ok: true, deleted, kept: remaining.map(l => l.backend) };
     }
 
-    stat(idOrKey) { return this.#index.get(idOrKey); }
-    has(idOrKey) { return this.#index.has(idOrKey); }
+    async stat(idOrKey) { return this.#index.get(idOrKey); }
+    async has(idOrKey) { return this.#index.has(idOrKey); }
 
-    async *list(options = {}) {
-        const { backend: backendName, prefix } = options;
+    /**
+     * Where does the content behind `idOrKey` actually live? Returns the
+     * canonical, resolvable `stored://<backend>/<key>` URLs plus per-location
+     * metadata. Single source of truth for the URL grammar — consumers map
+     * these straight into synapsd documents and read them back via getByUrl.
+     */
+    async locations(idOrKey) {
+        const meta = this.#index.get(idOrKey);
+        return (meta?.locations || []).map(l => {
+            const backend = this.#backends.get(l.backend);
+            return {
+                url: `stored://${l.backend}/${l.key}`,
+                nativeUrl: backend ? backend.nativeUrl(l.key) : null,
+                backend: l.backend,
+                key: l.key,
+                driver: l.driver,
+                synced: l.synced,
+                size: l.size,
+                source: l.source,
+            };
+        });
+    }
 
-        if (backendName) {
-            const backend = this.#backends.get(backendName);
-            if (backend) yield* backend.list({ prefix });
-        } else {
-            for (const [, meta] of this.#index.entries()) {
-                yield meta;
-            }
-        }
+    // Iterate all indexed metadata entries.
+    async *list() {
+        for (const [, meta] of this.#index.entries()) yield meta;
+    }
+
+    // Iterate a single backend's native listing (raw keys, not index entries).
+    async *listBackend(name, options = {}) {
+        const backend = this.#backends.get(name);
+        if (backend) yield* backend.list(options);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Scan / Index
     // ─────────────────────────────────────────────────────────────────────────
 
-    async scan(backendName) {
-        const backends = backendName
+    /**
+     * Index existing objects from one backend (or all). `options` is forwarded
+     * verbatim to each backend's `scan()` so each driver defines its own knobs.
+     * File backends get a size+mtime skip predicate so unchanged files are not
+     * re-hashed. Returns { ok:true, backend, count, files } | { ok:false, reason }.
+     */
+    async scan(backendName, options = {}) {
+        const list = backendName
             ? [this.#backends.get(backendName)].filter(Boolean)
             : this.#backends.all();
+        if (backendName && !list.length) return { ok: false, reason: 'unknown-backend' };
 
-        const results = [];
-        for (const backend of backends) {
-            const files = await backend.scan({ algorithms: this.#config.checksums });
-            const presentKeys = new Set(files.map(file => file.key));
+        const files = [];
+        for (const backend of list) {
+            const rows = await backend.scan({
+                algorithms: this.#config.checksums,
+                knownChecksums: (k, st) => this.#knownIfUnchanged(backend.name, k, st),
+                ...options,
+            });
+            // Non-array results (e.g. imap returns { inserted, lastUid } and
+            // indexes via events) are not content-addressable here.
+            if (!Array.isArray(rows)) continue;
 
-            for (const file of files) {
-                if (file.checksums) {
-                    const id = formatId(file.checksums, this.#config.primaryChecksum);
-                    const existing = this.#index.get(id);
-                    const location = this.#buildLocation(file.backend, file.key, true);
-
-                    const locations = existing?.locations || [];
-                    if (!locations.some(l => l.backend === file.backend && l.key === file.key)) {
-                        locations.push(location);
-                    }
-
-                    this.#index.put(id, {
-                        checksums: file.checksums,
-                        size: file.size,
-                        mimeType: file.mimeType,
-                        locations,
-                    });
+            const presentKeys = new Set(rows.map(file => file.key));
+            for (const file of rows) {
+                if (!file.checksums) continue;
+                const id = formatId(file.checksums, this.#config.primaryChecksum);
+                const existing = this.#index.get(id);
+                const locations = existing?.locations || [];
+                const match = locations.find(l => l.backend === file.backend && l.key === file.key);
+                if (match) {
+                    match.size = file.size;
+                    match.mtime = file.modified;
+                } else {
+                    locations.push(this.#buildLocation(file.backend, file.key, true, { size: file.size, mtime: file.modified }));
                 }
+                this.#index.put(id, { checksums: file.checksums, size: file.size, mimeType: file.mimeType, locations });
             }
             this.#removeMissingLocations(backend.name, presentKeys);
-            results.push(...files);
+            files.push(...rows);
         }
-        return results;
+        return { ok: true, backend: backendName ?? null, count: files.length, files };
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -326,37 +332,138 @@ export default class Stored extends EventEmitter2 {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Private — blob normalization & helpers
+    // Private — reads
     // ─────────────────────────────────────────────────────────────────────────
 
-    async #normalizeBlob(blob) {
-        const algos = this.#config.checksums;
-        let data, checksums, mimeType;
+    async #read(idOrKey, stream) {
+        const meta = this.#index.get(idOrKey);
+        if (!meta) return null;
 
-        if (isBuffer(blob)) {
-            data = blob;
-            checksums = checksumBuffer(blob, algos);
-            mimeType = await detectMimeType(blob);
-        } else if (isFile(blob)) {
-            const fs = await import('fs');
-            data = await fs.promises.readFile(blob);
-            checksums = await checksumFile(blob, algos);
-            mimeType = await detectMimeType(blob);
-        } else if (isStream(blob)) {
-            const chunks = [];
-            for await (const chunk of blob) chunks.push(chunk);
-            data = Buffer.concat(chunks);
-            checksums = checksumBuffer(data, algos);
-            mimeType = await detectMimeType(data);
-        } else if (typeof blob === 'string') {
-            data = Buffer.from(blob);
-            checksums = checksumBuffer(data, algos);
-            mimeType = 'text/plain';
+        // 1. Cache by content id.
+        if (stream) {
+            const info = await this.#cache.getInfo(meta.id).catch(() => null);
+            if (info) return this.#cache.getStream(meta.id);
         } else {
-            throw new Error('Invalid blob type');
+            try { return (await this.#cache.get(meta.id)).data; } catch { /* miss */ }
         }
 
-        return { data, checksums, size: data.length, mimeType };
+        // 2. First synced backend location.
+        const location = meta.locations?.find(l => l.synced);
+        const backend = location && this.#backends.get(location.backend);
+        if (!backend) return null;
+
+        const data = await backend.get(location.key, { stream });
+        if (!stream && Buffer.isBuffer(data)) this.#cache.put(meta.id, data).catch(() => {});
+        return data;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Private — ingest (streaming + in-memory)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // Buffer / string: already resident, write directly (no temp file).
+    async #ingestMemory(blob, targets, key, mimeHint) {
+        const data = isBuffer(blob) ? blob : Buffer.from(blob);
+        const checksums = checksumBuffer(data, this.#config.checksums);
+        const id = formatId(checksums, this.#config.primaryChecksum);
+        const finalKey = key || this.#generateKey(checksums);
+        const mimeType = mimeHint || await detectMimeType(data);
+
+        const { locations, remoteTargets } = await this.#commit(targets, finalKey, id, { data }, { checksums, size: data.length, mimeType });
+        return { id, finalKey, checksums, size: data.length, mimeType, locations, remoteTargets };
+    }
+
+    // Path / stream: stream through a hash pass into a temp file on the primary
+    // local backend's filesystem, then commit (hardlink/rename) to targets.
+    async #ingestStream(blob, targets, key, mimeHint) {
+        const source = isStream(blob) ? blob : createReadStream(blob);
+        const firstLocal = targets.find(t => t.backend.type === 'local')?.backend;
+        const tempDir = firstLocal ? firstLocal.tempDir : path.join(this.#paths.cache, '.tmp');
+        const tempPath = path.join(tempDir, `${Date.now()}-${crypto.randomUUID()}`);
+        await fsp.mkdir(tempDir, { recursive: true });
+
+        let result;
+        try {
+            const { checksums, size, head } = await this.#hashToFile(source, tempPath);
+            const id = formatId(checksums, this.#config.primaryChecksum);
+            const finalKey = key || this.#generateKey(checksums);
+            const mimeType = mimeHint || await detectMimeFromHead(head, finalKey);
+
+            const { locations, remoteTargets } = await this.#commit(targets, finalKey, id, { file: tempPath }, { checksums, size, mimeType });
+            result = { id, finalKey, checksums, size, mimeType, locations, remoteTargets };
+        } finally {
+            await fsp.rm(tempPath, { force: true }).catch(() => {});
+        }
+        return result;
+    }
+
+    // Single streaming pass: hash (all algorithms), measure size, peek the head
+    // for mime sniffing, and write to `tempPath`. Never buffers the whole blob.
+    async #hashToFile(source, tempPath) {
+        const hashes = this.#config.checksums.map(algo => ({ algo, hash: crypto.createHash(algo) }));
+        const ws = createWriteStream(tempPath);
+        let size = 0;
+        const headChunks = [];
+        let headLen = 0;
+
+        try {
+            for await (const chunk of source) {
+                const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+                for (const { hash } of hashes) hash.update(buf);
+                size += buf.length;
+                if (headLen < HEAD_BYTES) {
+                    const slice = buf.subarray(0, HEAD_BYTES - headLen);
+                    headChunks.push(slice);
+                    headLen += slice.length;
+                }
+                if (!ws.write(buf)) await once(ws, 'drain');
+            }
+            ws.end();
+            await once(ws, 'finish');
+        } catch (err) {
+            ws.destroy();
+            throw err;
+        }
+
+        const checksums = {};
+        for (const { algo, hash } of hashes) checksums[algo] = hash.digest('hex');
+        return { checksums, size, head: Buffer.concat(headChunks) };
+    }
+
+    // Place ingested bytes on every target: local backends get the bytes now
+    // (buffer write or hardlink/copy from temp); remote targets get a cache
+    // entry + a SyncQueue placeholder. Returns { locations, remoteTargets }.
+    async #commit(targets, finalKey, id, source, meta) {
+        const locations = [];
+        const remoteTargets = [];
+
+        for (const { name, backend } of targets) {
+            if (backend.type === 'local') {
+                if (source.data) await backend.put(finalKey, source.data);
+                else await backend.commit(finalKey, source.file);
+                locations.push(this.#buildLocation(name, finalKey, true, { size: meta.size }));
+            } else {
+                locations.push(this.#buildLocation(name, finalKey, false, { size: meta.size }));
+                remoteTargets.push({ name, driver: backend.config.driver, root: backend.config.root, key: finalKey });
+            }
+        }
+
+        if (remoteTargets.length) {
+            const cacheMeta = { key: finalKey, checksums: meta.checksums, size: meta.size, mimeType: meta.mimeType };
+            if (source.data) await this.#cache.put(id, source.data, cacheMeta);
+            else await pipeline(createReadStream(source.file), this.#cache.putStream(id, cacheMeta));
+        }
+
+        return { locations, remoteTargets };
+    }
+
+    // Skip-hash predicate for scan: returns the cached descriptor when a file's
+    // size+mtime match an existing indexed location, else null.
+    #knownIfUnchanged(backendName, key, stat) {
+        const meta = this.#index.get(`${backendName}:${key}`);
+        const loc = meta?.locations?.find(l => l.backend === backendName && l.key === key);
+        if (!loc || loc.size !== stat.size || loc.mtime !== stat.mtime) return null;
+        return { checksums: meta.checksums, mimeType: meta.mimeType };
     }
 
     #generateKey(checksums) {
@@ -364,7 +471,7 @@ export default class Stored extends EventEmitter2 {
         return `${hash.slice(0, 2)}/${hash.slice(2, 4)}/${hash}`;
     }
 
-    #buildLocation(backendName, key, synced) {
+    #buildLocation(backendName, key, synced, extra = {}) {
         const backend = this.#backends.get(backendName);
         const config = backend?.config || {};
 
@@ -373,6 +480,7 @@ export default class Stored extends EventEmitter2 {
             driver: config.driver || null,
             key,
             synced,
+            ...extra,
             source: this.#buildSourceDescriptor(backendName, key, config),
         };
     }
@@ -422,7 +530,7 @@ export default class Stored extends EventEmitter2 {
 
     #handleFileEvent(event, data) {
         const pathKey = `${data.backend}:${data.key}`;
-        const location = this.#buildLocation(data.backend, data.key, true);
+        const location = this.#buildLocation(data.backend, data.key, true, { size: data.size, mtime: data.modified });
 
         if (event === 'file:add' && data.checksums) {
             const id = formatId(data.checksums, this.#config.primaryChecksum);
