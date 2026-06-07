@@ -4,6 +4,19 @@ We'll design a simple CRUD data storage/retrieval middleware that aims to abstra
 
 ! This module only abstracts blob backends - mailboxes/git/etc live in separate connectors
 
+## TODO
+
+- **Batch operations with a configurable batch size.** Scan/index/resync currently
+  processes files one at a time (the consumer-side resync loop does a sequential
+  per-file upsert, which is O(n) DB round-trips and slow for large or remote
+  backends). `scan()` should yield/return work in batches and downstream
+  indexing should consume them in batches (e.g. via synapsd `putMany` /
+  `putManyDirectoryPaths` — one transaction + one bitmap flush per batch).
+  Batch size must be configurable (per backend and/or global, e.g.
+  `config.batchSize`, default ~500) to trade off memory vs throughput, and the
+  same batching should apply to delete/sync queue draining where backends
+  support bulk operations.
+
 ## API
 
 ### Core (MVP)
