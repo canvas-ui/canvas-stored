@@ -96,7 +96,7 @@ export default class Stored extends EventEmitter2 {
 
     /**
      * Parse a canonical `stored://<backend>/<key>` URL. The backend name may
-     * itself contain colons (e.g. `fs:data:email`), so we split on the first
+     * itself contain colons (e.g. `workspace:data`), so we split on the first
      * `/` after the scheme. Returns { backend, key } or null if malformed.
      */
     #parseStoredUrl(url) {
