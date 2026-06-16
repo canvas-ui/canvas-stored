@@ -68,8 +68,8 @@ export default class Stored extends EventEmitter2 {
         backend.on('file:add', e => this.#handleFileEvent('file:add', e));
         backend.on('file:change', e => this.#handleFileEvent('file:change', e));
         backend.on('file:unlink', e => this.#handleFileEvent('file:unlink', e));
-        // Generic change events from non-file backends (e.g. imap message:add) —
-        // forwarded as-is for the workspace indexer; they carry {backend, kind, key, ...}.
+        // Generic change events from non-file backends — forwarded as-is for
+        // consumers; they carry {backend, kind, key, ...}.
         backend.on('object:add', e => this.emit('object:add', e));
         backend.on('object:change', e => this.emit('object:change', e));
         backend.on('object:unlink', e => this.emit('object:unlink', e));
@@ -277,8 +277,8 @@ export default class Stored extends EventEmitter2 {
                 knownChecksums: (k, st) => this.#knownIfUnchanged(backend.name, k, st),
                 ...options,
             });
-            // Non-array results (e.g. imap returns { inserted, lastUid } and
-            // indexes via events) are not content-addressable here.
+            // Backends whose scan() reports via events instead of returning rows
+            // (non-array result) are not content-addressable here.
             if (!Array.isArray(rows)) continue;
 
             const presentKeys = new Set(rows.map(file => file.key));

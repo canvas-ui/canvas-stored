@@ -1,15 +1,16 @@
 import Debug from 'debug';
 import FileBackend from './file/index.js';
+import CacacheBackend from './cacache/index.js';
 import S3Backend from './s3/index.js';
 import HttpBackend from './http/index.js';
-import ImapBackend from './imap/index.js';
 
 const debug = Debug('stored:backends');
 
-// `s3`/`http`/`imap` are skeletons (see their index.js). `smb`/`webdav` are
-// reserved scheme names with no driver yet — register a driver class here when
-// implemented.
-const DRIVERS = { file: FileBackend, s3: S3Backend, http: HttpBackend, imap: ImapBackend };
+// `s3`/`http` are skeletons (see their index.js). `smb`/`webdav` are reserved
+// scheme names with no driver yet — register a driver class here when
+// implemented. Non-blob connectors (mail/git/…) are NOT stored drivers; they
+// live in separate workspace services and only use stored to persist blobs.
+const DRIVERS = { file: FileBackend, cacache: CacacheBackend, s3: S3Backend, http: HttpBackend };
 
 export default class BackendManager {
     #backends = new Map();

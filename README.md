@@ -145,8 +145,8 @@ Canonical fetch/delete form: `stored://<backend>/<key>`. Backend names may conta
 
 | Field | Description |
 |-------|-------------|
-| `driver` | `'file'` \| `'s3'` \| `'http'` \| `'imap'` |
-| `watch` | Start backend watcher when true (file: chokidar; imap: poll + scan) |
+| `driver` | `'file'` \| `'cacache'` \| `'s3'` \| `'http'` |
+| `watch` | Start backend watcher when true (file: chokidar) |
 | `root` | File backend root directory (required for `file`) |
 | `ignored` | chokidar ignore pattern (file backend) |
 | `provider`, `account`, `container`, `bucket`, `share`, `folder` | Override `location.source` fields (else derived from backend name + config) |
@@ -225,11 +225,13 @@ Registered in `BackendManager` via `DRIVERS`:
 | Driver | Type | Status | Notes |
 |--------|------|--------|-------|
 | `file` | `local` | complete | CRUD, chokidar `watch`, `scan` |
+| `cacache` | `local` | complete | Content-addressable blob store (cacache); CRUD, no `watch`/`scan` |
 | `http` | `remote` | partial | Read-only `get` / `stat` via `fetch`; `config.baseUrl`, `headers` |
 | `s3` | `remote` | skeleton | Registered for URL parsing; CRUD not implemented |
-| `imap` | `remote` | functional | Poll + `scan`; keys `<folder>;UID=<n>`; emits `object:add` (`kind: 'message'`) |
 
 Each backend implements `StorageBackend`: `put`, `get`, `delete`, `stat`, `list`; optional `commit` (local, for streaming put), `watch`, `scan`, `stop`.
+
+> StoreD abstracts **blob** backends only. Non-blob connectors (mail/IMAP, git, …) are not drivers here — they live in separate consumer services and use StoreD only to persist the blobs they produce. The generic `object:*` / `backend:state` event surface still lets such a connector emit through a host that wraps StoreD, but the IMAP protocol itself is no longer bundled.
 
 | Capability | Meaning |
 |------------|---------|
@@ -243,25 +245,18 @@ Each backend implements `StorageBackend`: `put`, `get`, `delete`, `stat`, `list`
 { driver: 'file', root: '/path/to/root', watch: true, ignored: /pattern/, algorithms: ['sha256'] }
 ```
 
+### `cacache` driver config
+
+```js
+{ driver: 'cacache', root: '/path/to/blobstore', algorithms: ['sha256'] }
+```
+
+Content-addressable local blob store backed by [cacache](https://www.npmjs.com/package/cacache): bytes are sha-keyed, deduped, and integrity-checked. Same key→value CRUD surface as `file` (`put`/`commit`/`get`/`delete`/`stat`/`list`), so it is a drop-in `type: 'local'` write target — bytes land synchronously on `put`, no `SyncQueue`. `config.root` is the only required field ("the data route"); `nativeUrl` is `null` (the store is internal — `stored://<backend>/<key>` is the sole address) and the store is **not** watched/scanned (a managed write target, not an external source). canvas-server wires it as the opt-in `workspace:data` backend (disabled by default).
+
 ### `http` driver config
 
 ```js
 { driver: 'http', baseUrl: 'https://cdn.example/', account: 'cdn', headers: {} }
-```
-
-### `imap` driver config
-
-```js
-{
-  driver: 'imap',
-  host, port: 993, tls: true, allowSelfSigned: false,
-  user, password,
-  folder: 'INBOX',
-  account: 'user@example.com',
-  pollInterval: 60000,
-  initialSyncDays: 180,
-  lastUid: 0,
-}
 ```
 
 ---
@@ -277,7 +272,7 @@ Stored re-emits backend events and adds its own. File watcher events are duplica
 | `file:add` | `{ backend, key, path, checksums, mimeType, size, id, locations }` |
 | `file:change` | Same shape on modify (emits `object:unlink` for old content, then `object:add` for new) |
 | `file:unlink` | `{ backend, key, path?, id?, checksums?, locations? }` |
-| `object:add` | `{ kind: 'file', … }` or from IMAP: `{ kind: 'message', backend, key, … }` |
+| `object:add` | `{ kind: 'file', … }` (or `{ kind, backend, key, … }` from a non-file connector emitting through stored) |
 | `object:change` | Forwarded from backends that emit it |
 | `object:unlink` | Forwarded or synthesized on file delete |
 
@@ -292,7 +287,7 @@ Wildcard: `object:*`, `file:*`, `scan:*`.
 | `synced` | `{ id, results }` — `results[]` has `{ backend, success, … }`; successful rows set `location.synced = true` |
 | `scan:start` | `{ backend }` |
 | `scan:complete` | `{ backend, count }` |
-| `backend:state` | Backend-specific (e.g. IMAP `{ backend, lastUid }`) |
+| `backend:state` | Backend-specific cursor/state `{ backend, … }` (forwarded for any connector that emits it) |
 | `error` | From backends or sync queue |
 
 ---
