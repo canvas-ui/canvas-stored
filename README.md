@@ -1,6 +1,6 @@
 # StoreD
 
-Cache-first blob storage with a content-addressable local cache, LMDB metadata index, and pluggable backends. Local backends write immediately; remote backends sync through a worker-thread queue.
+Cache-first blob storage with a content-addressable local cache, LMDB metadata index and pluggable backends. Local backends write immediately remote backends sync through a worker-thread queue.
 
 Used with canvas-server/synapsd to build virtual context trees over indexed data: checksum-based identity, multi-location replication, and `stored://` URLs as the canonical fetch form.
 
