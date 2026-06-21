@@ -31,7 +31,7 @@ const stored = new Stored({
 
 stored.addBackend('fs:home', {
   driver: 'file',
-  root: './home',                       // any path — not tied to .stored/data
+  root: './home',                       // any path - not tied to .stored/data
   watch: true,
   ignored: /node_modules/,
 });
@@ -39,7 +39,7 @@ stored.addBackend('fs:home', {
 stored.on('object:add', ({ kind, id, key }) => { /* index in synapsd */ });
 stored.on('synced', ({ id, results }) => { /* remote write finished */ });
 
-// `backends` is required — there is no implicit fan-out.
+// `backends` is required - there is no implicit fan-out.
 const res = await stored.put(Buffer.from('hello'), { key: 'docs/hello.txt', backends: ['fs:home'] });
 const data = await stored.get(res.id);
 await stored.getByUrl('stored://fs:home/docs/hello.txt');
@@ -124,7 +124,7 @@ Canonical fetch/delete form: `stored://<backend>/<key>`. Backend names may conta
 
 | Method | Description |
 |--------|-------------|
-| `getByUrl(url)` | `backend.get(key)` — bypasses the content index. Returns `Buffer \| null` (never throws on bad input). |
+| `getByUrl(url)` | `backend.get(key)` - bypasses the content index. Returns `Buffer \| null` (never throws on bad input). |
 | `getStreamByUrl(url)` | Same as `getByUrl` but returns a `Readable \| null`. |
 | `deleteByUrl(url)` | Deletes bytes on the backend only (does not update the LMDB index). Returns `{ ok: boolean, reason?: string }` where `reason` is `malformed-url`, `unknown-backend`, or `read-only-backend`. |
 
@@ -157,7 +157,7 @@ Throws if the name exists or the driver is unknown.
 
 #### `put(blob, options?) → Promise<{ ok, id, key, size, mimeType, checksums, locations, … }>`
 
-Accepts `Buffer`, `string` (content), filesystem path (`string` path readable as file), or `Readable` stream. Paths and streams are hashed and written in a single streaming pass — the whole blob is never held in memory.
+Accepts `Buffer`, `string` (content), filesystem path (`string` path readable as file), or `Readable` stream. Paths and streams are hashed and written in a single streaming pass - the whole blob is never held in memory.
 
 | Option | Default | Description |
 |--------|---------|-------------|
@@ -193,8 +193,8 @@ Emits `delete` with `{ id, backends }` (names deleted).
 
 Where the content actually lives: `{ url, nativeUrl, backend, key, driver, synced, size, source }` per location.
 
-- `url` — canonical `stored://<backend>/<key>`, the fetch form (`getByUrl`). Single source of truth for the grammar.
-- `nativeUrl` — the real protocol URL for provenance/UI: `https://…`, `s3://bucket/…`, `imap://account/…`, `file://…` (local), or `null` when the backend has none.
+- `url` - canonical `stored://<backend>/<key>`, the fetch form (`getByUrl`). Single source of truth for the grammar.
+- `nativeUrl` - the real protocol URL for provenance/UI: `https://…`, `s3://bucket/…`, `imap://account/…`, `file://…` (local), or `null` when the backend has none.
 
 Returns `[]` when unknown. Backend drivers render `nativeUrl(key)`; remote backends are the interesting case (a blob can live under several names across backends).
 
@@ -231,7 +231,7 @@ Registered in `BackendManager` via `DRIVERS`:
 
 Each backend implements `StorageBackend`: `put`, `get`, `delete`, `stat`, `list`; optional `commit` (local, for streaming put), `watch`, `scan`, `stop`.
 
-> StoreD abstracts **blob** backends only. Non-blob connectors (mail/IMAP, git, …) are not drivers here — they live in separate consumer services and use StoreD only to persist the blobs they produce. The generic `object:*` / `backend:state` event surface still lets such a connector emit through a host that wraps StoreD, but the IMAP protocol itself is no longer bundled.
+> StoreD abstracts **blob** backends only. Non-blob connectors (mail/IMAP, git, …) are not drivers here - they live in separate consumer services and use StoreD only to persist the blobs they produce. The generic `object:*` / `backend:state` event surface still lets such a connector emit through a host that wraps StoreD, but the IMAP protocol itself is no longer bundled.
 
 | Capability | Meaning |
 |------------|---------|
@@ -251,7 +251,7 @@ Each backend implements `StorageBackend`: `put`, `get`, `delete`, `stat`, `list`
 { driver: 'cacache', root: '/path/to/blobstore', algorithms: ['sha256'] }
 ```
 
-Content-addressable local blob store backed by [cacache](https://www.npmjs.com/package/cacache): bytes are sha-keyed, deduped, and integrity-checked. Same key→value CRUD surface as `file` (`put`/`commit`/`get`/`delete`/`stat`/`list`), so it is a drop-in `type: 'local'` write target — bytes land synchronously on `put`, no `SyncQueue`. `config.root` is the only required field ("the data route"); `nativeUrl` is `null` (the store is internal — `stored://<backend>/<key>` is the sole address) and the store is **not** watched/scanned (a managed write target, not an external source). canvas-server wires it as the opt-in `workspace:data` backend (disabled by default).
+Content-addressable local blob store backed by [cacache](https://www.npmjs.com/package/cacache): bytes are sha-keyed, deduped, and integrity-checked. Same key→value CRUD surface as `file` (`put`/`commit`/`get`/`delete`/`stat`/`list`), so it is a drop-in `type: 'local'` write target - bytes land synchronously on `put`, no `SyncQueue`. `config.root` is the only required field ("the data route"); `nativeUrl` is `null` (the store is internal - `stored://<backend>/<key>` is the sole address) and the store is **not** watched/scanned (a managed write target, not an external source). canvas-server wires it as the opt-in `workspace:data` backend (disabled by default).
 
 ### `http` driver config
 
@@ -284,7 +284,7 @@ Wildcard: `object:*`, `file:*`, `scan:*`.
 |-------|---------|
 | `put` | `{ id, key, metadata }` |
 | `delete` | `{ id, backends }` |
-| `synced` | `{ id, results }` — `results[]` has `{ backend, success, … }`; successful rows set `location.synced = true` |
+| `synced` | `{ id, results }` - `results[]` has `{ backend, success, … }`; successful rows set `location.synced = true` |
 | `scan:start` | `{ backend }` |
 | `scan:complete` | `{ backend, count }` |
 | `backend:state` | Backend-specific cursor/state `{ backend, … }` (forwarded for any connector that emits it) |
