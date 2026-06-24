@@ -116,6 +116,8 @@ Implementation should be flexible enough to easily add additional backends like 
 
 ### Services
 
+#### EmbedD
+
 #### ChecksumD
 
 - Mandatory for ingestion only
