@@ -8,6 +8,10 @@ import StorageBackend from '../StorageBackend.js';
 
 const debug = Debug('stored:backend:cacache');
 
+// memoize:false — this store fronts blobs up to ~20GB across 1M+ entries; never
+// let cacache's in-memory LRU hold content. All bytes flow through streams.
+const CACHE_OPTS = { memoize: false };
+
 /**
  * cacache storage backend — a content-addressable local blob store.
  *
@@ -52,7 +56,7 @@ export default class CacacheBackend extends StorageBackend {
     // ─────────────────────────────────────────────────────────────────────────
 
     async put(key, data) {
-        await cacache.put(this.#root, key, data, { algorithms: this.#algorithms });
+        await cacache.put(this.#root, key, data, { algorithms: this.#algorithms, ...CACHE_OPTS });
         const size = Buffer.isBuffer(data) ? data.length : Buffer.byteLength(data);
         debug(`PUT ${key} (${size} bytes)`);
         return { key, size };
@@ -61,7 +65,7 @@ export default class CacacheBackend extends StorageBackend {
     // Commit an already-written file (the Stored streaming-ingest temp) at `key`
     // by streaming it into the content store.
     async commit(key, srcPath) {
-        await pipeline(createReadStream(srcPath), cacache.put.stream(this.#root, key, { algorithms: this.#algorithms }));
+        await pipeline(createReadStream(srcPath), cacache.put.stream(this.#root, key, { algorithms: this.#algorithms, ...CACHE_OPTS }));
         const info = await cacache.get.info(this.#root, key);
         const size = info?.size ?? 0;
         debug(`COMMIT ${key} (${size} bytes)`);
@@ -72,10 +76,10 @@ export default class CacacheBackend extends StorageBackend {
         if (options.stream) {
             // get.stream emits ENOENT on miss; surface null instead of throwing.
             const exists = await cacache.get.info(this.#root, key);
-            return exists ? cacache.get.stream(this.#root, key) : null;
+            return exists ? cacache.get.stream(this.#root, key, CACHE_OPTS) : null;
         }
         try {
-            const { data } = await cacache.get(this.#root, key);
+            const { data } = await cacache.get(this.#root, key, CACHE_OPTS);
             return data;
         } catch (err) {
             if (err.code === 'ENOENT') return null;
@@ -99,10 +103,11 @@ export default class CacacheBackend extends StorageBackend {
 
     async *list(options = {}) {
         const { prefix = '' } = options;
-        const entries = await cacache.ls(this.#root);
-        for (const [key, info] of Object.entries(entries)) {
-            if (prefix && !key.startsWith(prefix)) continue;
-            yield { key, size: info.size, modified: info.time, created: info.time };
+        // Stream the index so a 1M+ entry store is walked without ever building
+        // the full key→info map in memory.
+        for await (const info of cacache.ls.stream(this.#root)) {
+            if (prefix && !info.key.startsWith(prefix)) continue;
+            yield { key: info.key, size: info.size, modified: info.time, created: info.time };
         }
     }
 
