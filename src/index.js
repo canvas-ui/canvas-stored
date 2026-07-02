@@ -24,6 +24,7 @@ export default class Stored extends EventEmitter2 {
     #config;
     #paths;
     #syncQueue;
+    #extract;   // optional injected metadata extractor: (source,{mimeType,key})→Promise<obj>
 
     constructor(config = {}) {
         // Wildcards (':' delimiter) let consumers bind `object:*` across backends.
@@ -34,6 +35,8 @@ export default class Stored extends EventEmitter2 {
             primaryChecksum: config.primaryChecksum || 'sha256',
             ...config,
         };
+
+        this.#extract = typeof config.extract === 'function' ? config.extract : null;
 
         this.#cache = new Cache({ path: this.#paths.cache, algorithms: this.#config.checksums });
         this.#backends = new BackendManager();
@@ -161,12 +164,15 @@ export default class Stored extends EventEmitter2 {
             ? await this.#ingestMemory(blob, targets, key, options.mimeType)
             : await this.#ingestStream(blob, targets, key, options.mimeType);
 
+        // Caller-supplied metadata + inline-extracted (EXIF/GPS/dimensions/media)
+        // → persisted under `custom`, returned to caller + on the 'put' event.
+        const extracted = ingest.extracted && Object.keys(ingest.extracted).length ? ingest.extracted : null;
         const meta = this.#index.put(ingest.id, {
             checksums: ingest.checksums,
             size: ingest.size,
             mimeType: ingest.mimeType,
             locations: ingest.locations,
-            custom: metadata,
+            custom: extracted ? { ...metadata, ...extracted } : metadata,
         });
 
         if (ingest.remoteTargets.length) {
@@ -361,6 +367,15 @@ export default class Stored extends EventEmitter2 {
     // Private — ingest (streaming + in-memory)
     // ─────────────────────────────────────────────────────────────────────────
 
+    // Best-effort extraction hook — bytes are in hand at ingest (works even for
+    // remote/S3-destined blobs, which still pass through the server here). Never
+    // throws; returns {} when disabled/unsupported/failed.
+    async #maybeExtract(source, mimeType, key) {
+        if (!this.#extract) { return {}; }
+        try { return (await this.#extract(source, { mimeType, key })) || {}; }
+        catch (e) { debug(`extract hook failed (${mimeType}): ${e.message}`); return {}; }
+    }
+
     // Buffer / string: already resident, write directly (no temp file).
     async #ingestMemory(blob, targets, key, mimeHint) {
         const data = isBuffer(blob) ? blob : Buffer.from(blob);
@@ -369,8 +384,9 @@ export default class Stored extends EventEmitter2 {
         const finalKey = key || this.#generateKey(checksums);
         const mimeType = mimeHint || await detectMimeType(data);
 
+        const extracted = await this.#maybeExtract({ data }, mimeType, finalKey);
         const { locations, remoteTargets } = await this.#commit(targets, finalKey, id, { data }, { checksums, size: data.length, mimeType });
-        return { id, finalKey, checksums, size: data.length, mimeType, locations, remoteTargets };
+        return { id, finalKey, checksums, size: data.length, mimeType, locations, remoteTargets, extracted };
     }
 
     // Path / stream: stream through a hash pass into a temp file on the primary
@@ -389,8 +405,11 @@ export default class Stored extends EventEmitter2 {
             const finalKey = key || this.#generateKey(checksums);
             const mimeType = mimeHint || await detectMimeFromHead(head, finalKey);
 
+            // Extract from the whole temp file (head=4KB is too small for EXIF),
+            // before the finally-block deletes it.
+            const extracted = await this.#maybeExtract({ file: tempPath }, mimeType, finalKey);
             const { locations, remoteTargets } = await this.#commit(targets, finalKey, id, { file: tempPath }, { checksums, size, mimeType });
-            result = { id, finalKey, checksums, size, mimeType, locations, remoteTargets };
+            result = { id, finalKey, checksums, size, mimeType, locations, remoteTargets, extracted };
         } finally {
             await fsp.rm(tempPath, { force: true }).catch(() => {});
         }
