@@ -48,6 +48,47 @@ export default class FileBackend extends StorageBackend {
 
     #resolvePath(key) { return path.join(this.#root, key); }
 
+    // Resolve a key to an absolute path, refusing anything that escapes the
+    // backend root (path traversal) or targets the root itself. Used by the
+    // container (directory) mutation ops.
+    #safeResolve(key) {
+        const target = path.resolve(this.#root, String(key || ''));
+        const rel = path.relative(this.#root, target);
+        if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+            throw new Error(`Path escapes backend root: ${key}`);
+        }
+        return target;
+    }
+
+    // ── Container (directory) ops — only meaningful for a real filesystem, so
+    // they live on the file driver (StorageBackend throws by default). Watched
+    // backends reflect the byte changes; empty directories are surfaced by the
+    // caller (Workspace) inserting a tree node.
+    async createContainer(key) {
+        const dir = this.#safeResolve(key);
+        await fs.ensureDir(dir);
+        debug(`MKDIR ${key}`);
+        return { key };
+    }
+
+    async deleteContainer(key) {
+        const dir = this.#safeResolve(key);
+        if (!await fs.pathExists(dir)) return false;
+        await fs.remove(dir);
+        debug(`RMDIR ${key}`);
+        return true;
+    }
+
+    async renameContainer(fromKey, toKey) {
+        const from = this.#safeResolve(fromKey);
+        const to = this.#safeResolve(toKey);
+        if (!await fs.pathExists(from)) throw new Error(`Container not found: ${fromKey}`);
+        await fs.ensureDir(path.dirname(to));
+        await fs.move(from, to, { overwrite: false });
+        debug(`MV ${fromKey} -> ${toKey}`);
+        return { from: fromKey, to: toKey };
+    }
+
     async put(key, data) {
         const filePath = this.#resolvePath(key);
         await fs.ensureDir(path.dirname(filePath));

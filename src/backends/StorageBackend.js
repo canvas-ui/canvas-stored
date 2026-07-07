@@ -41,4 +41,11 @@ export default class StorageBackend extends EventEmitter {
     async watch() { return false; }
     async scan() { return []; }
     async stop() { }
+
+    // Optional container (directory/folder) mutation — only backends with a real
+    // hierarchical namespace (the file driver) implement these. Advertised via
+    // the Workspace `mutableContainers` capability; callers must gate on it.
+    async createContainer(key) { throw new Error('Container ops not supported by this backend'); }
+    async deleteContainer(key) { throw new Error('Container ops not supported by this backend'); }
+    async renameContainer(fromKey, toKey) { throw new Error('Container ops not supported by this backend'); }
 }
