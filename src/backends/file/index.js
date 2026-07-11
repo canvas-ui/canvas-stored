@@ -2,6 +2,7 @@ import fs from 'fs-extra';
 import path from 'path';
 import { pathToFileURL } from 'url';
 import chokidar from 'chokidar';
+import picomatch from 'picomatch';
 import Debug from 'debug';
 import StorageBackend from '../StorageBackend.js';
 import { checksumFile } from '../../utils/checksum.js';
@@ -20,6 +21,7 @@ export default class FileBackend extends StorageBackend {
     #watcher = null;
     #watchEnabled;
     #ignored;
+    #ignoreMatcher = null;
     #defaultAlgorithms = ['sha256'];
 
     constructor(name, config = {}) {
@@ -28,6 +30,7 @@ export default class FileBackend extends StorageBackend {
         this.#root = path.resolve(config.root);
         this.#watchEnabled = config.watch ?? false;
         this.#ignored = config.ignored || null;
+        this.#ignoreMatcher = this.#buildIgnoreMatcher(this.#ignored);
         this.#defaultAlgorithms = config.algorithms || ['sha256'];
         this.type = 'local';
         fs.ensureDirSync(this.#root);
@@ -37,6 +40,46 @@ export default class FileBackend extends StorageBackend {
     get root() { return this.#root; }
     get tempDir() { return path.join(this.#root, TMP_DIR); }
     get watching() { return !!this.#watcher; }
+    get capabilities() { return { ...super.capabilities, canEnumerate: true }; }
+
+    // One matcher shared by watch(), list() and (via list) scan(), so exclusion
+    // patterns behave identically live and on resync. Accepts glob strings,
+    // RegExps and predicate functions (rel-path based, '/'-separated). Chokidar
+    // v4+ dropped glob support in `ignored`, hence the picomatch bridge.
+    #buildIgnoreMatcher(patterns) {
+        if (!patterns) return null;
+        const list = (Array.isArray(patterns) ? patterns : [patterns]).filter(Boolean);
+        if (list.length === 0) return null;
+
+        const globs = [];
+        const regexes = [];
+        const fns = [];
+        for (const pattern of list) {
+            if (typeof pattern === 'string') {
+                globs.push(pattern);
+                // "**/node_modules/**" should also prune the directory itself so
+                // enumeration/watch never descends into it.
+                if (pattern.endsWith('/**')) globs.push(pattern.slice(0, -3));
+            } else if (pattern instanceof RegExp) {
+                regexes.push(pattern);
+            } else if (typeof pattern === 'function') {
+                fns.push(pattern);
+            }
+        }
+        const globMatch = globs.length > 0 ? picomatch(globs, { dot: true }) : null;
+        return (relPath) => {
+            const rel = String(relPath).split(path.sep).join('/');
+            if (rel === '' || rel === '.') return false;
+            if (globMatch && globMatch(rel)) return true;
+            if (regexes.some((re) => re.test(rel))) return true;
+            if (fns.some((fn) => fn(rel))) return true;
+            return false;
+        };
+    }
+
+    #isIgnored(relPath) {
+        return this.#ignoreMatcher ? this.#ignoreMatcher(relPath) : false;
+    }
 
     // Truthful server-side location. Consumers decide whether to surface a local
     // path to clients (it leaks the server fs layout); stored:// is the address.
@@ -146,6 +189,7 @@ export default class FileBackend extends StorageBackend {
         const entries = await fs.readdir(searchPath, { withFileTypes: true });
         for (const entry of entries) {
             const relativePath = path.join(prefix, entry.name);
+            if (this.#isIgnored(relativePath)) continue;
             if (entry.isFile()) {
                 yield { key: relativePath, ...(await this.stat(relativePath)) };
             } else if (entry.isDirectory() && recursive) {
@@ -166,7 +210,14 @@ export default class FileBackend extends StorageBackend {
             ignoreInitial: true,
             awaitWriteFinish: { stabilityThreshold: 200, pollInterval: 50 },
         };
-        watchOpts.ignored = this.#ignored ? [TMP_IGNORE, this.#ignored] : [TMP_IGNORE];
+        // Chokidar hands us absolute paths; route them through the shared
+        // rel-path matcher so watch and list/scan agree on exclusions.
+        watchOpts.ignored = (p) => {
+            if (TMP_IGNORE.test(p)) return true;
+            const rel = path.relative(this.#root, p);
+            if (!rel || rel.startsWith('..')) return false;
+            return this.#isIgnored(rel);
+        };
 
         this.#watcher = chokidar.watch(this.#root, watchOpts);
 

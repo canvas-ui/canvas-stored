@@ -44,6 +44,9 @@ export default class CacacheBackend extends StorageBackend {
     }
 
     get root() { return this.#root; }
+    // list() streams the cacache index, so full-key enumeration works even
+    // though the store is opaque byte-wise.
+    get capabilities() { return { ...super.capabilities, canEnumerate: true }; }
     // Staging dir for the Stored streaming-ingest hash pass (shares a filesystem
     // with the store so the temp file is cheap to read back on commit).
     get tempDir() { return path.join(this.#root, 'tmp'); }

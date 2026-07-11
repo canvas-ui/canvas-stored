@@ -21,7 +21,8 @@
     "image-size": "^2.0.2",
     "imap": "^0.8.19",
     "lmdb": "^3.5.2",
-    "music-metadata": "^11.9.0"
+    "music-metadata": "^11.9.0",
+    "picomatch": "^2.3.1"
   },
   "engines": {
     "node": ">=20.0.0"

@@ -18,8 +18,11 @@ export default class StorageBackend extends EventEmitter {
      * Default is fully read-write; read-only backends (e.g. HTTP) override.
      * `delete:false` means a location on this backend can only be dropped as a
      * reference — its bytes cannot be removed by us.
+     * `canEnumerate:true` means the backend implements the async-generator
+     * `list()` (and usually `scan()`) so callers can mirror its whole tree;
+     * drivers without real enumeration (http, s3 skeleton) leave it false.
      */
-    get capabilities() { return { read: true, write: true, delete: true }; }
+    get capabilities() { return { read: true, write: true, delete: true, canEnumerate: false }; }
     get canDelete() { return this.capabilities.delete !== false; }
 
     // The real, protocol-native URL for `key` (e.g. https://…, s3://…, smb://…,

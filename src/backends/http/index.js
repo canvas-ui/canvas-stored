@@ -22,7 +22,7 @@ export default class HttpBackend extends StorageBackend {
     }
 
     // Read-only source: bytes can't be removed remotely, only the reference dropped.
-    get capabilities() { return { read: true, write: false, delete: false }; }
+    get capabilities() { return { read: true, write: false, delete: false, canEnumerate: false }; }
 
     nativeUrl(key) {
         try { return this.#baseUrl ? new URL(key, this.#baseUrl).href : key; }
