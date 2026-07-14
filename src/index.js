@@ -127,6 +127,26 @@ export default class Stored extends EventEmitter2 {
     }
 
     /**
+     * Ranged stream for HTTP Range / media streaming. Returns
+     * `{ stream, ranged }` where `ranged` is true only when the backend actually
+     * served the requested byte window (`getRange`). Backends without ranged
+     * reads (e.g. remote proxies) fall back to a full stream with `ranged:false`,
+     * so the caller can respond 200 instead of a length-mismatched 206.
+     * `range` = { start, end } with an inclusive `end`. Null on a miss.
+     */
+    async getRangeStreamByUrl(url, range) {
+        const p = this.#parseStoredUrl(url);
+        const backend = p && this.#backends.get(p.backend);
+        if (!backend) return null;
+        if (typeof backend.getRange === 'function') {
+            const stream = await backend.getRange(p.key, range);
+            if (stream) return { stream, ranged: true };
+        }
+        const stream = await backend.get(p.key, { stream: true });
+        return stream ? { stream, ranged: false } : null;
+    }
+
+    /**
      * Delete the bytes behind a `stored://<backend>/<key>` URL. Does not touch
      * the document index (synapsd owns that) — callers trim `locations[]`.
      * Returns { ok:boolean, reason?:'malformed-url'|'unknown-backend'|'read-only-backend' }.

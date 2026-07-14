@@ -3,6 +3,7 @@ import path from 'path';
 import { createReadStream } from 'fs';
 import { pipeline } from 'stream/promises';
 import cacache from 'cacache';
+import contentPath from 'cacache/lib/content/path.js';
 import Debug from 'debug';
 import StorageBackend from '../StorageBackend.js';
 
@@ -73,6 +74,16 @@ export default class CacacheBackend extends StorageBackend {
         const size = info?.size ?? 0;
         debug(`COMMIT ${key} (${size} bytes)`);
         return { key, size };
+    }
+
+    // Ranged read for HTTP Range/streaming: cacache has no ranged API, so read a
+    // byte window straight off the content-addressed blob file. `end` is
+    // inclusive (matches HTTP Range and fs.createReadStream). Returns null on a
+    // cache miss so the caller can fall back to a full read.
+    async getRange(key, { start, end }) {
+        const info = await cacache.get.info(this.#root, key);
+        if (!info) return null;
+        return createReadStream(contentPath(this.#root, info.integrity), { start, end });
     }
 
     async get(key, options = {}) {

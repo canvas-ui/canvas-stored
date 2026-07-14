@@ -165,6 +165,14 @@ export default class FileBackend extends StorageBackend {
         return options.stream ? fs.createReadStream(filePath) : fs.readFile(filePath);
     }
 
+    // Ranged read for HTTP Range/streaming. `end` is inclusive (matches HTTP
+    // Range and createReadStream). Null on miss → caller falls back to full read.
+    async getRange(key, { start, end }) {
+        const filePath = this.#resolvePath(key);
+        if (!await fs.pathExists(filePath)) return null;
+        return fs.createReadStream(filePath, { start, end });
+    }
+
     async delete(key) {
         const filePath = this.#resolvePath(key);
         if (!await fs.pathExists(filePath)) return false;
