@@ -54,7 +54,18 @@ export async function extractImage(source, _mimeType) {
             const ex = await _exifr.parse(buf, { gps: true, tiff: true, exif: true, ifd0: true });
             if (ex) {
                 if (typeof ex.latitude === 'number' && typeof ex.longitude === 'number') {
-                    out.geo = clean({ lat: ex.latitude, lon: ex.longitude, alt: typeof ex.GPSAltitude === 'number' ? ex.GPSAltitude : undefined });
+                    // `source` marks provenance so consumers can reconcile this
+                    // against device/manual geo instead of last-writer-wins.
+                    // `accuracy` = GPSHPositioningError, the camera's own
+                    // horizontal error radius in metres — the thing that explains
+                    // a pin sitting a block away from where the photo was taken.
+                    out.geo = clean({
+                        lat: ex.latitude,
+                        lon: ex.longitude,
+                        alt: typeof ex.GPSAltitude === 'number' ? ex.GPSAltitude : undefined,
+                        accuracy: typeof ex.GPSHPositioningError === 'number' ? ex.GPSHPositioningError : undefined,
+                        source: 'exif',
+                    });
                 }
                 const date = ex.DateTimeOriginal || ex.CreateDate || ex.ModifyDate;
                 const exif = clean({
