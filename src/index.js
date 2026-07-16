@@ -291,6 +291,7 @@ export default class Stored extends EventEmitter2 {
      * re-hashed. Returns { ok:true, backend, count, files } | { ok:false, reason }.
      */
     async scan(backendName, options = {}) {
+        const { onFile, ...backendOptions } = options;
         const list = backendName
             ? [this.#backends.get(backendName)].filter(Boolean)
             : this.#backends.all();
@@ -298,18 +299,14 @@ export default class Stored extends EventEmitter2 {
 
         const files = [];
         for (const backend of list) {
-            const rows = await backend.scan({
-                algorithms: this.#config.checksums,
-                knownChecksums: (k, st) => this.#knownIfUnchanged(backend.name, k, st),
-                ...options,
-            });
-            // Backends whose scan() reports via events instead of returning rows
-            // (non-array result) are not content-addressable here.
-            if (!Array.isArray(rows)) continue;
-
-            const presentKeys = new Set(rows.map(file => file.key));
-            for (const file of rows) {
-                if (!file.checksums) continue;
+            // Per-file ingest into the stored index — idempotent, guarded so the
+            // streaming path (backend onFile) and the returned-rows path don't
+            // double-process a key.
+            const processed = new Set();
+            const ingest = (file) => {
+                if (processed.has(file.key)) return;
+                processed.add(file.key);
+                if (!file.checksums) return;
                 const id = formatId(file.checksums, this.#config.primaryChecksum);
                 const existing = this.#index.get(id);
                 const locations = existing?.locations || [];
@@ -321,11 +318,43 @@ export default class Stored extends EventEmitter2 {
                     locations.push(this.#buildLocation(file.backend, file.key, true, { size: file.size, mtime: file.modified }));
                 }
                 this.#index.put(id, { checksums: file.checksums, size: file.size, mimeType: file.mimeType, locations });
-            }
+            };
+
+            const rows = await backend.scan({
+                algorithms: this.#config.checksums,
+                knownChecksums: (k, st) => this.#knownIfUnchanged(backend.name, k, st),
+                ...backendOptions,
+                // Stream-through: index the file, then hand it to the caller so
+                // consumers (workspace doc upserts) see results as the walk runs.
+                onFile: async (file) => {
+                    ingest(file);
+                    if (typeof onFile === 'function') await onFile(file);
+                },
+            });
+            // Backends whose scan() reports via events instead of returning rows
+            // (non-array result) are not content-addressable here.
+            if (!Array.isArray(rows)) continue;
+
+            const presentKeys = new Set(rows.map(file => file.key));
+            // Backends that ignore onFile still get their rows indexed here.
+            for (const file of rows) ingest(file);
             this.#removeMissingLocations(backend.name, presentKeys);
             files.push(...rows);
         }
         return { ok: true, backend: backendName ?? null, count: files.length, files };
+    }
+
+    /**
+     * Cheap structural walk of one backend (dirs + file count, no hashing).
+     * Returns { ok, dirs, files } or { ok:false } when the backend does not
+     * support it (only file backends do).
+     */
+    async shape(backendName) {
+        const backend = this.#backends.get(backendName);
+        if (!backend) return { ok: false, reason: 'unknown-backend' };
+        if (typeof backend.shape !== 'function') return { ok: false, reason: 'unsupported' };
+        const { dirs, files } = await backend.shape();
+        return { ok: true, dirs, files };
     }
 
     // ─────────────────────────────────────────────────────────────────────────

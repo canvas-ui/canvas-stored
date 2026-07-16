@@ -264,6 +264,10 @@ export default class FileBackend extends StorageBackend {
         // Optional skip-hash predicate: (key, { size, mtime }) => { checksums, mimeType } | null.
         // When it returns a cached descriptor the (expensive) file read is skipped.
         const known = typeof options.knownChecksums === 'function' ? options.knownChecksums : null;
+        // Optional streaming consumer: awaited per file as soon as its checksums
+        // are ready, so large scans (a whole photo archive on a network mount)
+        // surface results incrementally instead of after the full walk.
+        const onFile = typeof options.onFile === 'function' ? options.onFile : null;
         const results = [];
         debug(`Scanning ${this.#root}...`);
         this.emit('scan:start', { backend: this.name });
@@ -281,12 +285,39 @@ export default class FileBackend extends StorageBackend {
                     detectMimeType(filePath).catch(() => null),
                 ]);
             }
-            results.push({ ...entry, checksums, mimeType, backend: this.name });
+            const row = { ...entry, checksums, mimeType, backend: this.name };
+            results.push(row);
+            if (onFile) await onFile(row);
         }
 
         this.emit('scan:complete', { backend: this.name, count: results.length });
         debug(`Scan complete: ${results.length} files`);
         return results;
+    }
+
+    /**
+     * Cheap structural walk: directory keys + file count, honoring the shared
+     * ignore matcher — readdir only, no stat/hash. Lets callers mirror the
+     * folder skeleton (and size a progress bar) before the expensive scan.
+     */
+    async shape(prefix = '') {
+        const dirs = [];
+        let files = 0;
+        const walk = async (rel) => {
+            const entries = await fs.readdir(this.#resolvePath(rel), { withFileTypes: true }).catch(() => []);
+            for (const entry of entries) {
+                const relativePath = path.join(rel, entry.name);
+                if (TMP_IGNORE.test(relativePath) || this.#isIgnored(relativePath)) continue;
+                if (entry.isDirectory()) {
+                    dirs.push(relativePath.split(path.sep).join('/'));
+                    await walk(relativePath);
+                } else if (entry.isFile()) {
+                    files += 1;
+                }
+            }
+        };
+        await walk(prefix);
+        return { dirs, files };
     }
 
     async stop() {
