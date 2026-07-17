@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/canvas-ai/.github/main/banners/canvas-banner_1200x480.jpg" alt="Canvas" width="100%" />
+</p>
+
 # StoreD
 
 Cache-first blob storage with a content-addressable local cache, LMDB metadata index and pluggable backends. Local backends write immediately remote backends sync through a worker-thread queue.
