@@ -33,7 +33,12 @@ export default class FileBackend extends StorageBackend {
         this.#ignoreMatcher = this.#buildIgnoreMatcher(this.#ignored);
         this.#defaultAlgorithms = config.algorithms || ['sha256'];
         this.type = 'local';
-        fs.ensureDirSync(this.#root);
+        // Managed stores (workspace:home/data) own their directory and may
+        // create it. External mounts (createRoot:false) must NOT: silently
+        // creating an empty dir at an unmounted mountpoint makes an absent
+        // drive indistinguishable from an empty one — verifyRoot() + the
+        // resync liveness gate rely on the root being genuinely missing.
+        if (config.createRoot !== false) fs.ensureDirSync(this.#root);
         debug(`FileBackend "${name}" initialized at ${this.#root}`);
     }
 
@@ -84,6 +89,33 @@ export default class FileBackend extends StorageBackend {
     // Truthful server-side location. Consumers decide whether to surface a local
     // path to clients (it leaks the server fs layout); stored:// is the address.
     nativeUrl(key) { return pathToFileURL(this.#resolvePath(key)).href; }
+
+    /**
+     * Liveness gate for resync: is the root present, a directory, and the same
+     * filesystem it was when the mount was configured? `expected` is the fsid
+     * snapshot ({ dev, ino }) recorded at mount creation (falls back to
+     * config.fsid). An absent mountpoint or a dev mismatch means the backend
+     * must go offline — a scan would read "empty", not "deleted".
+     * @returns {Promise<{ok: boolean, reason?: string, fsid: {dev:number, ino:number}|null}>}
+     */
+    async verifyRoot(expected = null) {
+        const snapshot = expected || this.config.fsid || null;
+        let stats;
+        try {
+            stats = await fs.stat(this.#root);
+        } catch {
+            return { ok: false, reason: 'root-missing', fsid: null };
+        }
+        if (!stats.isDirectory()) return { ok: false, reason: 'root-not-directory', fsid: null };
+        const fsid = { dev: stats.dev, ino: stats.ino };
+        if (snapshot?.dev != null && Number(snapshot.dev) !== stats.dev) {
+            return { ok: false, reason: 'filesystem-changed', fsid };
+        }
+        if (snapshot?.ino != null && Number(snapshot.ino) !== stats.ino) {
+            return { ok: false, reason: 'root-replaced', fsid };
+        }
+        return { ok: true, fsid };
+    }
 
     // ─────────────────────────────────────────────────────────────────────────
     // CRUD Operations
@@ -186,15 +218,26 @@ export default class FileBackend extends StorageBackend {
         if (!await fs.pathExists(filePath)) return null;
         const stats = await fs.stat(filePath);
         if (!stats.isFile()) return null;
-        return { key, size: stats.size, modified: stats.mtimeMs, created: stats.birthtimeMs };
+        // dev/ino feed rename matching (same inode at a new path) and the
+        // liveness checks — stored keeps them in location metadata.
+        return { key, size: stats.size, modified: stats.mtimeMs, created: stats.birthtimeMs, dev: stats.dev, ino: stats.ino };
     }
 
+    // `onError(relPath, err)` (optional): an unreadable directory (EACCES, I/O)
+    // is reported and skipped instead of aborting the walk — one denied subtree
+    // must not kill (or worse, truncate) a whole-mount enumeration.
     async *list(options = {}) {
-        const { prefix = '', recursive = true } = options;
+        const { prefix = '', recursive = true, onError = null } = options;
         const searchPath = this.#resolvePath(prefix);
         if (!await fs.pathExists(searchPath)) return;
 
-        const entries = await fs.readdir(searchPath, { withFileTypes: true });
+        let entries;
+        try {
+            entries = await fs.readdir(searchPath, { withFileTypes: true });
+        } catch (err) {
+            if (typeof onError === 'function') { onError(prefix, err); return; }
+            throw err;
+        }
         for (const entry of entries) {
             const relativePath = path.join(prefix, entry.name);
             if (this.#isIgnored(relativePath)) continue;
@@ -239,7 +282,7 @@ export default class FileBackend extends StorageBackend {
                     detectMimeType(p).catch(() => null),
                     fs.stat(p).catch(() => null),
                 ]);
-                this.emit('file:add', { backend: this.name, key, path: p, checksums, mimeType, size: stats?.size, modified: stats?.mtimeMs });
+                this.emit('file:add', { backend: this.name, key, path: p, checksums, mimeType, size: stats?.size, modified: stats?.mtimeMs, dev: stats?.dev, ino: stats?.ino });
             })
             .on('change', async p => {
                 const key = toKey(p);
@@ -248,7 +291,7 @@ export default class FileBackend extends StorageBackend {
                     detectMimeType(p).catch(() => null),
                     fs.stat(p).catch(() => null),
                 ]);
-                this.emit('file:change', { backend: this.name, key, path: p, checksums, mimeType, size: stats?.size, modified: stats?.mtimeMs });
+                this.emit('file:change', { backend: this.name, key, path: p, checksums, mimeType, size: stats?.size, modified: stats?.mtimeMs, dev: stats?.dev, ino: stats?.ino });
             })
             .on('unlink', p => {
                 this.emit('file:unlink', { backend: this.name, key: toKey(p), path: p });
@@ -259,6 +302,16 @@ export default class FileBackend extends StorageBackend {
         return true;
     }
 
+    /**
+     * Full-snapshot scan. Returns { files, complete, errors } — a diff against
+     * the previous state may only run on a completed snapshot:
+     *   - root liveness is verified first; a missing/replaced root yields
+     *     complete:false and NO rows (absent mount ≠ empty mount)
+     *   - unreadable directories are recorded in errors.dirs and skipped; their
+     *     prior entries must be carried forward by the differ, not deleted
+     *   - files that fail to hash keep a row (checksums:null) and are recorded
+     *     in errors.files: present-but-unverified, never "deleted"
+     */
     async scan(options = {}) {
         const algorithms = options.algorithms || this.#defaultAlgorithms;
         // Optional skip-hash predicate: (key, { size, mtime }) => { checksums, mimeType } | null.
@@ -269,10 +322,23 @@ export default class FileBackend extends StorageBackend {
         // surface results incrementally instead of after the full walk.
         const onFile = typeof options.onFile === 'function' ? options.onFile : null;
         const results = [];
+        const errors = { root: null, dirs: [], files: [] };
         debug(`Scanning ${this.#root}...`);
         this.emit('scan:start', { backend: this.name });
 
-        for await (const entry of this.list(options)) {
+        const liveness = await this.verifyRoot(options.fsid || null);
+        if (!liveness.ok) {
+            errors.root = liveness.reason;
+            debug(`Scan aborted: root ${liveness.reason}`);
+            this.emit('scan:complete', { backend: this.name, count: 0, complete: false, errors });
+            return { files: [], complete: false, errors, fsid: liveness.fsid };
+        }
+
+        const listOptions = {
+            ...options,
+            onError: (relPath, err) => errors.dirs.push({ prefix: relPath, code: err?.code || 'EUNKNOWN' }),
+        };
+        for await (const entry of this.list(listOptions)) {
             const cached = known ? known(entry.key, { size: entry.size, mtime: entry.modified }) : null;
             let checksums, mimeType;
             if (cached) {
@@ -284,15 +350,17 @@ export default class FileBackend extends StorageBackend {
                     checksumFile(filePath, algorithms).catch(() => null),
                     detectMimeType(filePath).catch(() => null),
                 ]);
+                if (!checksums) errors.files.push({ key: entry.key });
             }
             const row = { ...entry, checksums, mimeType, backend: this.name };
             results.push(row);
             if (onFile) await onFile(row);
         }
 
-        this.emit('scan:complete', { backend: this.name, count: results.length });
-        debug(`Scan complete: ${results.length} files`);
-        return results;
+        const complete = errors.dirs.length === 0;
+        this.emit('scan:complete', { backend: this.name, count: results.length, complete, errors });
+        debug(`Scan complete: ${results.length} files (${complete ? 'full' : `partial — ${errors.dirs.length} unreadable dirs`})`);
+        return { files: results, complete, errors, fsid: liveness.fsid };
     }
 
     /**

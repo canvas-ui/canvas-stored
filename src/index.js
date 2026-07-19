@@ -298,6 +298,8 @@ export default class Stored extends EventEmitter2 {
         if (backendName && !list.length) return { ok: false, reason: 'unknown-backend' };
 
         const files = [];
+        let complete = true;
+        let errors = null;
         for (const backend of list) {
             // Per-file ingest into the stored index — idempotent, guarded so the
             // streaming path (backend onFile) and the returned-rows path don't
@@ -314,13 +316,20 @@ export default class Stored extends EventEmitter2 {
                 if (match) {
                     match.size = file.size;
                     match.mtime = file.modified;
+                    if (file.ino != null) { match.ino = file.ino; match.dev = file.dev; }
                 } else {
-                    locations.push(this.#buildLocation(file.backend, file.key, true, { size: file.size, mtime: file.modified }));
+                    locations.push(this.#buildLocation(file.backend, file.key, true, {
+                        size: file.size,
+                        mtime: file.modified,
+                        // Inode identity — enables rename matching (same
+                        // (dev,ino) at a new path is a move, not delete+add).
+                        ...(file.ino != null ? { ino: file.ino, dev: file.dev } : {}),
+                    }));
                 }
                 this.#index.put(id, { checksums: file.checksums, size: file.size, mimeType: file.mimeType, locations });
             };
 
-            const rows = await backend.scan({
+            const result = await backend.scan({
                 algorithms: this.#config.checksums,
                 knownChecksums: (k, st) => this.#knownIfUnchanged(backend.name, k, st),
                 ...backendOptions,
@@ -331,17 +340,32 @@ export default class Stored extends EventEmitter2 {
                     if (typeof onFile === 'function') await onFile(file);
                 },
             });
-            // Backends whose scan() reports via events instead of returning rows
-            // (non-array result) are not content-addressable here.
-            if (!Array.isArray(rows)) continue;
+            // Snapshot shape { files, complete, errors } (file driver) or a bare
+            // rows array (legacy/simple drivers — treated as a complete walk).
+            // Backends whose scan() reports via events instead (non-array, no
+            // files[]) are not content-addressable here.
+            const snapshot = Array.isArray(result)
+                ? { files: result, complete: true, errors: null }
+                : (Array.isArray(result?.files) ? result : null);
+            if (!snapshot) continue;
 
-            const presentKeys = new Set(rows.map(file => file.key));
+            if (snapshot.complete === false) complete = false;
+            if (snapshot.errors) errors = { ...(errors || {}), [backend.name]: snapshot.errors };
+
             // Backends that ignore onFile still get their rows indexed here.
-            for (const file of rows) ingest(file);
-            this.#removeMissingLocations(backend.name, presentKeys);
-            files.push(...rows);
+            for (const file of snapshot.files) ingest(file);
+
+            // Removal only ever runs against a usable snapshot: a dead/absent
+            // root (errors.root) means the backend is offline — nothing is
+            // removed. Hash-failed rows are still rows, so their keys count as
+            // present; unreadable subtrees carry their prior entries forward.
+            if (snapshot.errors?.root) continue;
+            const presentKeys = new Set(snapshot.files.map(file => file.key));
+            const erroredPrefixes = (snapshot.errors?.dirs || []).map(d => d.prefix).filter(Boolean);
+            this.#removeMissingLocations(backend.name, presentKeys, erroredPrefixes);
+            files.push(...snapshot.files);
         }
-        return { ok: true, backend: backendName ?? null, count: files.length, files };
+        return { ok: true, backend: backendName ?? null, count: files.length, files, complete, errors };
     }
 
     /**
@@ -572,10 +596,20 @@ export default class Stored extends EventEmitter2 {
         };
     }
 
-    #removeMissingLocations(backendName, presentKeys) {
+    // `erroredPrefixes`: subtrees the scan could not read (EACCES etc.) — their
+    // prior entries are carried forward, never treated as deleted. Key presence
+    // is compared NFC-normalized: macOS reports NFD, so without this every
+    // accented filename would diff as a perpetual delete+add pair.
+    #removeMissingLocations(backendName, presentKeys, erroredPrefixes = []) {
+        const nfc = (k) => String(k).normalize('NFC');
+        const present = new Set([...presentKeys].map(nfc));
+        const underErroredPrefix = (key) => erroredPrefixes.some((prefix) =>
+            key === prefix || key.startsWith(`${prefix}/`) || key.startsWith(`${prefix}\\`));
         for (const [id, meta] of this.#index.entries()) {
             const nextLocations = (meta.locations || []).filter(location =>
-                location.backend !== backendName || presentKeys.has(location.key)
+                location.backend !== backendName
+                || present.has(nfc(location.key))
+                || underErroredPrefix(location.key)
             );
 
             if (nextLocations.length === (meta.locations || []).length) continue;
@@ -598,7 +632,11 @@ export default class Stored extends EventEmitter2 {
 
     #handleFileEvent(event, data) {
         const pathKey = `${data.backend}:${data.key}`;
-        const location = this.#buildLocation(data.backend, data.key, true, { size: data.size, mtime: data.modified });
+        const location = this.#buildLocation(data.backend, data.key, true, {
+            size: data.size,
+            mtime: data.modified,
+            ...(data.ino != null ? { ino: data.ino, dev: data.dev } : {}),
+        });
 
         if (event === 'file:add' && data.checksums) {
             const id = formatId(data.checksums, this.#config.primaryChecksum);
@@ -618,8 +656,14 @@ export default class Stored extends EventEmitter2 {
             this.#emitObject('add', { ...data, id, locations });
 
         } else if (event === 'file:change' && data.checksums) {
+            const newId = formatId(data.checksums, this.#config.primaryChecksum);
             const oldMeta = this.#index.get(pathKey);
-            if (oldMeta) {
+            // Same path, new bytes = a successor under content identity. Carry
+            // the predecessor's identity on the add event so consumers can
+            // migrate curated placements instead of orphaning them.
+            let previous = null;
+            if (oldMeta && oldMeta.id !== newId) {
+                previous = { id: oldMeta.id, checksums: oldMeta.checksums };
                 oldMeta.locations = oldMeta.locations.filter(l =>
                     !(l.backend === data.backend && l.key === data.key)
                 );
@@ -628,10 +672,9 @@ export default class Stored extends EventEmitter2 {
                 } else {
                     this.#index.put(oldMeta.id, oldMeta);
                 }
-                this.#emitObject('unlink', { ...data, id: oldMeta.id, checksums: oldMeta.checksums });
+                this.#emitObject('unlink', { ...data, id: oldMeta.id, checksums: oldMeta.checksums, successor: { id: newId, checksums: data.checksums } });
             }
 
-            const newId = formatId(data.checksums, this.#config.primaryChecksum);
             const existing = this.#index.get(newId);
             const locations = existing?.locations || [];
             if (!locations.some(l => l.backend === data.backend && l.key === data.key)) {
@@ -644,7 +687,7 @@ export default class Stored extends EventEmitter2 {
                 mimeType: data.mimeType,
                 locations,
             });
-            this.#emitObject('add', { ...data, id: newId, locations });
+            this.#emitObject('add', { ...data, id: newId, locations, previous });
 
         } else if (event === 'file:unlink') {
             const meta = this.#index.get(pathKey);
