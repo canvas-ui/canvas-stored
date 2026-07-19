@@ -17,6 +17,12 @@ const debug = Debug('stored');
 
 const HEAD_BYTES = 4096;
 
+// A filesystem move reaches the watcher as unlink(old) + add(new). Unlink
+// processing is held back this long so an add carrying the same inode can
+// claim it as a rename (in-place URL rewrite, no orphan churn). Expired
+// holds process as genuine deletions.
+const RENAME_WINDOW_MS = 1000;
+
 export default class Stored extends EventEmitter2 {
     #cache;
     #backends;
@@ -25,6 +31,9 @@ export default class Stored extends EventEmitter2 {
     #paths;
     #syncQueue;
     #extract;   // optional injected metadata extractor: (source,{mimeType,key})→Promise<obj>
+    // `${backend}|${dev}:${ino}` → { data, timer } — unlink events held for
+    // RENAME_WINDOW_MS awaiting a same-inode add (see #handleFileEvent).
+    #pendingUnlinks = new Map();
 
     constructor(config = {}) {
         // Wildcards (':' delimiter) let consumers bind `object:*` across backends.
@@ -329,9 +338,16 @@ export default class Stored extends EventEmitter2 {
                 this.#index.put(id, { checksums: file.checksums, size: file.size, mimeType: file.mimeType, locations });
             };
 
+            // Inode identity snapshot for rename matching: same (dev, ino) at a
+            // NEW path with unchanged size+mtime is a move — reuse the indexed
+            // checksums instead of rehashing, so a folder rename (thousands of
+            // "moves") collapses into cheap URL rewrites.
+            const inodeMap = this.#buildInodeMap(backend.name);
+
             const result = await backend.scan({
                 algorithms: this.#config.checksums,
-                knownChecksums: (k, st) => this.#knownIfUnchanged(backend.name, k, st),
+                knownChecksums: (k, st) =>
+                    this.#knownIfUnchanged(backend.name, k, st) || this.#knownByInode(inodeMap, k, st),
                 ...backendOptions,
                 // Stream-through: index the file, then hand it to the caller so
                 // consumers (workspace doc upserts) see results as the walk runs.
@@ -388,6 +404,13 @@ export default class Stored extends EventEmitter2 {
     async stop() {
         await this.#syncQueue.stop();
         await this.#backends.stopAll();
+        // Flush held unlinks (watchers are stopped — no add can claim them now)
+        // so the index reflects them before it closes.
+        for (const [pendingKey, { data, timer }] of this.#pendingUnlinks) {
+            clearTimeout(timer);
+            this.#pendingUnlinks.delete(pendingKey);
+            this.#processUnlink(data);
+        }
         this.#index.close();
         debug('Stopped');
     }
@@ -558,6 +581,37 @@ export default class Stored extends EventEmitter2 {
         return { checksums: meta.checksums, mimeType: meta.mimeType };
     }
 
+    // One-shot snapshot of a backend's indexed locations keyed by inode
+    // identity, built per scan (the index is LMDB — a per-file reverse lookup
+    // would be O(N²)).
+    #buildInodeMap(backendName) {
+        const map = new Map();
+        for (const [, meta] of this.#index.entries()) {
+            for (const loc of meta.locations || []) {
+                if (loc.backend !== backendName || loc.ino == null) continue;
+                map.set(`${loc.dev}:${loc.ino}`, {
+                    key: loc.key,
+                    size: loc.size,
+                    mtime: loc.mtime,
+                    checksums: meta.checksums,
+                    mimeType: meta.mimeType,
+                });
+            }
+        }
+        return map;
+    }
+
+    // Rename-match skip-hash: the path is new, but the inode is one we already
+    // indexed and size+mtime are untouched — trust the prior checksums. (Also
+    // covers hardlink twins: same inode ⇒ same bytes by definition.)
+    #knownByInode(inodeMap, key, stat) {
+        if (stat?.ino == null) return null;
+        const prior = inodeMap.get(`${stat.dev}:${stat.ino}`);
+        if (!prior || prior.key === key) return null;
+        if (prior.size !== stat.size || prior.mtime !== stat.mtime) return null;
+        return { checksums: prior.checksums, mimeType: prior.mimeType };
+    }
+
     #generateKey(checksums) {
         const hash = checksums[this.#config.primaryChecksum];
         return `${hash.slice(0, 2)}/${hash.slice(2, 4)}/${hash}`;
@@ -640,8 +694,33 @@ export default class Stored extends EventEmitter2 {
 
         if (event === 'file:add' && data.checksums) {
             const id = formatId(data.checksums, this.#config.primaryChecksum);
-            const existing = this.#index.get(id);
 
+            // Rename pairing: an add whose inode matches a held unlink is the
+            // second half of a move. Same content → silently drop the old-path
+            // location (no unlink emission, no identity churn) and let the add
+            // land the new path on the same id. Content changed mid-move →
+            // release the held unlink first; the succession flow handles it.
+            let renamedFrom = null;
+            if (data.ino != null) {
+                const pendingKey = `${data.backend}|${data.dev}:${data.ino}`;
+                const pending = this.#pendingUnlinks.get(pendingKey);
+                if (pending) {
+                    clearTimeout(pending.timer);
+                    this.#pendingUnlinks.delete(pendingKey);
+                    const oldMeta = this.#index.get(`${pending.data.backend}:${pending.data.key}`);
+                    if (oldMeta && oldMeta.id === id) {
+                        renamedFrom = pending.data.key;
+                        oldMeta.locations = oldMeta.locations.filter(l =>
+                            !(l.backend === pending.data.backend && l.key === pending.data.key)
+                        );
+                        this.#index.put(oldMeta.id, oldMeta);
+                    } else {
+                        this.#processUnlink(pending.data);
+                    }
+                }
+            }
+
+            const existing = this.#index.get(id);
             const locations = existing?.locations || [];
             if (!locations.some(l => l.backend === data.backend && l.key === data.key)) {
                 locations.push(location);
@@ -653,7 +732,7 @@ export default class Stored extends EventEmitter2 {
                 mimeType: data.mimeType,
                 locations,
             });
-            this.#emitObject('add', { ...data, id, locations });
+            this.#emitObject('add', { ...data, id, locations, ...(renamedFrom ? { renamedFrom } : {}) });
 
         } else if (event === 'file:change' && data.checksums) {
             const newId = formatId(data.checksums, this.#config.primaryChecksum);
@@ -690,20 +769,50 @@ export default class Stored extends EventEmitter2 {
             this.#emitObject('add', { ...data, id: newId, locations, previous });
 
         } else if (event === 'file:unlink') {
+            // Hold the unlink briefly when we know the file's inode — if a
+            // same-inode add arrives inside the window this was a move, not a
+            // deletion, and consumers never see the transient absence.
             const meta = this.#index.get(pathKey);
-            if (meta) {
-                meta.locations = meta.locations.filter(l =>
-                    !(l.backend === data.backend && l.key === data.key)
-                );
-                if (meta.locations.length === 0) {
-                    this.#index.delete(meta.id);
-                } else {
-                    this.#index.put(meta.id, meta);
+            const loc = meta?.locations?.find(l => l.backend === data.backend && l.key === data.key);
+            if (loc?.ino != null) {
+                const pendingKey = `${data.backend}|${loc.dev}:${loc.ino}`;
+                // A second unlink for the same inode (hardlink twin) processes
+                // the held one immediately — one hold per inode.
+                const prior = this.#pendingUnlinks.get(pendingKey);
+                if (prior) {
+                    clearTimeout(prior.timer);
+                    this.#pendingUnlinks.delete(pendingKey);
+                    this.#processUnlink(prior.data);
                 }
-                this.#emitObject('unlink', { ...data, id: meta.id, checksums: meta.checksums, locations: meta.locations });
-            } else {
-                this.#emitObject('unlink', data);
+                const timer = setTimeout(() => {
+                    this.#pendingUnlinks.delete(pendingKey);
+                    this.#processUnlink(data);
+                }, RENAME_WINDOW_MS);
+                timer.unref?.();
+                this.#pendingUnlinks.set(pendingKey, { data, timer });
+                return;
             }
+            this.#processUnlink(data);
+        }
+    }
+
+    // The genuine-deletion path for a file:unlink (immediate when the inode is
+    // unknown, deferred through #pendingUnlinks otherwise).
+    #processUnlink(data) {
+        const pathKey = `${data.backend}:${data.key}`;
+        const meta = this.#index.get(pathKey);
+        if (meta) {
+            meta.locations = meta.locations.filter(l =>
+                !(l.backend === data.backend && l.key === data.key)
+            );
+            if (meta.locations.length === 0) {
+                this.#index.delete(meta.id);
+            } else {
+                this.#index.put(meta.id, meta);
+            }
+            this.#emitObject('unlink', { ...data, id: meta.id, checksums: meta.checksums, locations: meta.locations });
+        } else {
+            this.#emitObject('unlink', data);
         }
     }
 }

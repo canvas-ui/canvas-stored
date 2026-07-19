@@ -339,7 +339,7 @@ export default class FileBackend extends StorageBackend {
             onError: (relPath, err) => errors.dirs.push({ prefix: relPath, code: err?.code || 'EUNKNOWN' }),
         };
         for await (const entry of this.list(listOptions)) {
-            const cached = known ? known(entry.key, { size: entry.size, mtime: entry.modified }) : null;
+            const cached = known ? known(entry.key, { size: entry.size, mtime: entry.modified, dev: entry.dev, ino: entry.ino }) : null;
             let checksums, mimeType;
             if (cached) {
                 checksums = cached.checksums;
