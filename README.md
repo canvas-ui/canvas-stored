@@ -299,3 +299,18 @@ Wildcard: `object:*`, `file:*`, `scan:*`.
 ## Workspace integration
 
 canvas-server owns a `Stored` instance per workspace at `{WORKSPACE_ROOT}/.stored` (index + cacache). Workspace blobs still live under `data/`, `home/`, etc. as separate file backends. `WorkspaceStoredIndex` listens on `object:*`, builds synapsd documents with `stored://` locations, and resolves blobs via `getByUrl`. See `STORAGE-URL-SCHEME.md` at the repo root for the full URL grammar.
+
+## Licence
+
+Copyright (C) 2025-2026 Jozef Melich. Canvas StoreD is dual-licensed:
+
+- **[AGPL-3.0-or-later](LICENSE)**, free for everyone. Run it, modify it, build
+  on it. If you distribute a modified version, or expose one to users over a
+  network, they are entitled to your changes (AGPL section 13).
+- **[Commercial licence](COMMERCIAL.md)**, the same code without the copyleft
+  obligations, for hosted products and proprietary distribution. Issued by
+  Augmentd s.r.o., lic@augmentd.eu.
+
+Same software either way. There is no cut-down community edition. See
+[NOTICE](NOTICE) for the full position, and [CONTRIBUTING.md](CONTRIBUTING.md)
+before opening a pull request.
