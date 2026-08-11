@@ -5,8 +5,8 @@ import path from 'path';
 import { Readable } from 'stream';
 import Stored from '../src/index.js';
 
-const TEST_DIR = './test-fixtures';
-const STORED_ROOT = './test-stored';
+const TEST_DIR = '~/Desktop/Notes';
+const STORED_ROOT = '~/Desktop/Notes.stored';
 
 describe('Stored', async () => {
     let stored;
@@ -87,7 +87,7 @@ describe('Stored', async () => {
             assert.deepStrictEqual(meta.locations[0].source, {
                 provider: 'fs',
                 account: 'test',
-                container: 'test-fixtures',
+                container: 'Notes.stored',
                 path: 'buffer.txt',
             });
             assert.ok(meta.created);
@@ -283,7 +283,7 @@ describe('Stored', async () => {
                 assert.deepStrictEqual(meta.locations[0].source, {
                     provider: 'fs',
                     account: 'test',
-                    container: 'test-fixtures',
+                    container: 'Notes.stored',
                     path: 'scan1.txt',
                 });
             }
