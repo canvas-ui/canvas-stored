@@ -86,6 +86,8 @@ The constructor extends **eventemitter2** with `wildcard: true` and `delimiter: 
 | `index` | `Index` | LMDB metadata store |
 | `backends` | `BackendManager` | Registered backend instances |
 
+The `cache` wrapper exposes cacache maintenance helpers directly: `stats()` (entry count + total size, streamed so large stores are never held in memory), `clear()`, `verify()`, and `list()` / `listStream()`.
+
 ---
 
 ## Metadata
