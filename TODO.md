@@ -34,8 +34,6 @@ Implementation should be flexible enough to easily add additional backends like 
 
 ### Services
 
-#### EmbedD
-
 #### WatchD
 
 - Only for backends that support it (fs)
@@ -54,4 +52,5 @@ Implementation should be flexible enough to easily add additional backends like 
 - atomic operations
 - counters, timestamps
 
+To eval: Support sync policies
 Not needed: cluster mode, pub/sub, cron expressions, priorities
