@@ -21,9 +21,27 @@ export default class StorageBackend extends EventEmitter {
      * `canEnumerate:true` means the backend implements the async-generator
      * `list()` (and usually `scan()`) so callers can mirror its whole tree;
      * drivers without real enumeration (http, s3 skeleton) leave it false.
+     * `remote` mirrors the getter below — carried here so a single capabilities
+     * snapshot is enough for consumers deciding how expensive an op will be.
      */
-    get capabilities() { return { read: true, write: true, delete: true, canEnumerate: false }; }
+    get capabilities() { return { read: true, write: true, delete: true, canEnumerate: false, remote: this.remote }; }
     get canDelete() { return this.capabilities.delete !== false; }
+    get canWrite() { return this.capabilities.write !== false; }
+    get canRead() { return this.capabilities.read !== false; }
+
+    /**
+     * Is the data behind this backend reached over the network?
+     *
+     * Distinct from `type` on purpose: `type: 'local'|'remote'` decides the
+     * WRITE path (synchronous put vs cache + SyncQueue), and an NFS/CIFS mount
+     * is still a synchronous POSIX write target — `type:'local'`, `remote:true`.
+     * This flag is about latency and trust: no reliable inotify, expensive
+     * full-file hashing, and a root that can disappear wholesale.
+     */
+    get remote() { return this.config.remote ?? (this.type === 'remote'); }
+
+    /** Transport serving the bytes ('cifs', 'nfs4', 'fuse.sshfs', 's3', …) or null. */
+    get transport() { return this.config.transport ?? null; }
 
     // The real, protocol-native URL for `key` (e.g. https://…, s3://…, smb://…,
     // file://…), used for provenance/UI. `stored://<backend>/<key>` remains the

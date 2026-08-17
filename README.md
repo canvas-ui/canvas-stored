@@ -132,7 +132,7 @@ Canonical fetch/delete form: `stored://<backend>/<key>`. Backend names may conta
 |--------|-------------|
 | `getByUrl(url)` | `backend.get(key)` - bypasses the content index. Returns `Buffer \| null` (never throws on bad input). |
 | `getStreamByUrl(url)` | Same as `getByUrl` but returns a `Readable \| null`. |
-| `deleteByUrl(url)` | Deletes bytes on the backend only (does not update the LMDB index). Returns `{ ok: boolean, reason?: string }` where `reason` is `malformed-url`, `unknown-backend`, or `read-only-backend`. |
+| `deleteByUrl(url)` | Deletes bytes on the backend and drops that location from the index (the consumer's document index is still the caller's to trim). Emits `object:location:remove` when the content survives elsewhere. Returns `{ ok: boolean, reason?: string }` where `reason` is `malformed-url`, `unknown-backend`, or `read-only-backend`. |
 
 ---
 
@@ -190,6 +190,36 @@ Removes from cache and backends. The index entry is removed only when no locatio
 | `urls` | Only delete the listed `stored://<backend>/<key>` locations (precise multi-name targeting) |
 
 Emits `delete` with `{ id, backends }` (names deleted).
+
+#### `copy(idOrKey, options) → Promise<{ ok, id, added, locations } | { ok:false, reason }>`
+
+Copy bytes onto other backends. Content identity is unchanged — the same index entry gains locations.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `to` | **required** | Target backend name, or an array of them |
+| `key` | source key | Key on the targets |
+| `from` | cheapest readable location | Source backend name or `stored://` URL |
+| `onConflict` | `error` | Other content already on the destination key: `error` (refuse), `rename` (next free `name-1.ext`), `overwrite` |
+
+Bytes stream through one hashing pass and the result is checked against the indexed id **before** anything is committed, so a source that was rewritten behind stored's back fails with `checksum-mismatch` instead of propagating wrong bytes under the old id. Targets that already hold the key are skipped (`unchanged:true`, not an error).
+
+Destination keys are normalized (`Fotky//2019` → `Fotky/2019`) so the index always spells a key the way the filesystem reports it back.
+
+Reasons: `not-found`, `no-targets`, `no-source`, `unknown-backend`, `read-only-target`, `source-offline`, `target-offline`, `source-unreadable`, `checksum-mismatch`, `target-exists`, `invalid-key`, `transfer-failed`.
+
+Emits `object:location:add` per new location.
+
+#### `move(idOrKey, options) → Promise<{ ok, id, state, from, to, locations } | { ok:false, reason }>`
+
+Same options as `copy`, but exactly one target (`move-single-target` otherwise) and the source location is dropped afterwards.
+
+- Within one filesystem the transfer is a single `rename(2)` — no bytes cross userspace and no re-hash (the inode carries the identity).
+- Across filesystems/drivers it is a verified stream copy, then a source delete.
+- Onto a `type:'remote'` backend it returns `state:'pending'` and completes on the `synced` event: **the source is never released before the destination write is durable.** A failed sync leaves the object as a copy, never lost.
+- If the destination lands but the source delete fails, the result is `{ ok:false, reason:'source-delete-failed', degradedToCopy:true }` — a cleanup problem, not data loss.
+
+Emits `object:move` on completion. Consumers must patch `locations[]` **in place**; treating it as unlink + add loses the document's identity and curated placements.
 
 #### `stat(idOrKey) → Promise<Metadata | null>`
 
@@ -251,6 +281,23 @@ Each backend implements `StorageBackend`: `put`, `get`, `delete`, `stat`, `list`
 { driver: 'file', root: '/path/to/root', watch: true, ignored: /pattern/, algorithms: ['sha256'] }
 ```
 
+#### Network mounts (`remote`)
+
+Remote shares are consumed as **OS-level mounts** (kernel cifs/nfs, `rclone mount`, …) rather than protocol drivers: the file driver already carries the whole vocabulary a share needs (`createRoot:false`, `verifyRoot()` fsid liveness, partial-scan semantics, ranged reads, `stat.dev/ino` for rename matching and skip-hash), and the kernel client caches far better than a userspace one.
+
+```js
+{ driver: 'file', root: '/mnt/nas/photos', remote: true, transport: 'cifs' }
+```
+
+Detected from the kernel mount table (`/proc/mounts`, Linux) at registration; explicit config always wins. `remote` is a **separate axis from `type`**: `type: 'local'|'remote'` decides the write path (synchronous put vs cache + SyncQueue), and a CIFS mount is still a synchronous POSIX write target — `type:'local'`, `remote:true`.
+
+What it changes:
+
+- **`watch()` refuses to start** without `usePolling: true`. inotify only reports changes made through *this* client, so a watched share silently misses everything another machine writes — worse than not watching, because it looks live. A `backend:state` event with `reason: 'remote-watch-requires-polling'` is emitted instead; use `scan()`/resync. With `usePolling` the watcher polls at `pollInterval` (default 30s).
+- **Reads prefer local locations.** `get()`/`getStream()` order candidates cache → local disk → network mount → protocol backend, so a LAN round-trip never wins over a local copy that was merely indexed later.
+- **`locations()` carries `remote` + `transport`**, and the location's `source` descriptor records them too (sparsely — only when remote), so a location stays self-describing after its backend is unmounted or dropped from config.
+- Liveness is unchanged and load-bearing: an unmounted share either vanishes or exposes a different `dev`, and `verifyRoot()` fails the scan with `complete:false` and **zero rows**. An absent mount is never read as an empty one.
+
 ### `cacache` driver config
 
 ```js
@@ -281,6 +328,20 @@ Stored re-emits backend events and adds its own. File watcher events are duplica
 | `object:add` | `{ kind: 'file', … }` (or `{ kind, backend, key, … }` from a non-file connector emitting through stored) |
 | `object:change` | Forwarded from backends that emit it |
 | `object:unlink` | Forwarded or synthesized on file delete |
+
+### Location events (identity-preserving)
+
+Same content, different places. Consumers **patch `locations[]` in place** — routing these through unlink + add rebuilds the document and loses its identity and curated placements. Every payload carries the full post-mutation `locations` array.
+
+| Event | Payload | Meaning |
+|-------|---------|---------|
+| `object:move` | `{ kind, id, checksums, from:{backend,key,url}, to:{…}, location, locations }` | One location replaced another (`move()`), destination already durable |
+| `object:location:add` | `{ kind, id, checksums, location, locations }` | Content gained a location (`copy()`), keeping the existing ones |
+| `object:location:remove` | `{ …, reason }` | One location dropped while others survive. `reason`: `deleted` (today) — `evicted` / `backend-removed` land with the cache policy |
+
+Note the three-segment names: an `object:*` wildcard binding does **not** match them (eventemitter2 `*` is single-level); bind them explicitly or use `object:**`.
+
+Watcher echoes from stored's own transfers are suppressed, so a move never also arrives as an `unlink` of the source key.
 
 Wildcard: `object:*`, `file:*`, `scan:*`.
 

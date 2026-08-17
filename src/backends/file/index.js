@@ -7,6 +7,7 @@ import Debug from 'debug';
 import StorageBackend from '../StorageBackend.js';
 import { checksumFile } from '../../utils/checksum.js';
 import { detectMimeType } from '../../utils/mime.js';
+import { detectMountSync } from '../../utils/mount.js';
 
 const debug = Debug('stored:backend:file');
 
@@ -23,6 +24,9 @@ export default class FileBackend extends StorageBackend {
     #ignored;
     #ignoreMatcher = null;
     #defaultAlgorithms = ['sha256'];
+    #remote = false;
+    #transport = null;
+    #mountSource = null;
 
     constructor(name, config = {}) {
         super(name, config);
@@ -39,13 +43,34 @@ export default class FileBackend extends StorageBackend {
         // drive indistinguishable from an empty one — verifyRoot() + the
         // resync liveness gate rely on the root being genuinely missing.
         if (config.createRoot !== false) fs.ensureDirSync(this.#root);
-        debug(`FileBackend "${name}" initialized at ${this.#root}`);
+
+        // Network mount detection. A CIFS/NFS share reached through a POSIX path
+        // is indistinguishable from local disk to every fs call we make, so the
+        // kernel mount table is the only honest source. Explicit config always
+        // wins — detection only fills the gaps (and is a no-op off Linux).
+        const detected = detectMountSync(this.#root);
+        this.#remote = config.remote ?? detected.remote;
+        this.#transport = config.transport ?? detected.transport;
+        this.#mountSource = config.mountSource ?? detected.source;
+
+        debug(`FileBackend "${name}" initialized at ${this.#root}${this.#remote ? ` (remote, ${this.#transport || 'unknown transport'})` : ''}`);
     }
 
     get root() { return this.#root; }
     get tempDir() { return path.join(this.#root, TMP_DIR); }
     get watching() { return !!this.#watcher; }
     get capabilities() { return { ...super.capabilities, canEnumerate: true }; }
+    get remote() { return this.#remote; }
+    get transport() { return this.#transport; }
+    get mountSource() { return this.#mountSource; }
+
+    /**
+     * Absolute on-disk path for `key`. Public because cross-backend copy/move
+     * needs it to detect a shared filesystem (same `dev` ⇒ rename instead of a
+     * byte-for-byte stream copy) — callers outside stored should still address
+     * bytes via `stored://<backend>/<key>`.
+     */
+    resolveKeyPath(key) { return this.#resolvePath(key); }
 
     // One matcher shared by watch(), list() and (via list) scan(), so exclusion
     // patterns behave identically live and on resync. Accepts glob strings,
@@ -191,6 +216,21 @@ export default class FileBackend extends StorageBackend {
         return { key, size: stats.size };
     }
 
+    /**
+     * Move an already-existing file at `srcPath` to `key` on this backend via a
+     * single `rename(2)` — no bytes cross userspace, so a 10GB file moves in
+     * microseconds instead of minutes. Only valid within one filesystem: throws
+     * EXDEV otherwise, which callers treat as "fall back to a stream copy".
+     */
+    async renameFrom(key, srcPath) {
+        const dest = this.#resolvePath(key);
+        await fs.ensureDir(path.dirname(dest));
+        await fs.rename(srcPath, dest);
+        const stats = await fs.stat(dest);
+        debug(`RENAME ${srcPath} -> ${key} (${stats.size} bytes)`);
+        return { key, size: stats.size, modified: stats.mtimeMs, dev: stats.dev, ino: stats.ino };
+    }
+
     async get(key, options = {}) {
         const filePath = this.#resolvePath(key);
         if (!await fs.pathExists(filePath)) return null;
@@ -256,11 +296,36 @@ export default class FileBackend extends StorageBackend {
     async watch() {
         if (this.#watcher) return true;
 
+        // inotify does not cross the wire: on cifs/nfs the kernel only reports
+        // changes made through THIS client, so a watched share silently misses
+        // everything another machine writes — worse than not watching, because
+        // it looks live. Polling is the only correct option and it is expensive
+        // on a large share, so it must be asked for explicitly.
+        if (this.#remote && this.config.usePolling !== true) {
+            debug(`Refusing to watch remote backend "${this.name}" (${this.#transport || 'unknown transport'}) without usePolling — use scan()/resync instead`);
+            this.emit('backend:state', {
+                backend: this.name,
+                watching: false,
+                remote: true,
+                transport: this.#transport,
+                reason: 'remote-watch-requires-polling',
+            });
+            return false;
+        }
+
         const watchOpts = {
             persistent: true,
             ignoreInitial: true,
             awaitWriteFinish: { stabilityThreshold: 200, pollInterval: 50 },
         };
+        // Opt-in polling (the only way to see other clients' writes on a network
+        // mount). Deliberately slow by default: each tick stats every watched
+        // file, which on a NAS is real traffic.
+        if (this.config.usePolling === true) {
+            watchOpts.usePolling = true;
+            watchOpts.interval = this.config.pollInterval ?? 30000;
+            watchOpts.binaryInterval = this.config.pollInterval ?? 30000;
+        }
         // Chokidar hands us absolute paths; route them through the shared
         // rel-path matcher so watch and list/scan agree on exclusions.
         watchOpts.ignored = (p) => {

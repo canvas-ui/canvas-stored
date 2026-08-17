@@ -23,6 +23,14 @@ const HEAD_BYTES = 4096;
 // holds process as genuine deletions.
 const RENAME_WINDOW_MS = 1000;
 
+// A copy/move writes and deletes through the same watched roots the file
+// backends observe, so our own writes come back as add/unlink events. Affected
+// keys are suppressed for the duration of the operation plus this grace period
+// (chokidar's awaitWriteFinish alone is 200ms, and an unlink is held for
+// RENAME_WINDOW_MS on top) — without it a move is seen a second time as a
+// delete of the source, which downstream drops the location for.
+const MOVE_SUPPRESS_MS = 3000;
+
 export default class Stored extends EventEmitter2 {
     #cache;
     #backends;
@@ -34,6 +42,13 @@ export default class Stored extends EventEmitter2 {
     // `${backend}|${dev}:${ino}` → { data, timer } — unlink events held for
     // RENAME_WINDOW_MS awaiting a same-inode add (see #handleFileEvent).
     #pendingUnlinks = new Map();
+    // `${backend}:${key}` → refcount. Watcher events for these keys are ours
+    // (an in-flight copy/move) and must not be re-processed as external change.
+    #suppressedKeys = new Map();
+    // id → [{ sourceLocation, target, destKey }] — moves onto a `type:'remote'`
+    // backend, held until the SyncQueue confirms the destination write. The
+    // source is only removed once the copy is durable somewhere else.
+    #pendingMoves = new Map();
 
     constructor(config = {}) {
         // Wildcards (':' delimiter) let consumers bind `object:*` across backends.
@@ -157,7 +172,10 @@ export default class Stored extends EventEmitter2 {
 
     /**
      * Delete the bytes behind a `stored://<backend>/<key>` URL. Does not touch
-     * the document index (synapsd owns that) — callers trim `locations[]`.
+     * the consumer's document index (synapsd owns that) — callers trim
+     * `locations[]` — but DOES drop the location from stored's own index: an
+     * index that still claims bytes we just deleted makes a later `copy()` skip
+     * the target as "already there" and report success for a no-op.
      * Returns { ok:boolean, reason?:'malformed-url'|'unknown-backend'|'read-only-backend' }.
      */
     async deleteByUrl(url) {
@@ -166,7 +184,27 @@ export default class Stored extends EventEmitter2 {
         const backend = this.#backends.get(p.backend);
         if (!backend) return { ok: false, reason: 'unknown-backend' };
         if (!backend.canDelete) return { ok: false, reason: 'read-only-backend' };
-        return { ok: !!(await backend.delete(p.key)) };
+        const deleted = !!(await backend.delete(p.key));
+        if (deleted) this.#dropLocation(p.backend, p.key);
+        return { ok: deleted };
+    }
+
+    /**
+     * Forget one location we just deleted the bytes for. Emits
+     * `object:location:remove` when the content survives elsewhere; drops the
+     * whole entry when that was its last home.
+     */
+    #dropLocation(backendName, key) {
+        const meta = this.#index.get(`${backendName}:${key}`);
+        if (!meta) return;
+        const removed = (meta.locations || []).find(l => l.backend === backendName && l.key === key);
+        const remaining = (meta.locations || []).filter(l => !(l.backend === backendName && l.key === key));
+        if (remaining.length === 0) {
+            this.#index.delete(meta.id);
+            return;
+        }
+        const saved = this.#index.put(meta.id, { ...meta, locations: remaining });
+        if (removed) this.#emitLocationEvent('location:remove', saved, removed, { reason: 'deleted' });
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -246,6 +284,9 @@ export default class Stored extends EventEmitter2 {
         } else {
             meta.locations = remaining;
             this.#index.put(meta.id, meta);
+            // Content survives elsewhere — consumers patch locations[] in place
+            // rather than treating this as the object going away.
+            for (const loc of removed) this.#emitLocationEvent('location:remove', meta, loc, { reason: 'deleted' });
         }
 
         this.emit('delete', { id: meta.id, backends: deleted });
@@ -255,6 +296,143 @@ export default class Stored extends EventEmitter2 {
     async stat(idOrKey) { return this.#index.get(idOrKey); }
     async has(idOrKey) { return this.#index.has(idOrKey); }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Copy / move — location mutations that preserve content identity
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Copy the bytes behind `idOrKey` onto one or more other backends. Content
+     * identity is unchanged: the same index entry simply gains locations.
+     *
+     * Bytes are streamed through a hashing pass and the result is checked
+     * against the indexed id before anything is committed — the stream is being
+     * paid for regardless, and it catches a source that rotted or was rewritten
+     * behind our back (returns `checksum-mismatch` rather than silently
+     * propagating the wrong bytes under the old id).
+     *
+     * @param {string} idOrKey Content id or `{backend}:{key}`
+     * @param {object} options
+     * @param {string|string[]} options.to Target backend name(s)
+     * @param {string} [options.key] Key on the targets (defaults to the source key)
+     * @param {string} [options.from] Source backend name or `stored://` URL
+     * @param {'error'|'rename'|'overwrite'} [options.onConflict='error'] What to do
+     *   when other content already occupies the destination key: refuse (default),
+     *   pick the next free `name-1.ext`, or replace it.
+     * @returns {Promise<{ ok:true, id, added:string[], locations } | { ok:false, reason:string }>}
+     */
+    async copy(idOrKey, options = {}) {
+        const plan = await this.#planTransfer(idOrKey, options);
+        if (!plan.ok) return plan;
+
+        const { meta, sourceLocation, targets, destKey } = plan;
+        if (!targets.length) {
+            return { ok: true, id: meta.id, added: [], unchanged: true, locations: await this.locations(meta.id) };
+        }
+
+        const release = this.#holdKeys(targets.map(t => `${t.name}:${destKey}`));
+        try {
+            const transferred = await this.#streamToTargets(meta, sourceLocation, targets, destKey);
+            if (!transferred.ok) return transferred;
+
+            const saved = this.#index.put(meta.id, { ...meta, locations: this.#mergeLocations(meta, transferred.locations) });
+            if (transferred.remoteTargets.length) {
+                this.#syncQueue.enqueue({ id: meta.id, cacheRoot: this.#cache.root, cacheKey: meta.id, targets: transferred.remoteTargets });
+            }
+
+            for (const loc of transferred.locations) this.#emitLocationEvent('location:add', saved, loc);
+            debug(`COPY ${meta.id.slice(0, 19)}... → ${targets.map(t => t.name).join(', ')}/${destKey}`);
+            return {
+                ok: true,
+                id: meta.id,
+                added: transferred.locations.map(l => `stored://${l.backend}/${l.key}`),
+                locations: saved.locations.map(l => this.#describeLocation(l)),
+            };
+        } finally {
+            release();
+        }
+    }
+
+    /**
+     * Move the bytes behind `idOrKey` to another backend: a copy followed by
+     * removal of the source location.
+     *
+     * Ordering is load-bearing — the source is never dropped until the
+     * destination is durable. For a `type:'remote'` target that means waiting
+     * for the SyncQueue, so the call returns `state:'pending'` and completes on
+     * the `synced` event; a failed sync leaves the object as a copy rather than
+     * losing it. Within one filesystem the whole transfer collapses to a single
+     * `rename(2)` (no bytes cross userspace, no re-hash — the inode is the
+     * proof of identity).
+     *
+     * Emits `object:move` on completion — consumers must patch `locations[]` in
+     * place, NOT unlink + re-add, or the document loses its identity.
+     *
+     * @returns {Promise<{ ok:true, id, state:'complete'|'pending', from, to, locations } | { ok:false, reason:string }>}
+     */
+    async move(idOrKey, options = {}) {
+        const plan = await this.#planTransfer(idOrKey, options);
+        if (!plan.ok) return plan;
+
+        const { meta, sourceLocation, sourceBackend, targets, destKey } = plan;
+        if (!targets.length) {
+            return { ok: true, id: meta.id, state: 'complete', unchanged: true, locations: await this.locations(meta.id) };
+        }
+        // Fan-out is `copy`'s job; a move has exactly one destination, otherwise
+        // "which one may the source be dropped for?" has no answer.
+        if (targets.length > 1) return { ok: false, reason: 'move-single-target' };
+        if (!sourceBackend.canDelete) return { ok: false, reason: 'source-not-removable', backend: sourceLocation.backend };
+
+        const target = targets[0];
+        // Conflict resolution may have renamed this target's key (see
+        // #planTransfer) — everything below addresses the resolved one.
+        const targetKey = target.key || destKey;
+        const release = this.#holdKeys([
+            `${sourceLocation.backend}:${sourceLocation.key}`,
+            `${target.name}:${targetKey}`,
+        ]);
+        try {
+            // Fast path — same filesystem, both file backends.
+            const renamed = await this.#tryRename(sourceBackend, sourceLocation.key, target.backend, targetKey);
+            if (renamed) {
+                const location = this.#buildLocation(target.name, targetKey, true, {
+                    size: renamed.size, mtime: renamed.modified, dev: renamed.dev, ino: renamed.ino,
+                });
+                debug(`MOVE (rename) ${sourceLocation.backend}:${sourceLocation.key} → ${target.name}:${targetKey}`);
+                return this.#finalizeMove(meta.id, sourceLocation, location, { removeSourceBytes: false });
+            }
+
+            const transferred = await this.#streamToTargets(meta, sourceLocation, targets, destKey);
+            if (!transferred.ok) return transferred;
+            const location = transferred.locations[0];
+
+            // Add-first: the destination location is recorded before the source
+            // is touched, so a crash here leaves a copy — never an orphan.
+            const saved = this.#index.put(meta.id, { ...meta, locations: this.#mergeLocations(meta, transferred.locations) });
+            this.#emitLocationEvent('location:add', saved, location);
+
+            if (transferred.remoteTargets.length) {
+                const pending = this.#pendingMoves.get(meta.id) || [];
+                pending.push({ sourceLocation, target: target.name, destKey: targetKey });
+                this.#pendingMoves.set(meta.id, pending);
+                this.#syncQueue.enqueue({ id: meta.id, cacheRoot: this.#cache.root, cacheKey: meta.id, targets: transferred.remoteTargets });
+                debug(`MOVE (pending sync) ${sourceLocation.backend}:${sourceLocation.key} → ${target.name}:${targetKey}`);
+                return {
+                    ok: true,
+                    id: meta.id,
+                    state: 'pending',
+                    from: this.#endpoint(sourceLocation),
+                    to: this.#endpoint(location),
+                    locations: saved.locations.map(l => this.#describeLocation(l)),
+                };
+            }
+
+            debug(`MOVE ${sourceLocation.backend}:${sourceLocation.key} → ${target.name}:${targetKey}`);
+            return this.#finalizeMove(meta.id, sourceLocation, location, { removeSourceBytes: true });
+        } finally {
+            release();
+        }
+    }
+
     /**
      * Where does the content behind `idOrKey` actually live? Returns the
      * canonical, resolvable `stored://<backend>/<key>` URLs plus per-location
@@ -263,19 +441,26 @@ export default class Stored extends EventEmitter2 {
      */
     async locations(idOrKey) {
         const meta = this.#index.get(idOrKey);
-        return (meta?.locations || []).map(l => {
-            const backend = this.#backends.get(l.backend);
-            return {
-                url: `stored://${l.backend}/${l.key}`,
-                nativeUrl: backend ? backend.nativeUrl(l.key) : null,
-                backend: l.backend,
-                key: l.key,
-                driver: l.driver,
-                synced: l.synced,
-                size: l.size,
-                source: l.source,
-            };
-        });
+        return (meta?.locations || []).map(l => this.#describeLocation(l));
+    }
+
+    #describeLocation(l) {
+        const backend = this.#backends.get(l.backend);
+        // Live backend first (a mount may have been re-detected since indexing),
+        // falling back to the snapshot on the location for offline backends.
+        const remote = backend ? backend.remote : (l.source?.remote === true);
+        return {
+            url: `stored://${l.backend}/${l.key}`,
+            nativeUrl: backend ? backend.nativeUrl(l.key) : null,
+            backend: l.backend,
+            key: l.key,
+            driver: l.driver,
+            synced: l.synced,
+            size: l.size,
+            remote,
+            transport: backend ? backend.transport : (l.source?.transport ?? null),
+            source: l.source,
+        };
     }
 
     // Iterate all indexed metadata entries.
@@ -431,11 +616,357 @@ export default class Stored extends EventEmitter2 {
 
         this.#index.put(meta.id, meta);
         this.emit('synced', { id, results });
+        this.#resolvePendingMoves(id, results);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Private — copy / move
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Validate a copy/move request before a single byte is read: content must
+     * exist, the source must be readable and online, every target must exist, be
+     * writable and be online. Targets that already hold `destKey` are dropped
+     * (a copy onto an existing location is a no-op, not an error).
+     */
+    async #planTransfer(idOrKey, options = {}) {
+        const meta = this.#index.get(idOrKey);
+        if (!meta) return { ok: false, reason: 'not-found' };
+
+        const onConflict = ['error', 'overwrite', 'rename'].includes(options.onConflict)
+            ? options.onConflict
+            : 'error';
+
+        const toNames = (Array.isArray(options.to) ? options.to : [options.to]).filter(Boolean).map(String);
+        if (!toNames.length) return { ok: false, reason: 'no-targets' };
+
+        const sourceLocation = this.#resolveSourceLocation(meta, options.from);
+        if (!sourceLocation) return { ok: false, reason: 'no-source' };
+        const sourceBackend = this.#backends.get(sourceLocation.backend);
+        const sourceLive = await this.#verifyBackendRoot(sourceBackend);
+        if (!sourceLive.ok) {
+            return { ok: false, reason: 'source-offline', backend: sourceLocation.backend, detail: sourceLive.reason };
+        }
+
+        // Normalize the destination key: a template that leaves an empty
+        // segment ('Fotky//2019') writes a file the OS reports back under the
+        // collapsed path, and the watcher would then index it a SECOND time as
+        // a new location. The index must spell keys the way the filesystem does.
+        const destKey = String(options.key || sourceLocation.key)
+            .replace(/\/{2,}/g, '/')
+            .replace(/^\/+|\/+$/g, '');
+        if (!destKey) return { ok: false, reason: 'invalid-key' };
+        const targets = [];
+        for (const name of toNames) {
+            const backend = this.#backends.get(name);
+            if (!backend) return { ok: false, reason: 'unknown-backend', backend: name };
+            if (!backend.canWrite) return { ok: false, reason: 'read-only-target', backend: name };
+            if (name === sourceLocation.backend && destKey === sourceLocation.key) continue;
+            // Already recorded there — but only skip if the bytes are REALLY
+            // there. An index that outlived its file (deleted behind our back,
+            // an unmounted share, a failed sync) must not turn a copy into a
+            // silent no-op that reports success.
+            const ours = (meta.locations || []).some(l => l.backend === name && l.key === destKey);
+            const present = await backend.stat(destKey).catch(() => null);
+            if (ours && present) continue;
+            if (ours) debug(`Stale location ${name}:${destKey} (indexed, no bytes) — re-transferring`);
+
+            const live = await this.#verifyBackendRoot(backend);
+            if (!live.ok) return { ok: false, reason: 'target-offline', backend: name, detail: live.reason };
+
+            // Somebody else's bytes are sitting on the destination key. Writing
+            // over them is silent data loss, so it takes an explicit policy.
+            let key = destKey;
+            if (present && !ours && !this.#isSameContent(name, destKey, meta.id)) {
+                if (onConflict === 'error') return { ok: false, reason: 'target-exists', backend: name, key: destKey };
+                if (onConflict === 'rename') {
+                    key = await this.#freeKey(backend, destKey);
+                    debug(`Conflict on ${name}:${destKey} — using ${key}`);
+                }
+                // 'overwrite' keeps destKey and lets the commit replace it.
+            }
+            targets.push({ name, backend, key });
+        }
+
+        return { ok: true, meta, sourceLocation, sourceBackend, targets, destKey };
+    }
+
+    /** Do the bytes already on `key` happen to BE this content? Then it is not a conflict. */
+    #isSameContent(backendName, key, id) {
+        return this.#index.get(`${backendName}:${key}`)?.id === id;
+    }
+
+    /**
+     * First free variant of `key`: `photo.jpg` → `photo-1.jpg` → `photo-2.jpg`.
+     * Two photos taken in the same second produce the same templated name, and
+     * silently overwriting one with the other is the worst possible outcome.
+     */
+    async #freeKey(backend, key) {
+        const dot = key.lastIndexOf('.');
+        const slash = key.lastIndexOf('/');
+        const hasExt = dot > slash + 1;
+        const stem = hasExt ? key.slice(0, dot) : key;
+        const ext = hasExt ? key.slice(dot) : '';
+
+        for (let n = 1; n <= 1000; n += 1) {
+            const candidate = `${stem}-${n}${ext}`;
+            if (!(await backend.stat(candidate).catch(() => null))) return candidate;
+        }
+        throw new Error(`No free key for ${key} after 1000 attempts`);
+    }
+
+    /**
+     * Which location do we read from? An explicit `from` (backend name or
+     * `stored://` URL) wins; otherwise the cheapest readable one — local disk
+     * before a network mount, so a copy between two local backends never pulls
+     * the bytes over the LAN just because the NAS location was indexed first.
+     */
+    #resolveSourceLocation(meta, from) {
+        const locations = meta.locations || [];
+        if (from) {
+            const parsed = this.#parseStoredUrl(from);
+            const match = parsed
+                ? locations.find(l => l.backend === parsed.backend && l.key === parsed.key)
+                : locations.find(l => l.backend === from);
+            if (!match) return null;
+            const backend = this.#backends.get(match.backend);
+            return backend && backend.canRead && match.synced ? match : null;
+        }
+        return this.#readableLocations(meta)[0] || null;
+    }
+
+    /**
+     * Liveness gate. For file backends an absent mountpoint must fail the whole
+     * transfer up front: writing into the empty directory where a NAS used to be
+     * silently creates a second, divergent copy — and reading from one yields
+     * "not found" for content that is merely offline.
+     */
+    async #verifyBackendRoot(backend) {
+        if (!backend) return { ok: false, reason: 'unknown-backend' };
+        if (typeof backend.verifyRoot !== 'function') return { ok: true };
+        return backend.verifyRoot();
+    }
+
+    /**
+     * Stream source bytes onto the targets through one hashing pass, verifying
+     * content identity before committing. The temp file is staged on the first
+     * local target's filesystem so `#commit` can hardlink instead of copying.
+     */
+    async #streamToTargets(meta, sourceLocation, targets, destKey) {
+        const sourceBackend = this.#backends.get(sourceLocation.backend);
+        const source = await sourceBackend.get(sourceLocation.key, { stream: true });
+        if (!source) return { ok: false, reason: 'source-unreadable', backend: sourceLocation.backend, key: sourceLocation.key };
+
+        const firstLocal = targets.find(t => t.backend.type === 'local')?.backend;
+        const tempDir = firstLocal ? firstLocal.tempDir : path.join(this.#paths.cache, '.tmp');
+        const tempPath = path.join(tempDir, `${Date.now()}-${crypto.randomUUID()}`);
+        await fsp.mkdir(tempDir, { recursive: true });
+
+        try {
+            const { checksums, size } = await this.#hashToFile(source, tempPath);
+            const id = formatId(checksums, this.#config.primaryChecksum);
+            if (id !== meta.id) {
+                debug(`Transfer aborted: ${sourceLocation.backend}:${sourceLocation.key} hashes to ${id}, indexed as ${meta.id}`);
+                return { ok: false, reason: 'checksum-mismatch', expected: meta.id, actual: id };
+            }
+            const { locations, remoteTargets } = await this.#commit(
+                targets, destKey, meta.id, { file: tempPath }, { checksums, size, mimeType: meta.mimeType },
+            );
+            return { ok: true, locations, remoteTargets, size };
+        } catch (err) {
+            return { ok: false, reason: 'transfer-failed', error: err.message };
+        } finally {
+            await fsp.rm(tempPath, { force: true }).catch(() => {});
+        }
+    }
+
+    /**
+     * Same-filesystem shortcut: one `rename(2)` instead of reading and rewriting
+     * the whole object. Returns the destination stat on success, or null when
+     * the shortcut does not apply (different filesystems, non-file drivers) so
+     * the caller falls back to a stream copy. No re-hash — the inode is carried
+     * over intact, so the bytes are the same bytes by construction.
+     */
+    async #tryRename(sourceBackend, sourceKey, targetBackend, destKey) {
+        if (typeof sourceBackend?.resolveKeyPath !== 'function') return null;
+        if (typeof targetBackend?.renameFrom !== 'function' || !targetBackend.root) return null;
+
+        const sourcePath = sourceBackend.resolveKeyPath(sourceKey);
+        const [sourceStat, targetStat] = await Promise.all([
+            fsp.stat(sourcePath).catch(() => null),
+            fsp.stat(targetBackend.root).catch(() => null),
+        ]);
+        if (!sourceStat || !targetStat || sourceStat.dev !== targetStat.dev) return null;
+
+        try {
+            return await targetBackend.renameFrom(destKey, sourcePath);
+        } catch (err) {
+            if (err.code === 'EXDEV') return null;   // mount table lied; copy instead
+            throw err;
+        }
+    }
+
+    /**
+     * Complete a move: drop the source bytes (unless a rename already relocated
+     * them), swap the location in the index, emit `object:move`.
+     *
+     * A failed source delete is reported as `source-delete-failed` with
+     * `degradedToCopy` — the content is safely at the destination, there is just
+     * a stale second copy left behind. That is a cleanup problem, never data
+     * loss, and the caller must be able to tell the two apart.
+     */
+    async #finalizeMove(id, sourceLocation, newLocation, { removeSourceBytes }) {
+        const release = this.#holdKeys([`${sourceLocation.backend}:${sourceLocation.key}`]);
+        try {
+            if (removeSourceBytes) {
+                const sourceBackend = this.#backends.get(sourceLocation.backend);
+                const deleted = await sourceBackend.delete(sourceLocation.key).catch(() => false);
+                if (!deleted) {
+                    return {
+                        ok: false,
+                        reason: 'source-delete-failed',
+                        degradedToCopy: true,
+                        id,
+                        from: this.#endpoint(sourceLocation),
+                        to: this.#endpoint(newLocation),
+                    };
+                }
+            }
+
+            // Re-read: a pending move completes on the sync callback, long after
+            // the plan was made, and the entry may have gained locations since.
+            const current = this.#index.get(id);
+            if (!current) return { ok: false, reason: 'not-found' };
+            const locations = this.#mergeLocations(current, [newLocation])
+                .filter(l => !(l.backend === sourceLocation.backend && l.key === sourceLocation.key));
+            const saved = this.#index.put(id, { ...current, locations });
+
+            this.#emitObject('move', {
+                id,
+                checksums: saved.checksums,
+                from: this.#endpoint(sourceLocation),
+                to: this.#endpoint(newLocation),
+                location: this.#describeLocation(newLocation),
+                locations: saved.locations.map(l => this.#describeLocation(l)),
+            });
+
+            return {
+                ok: true,
+                id,
+                state: 'complete',
+                from: this.#endpoint(sourceLocation),
+                to: this.#endpoint(newLocation),
+                locations: saved.locations.map(l => this.#describeLocation(l)),
+            };
+        } finally {
+            release();
+        }
+    }
+
+    /** Finish moves that were waiting on a remote destination write. */
+    #resolvePendingMoves(id, results = []) {
+        const pending = this.#pendingMoves.get(id);
+        if (!pending) return;
+
+        const succeeded = new Set(results.filter(r => r.success).map(r => r.backend));
+        const failed = new Set(results.filter(r => !r.success).map(r => r.backend));
+        const remaining = [];
+
+        for (const entry of pending) {
+            if (succeeded.has(entry.target)) {
+                const meta = this.#index.get(id);
+                const location = (meta?.locations || []).find(l => l.backend === entry.target && l.key === entry.destKey);
+                if (location) {
+                    this.#finalizeMove(id, entry.sourceLocation, location, { removeSourceBytes: true })
+                        .catch(err => this.emit('error', err));
+                }
+            } else if (failed.has(entry.target)) {
+                // Destination write failed — the source stays exactly where it
+                // is. The object is unharmed; the move simply did not happen.
+                this.emit('error', Object.assign(
+                    new Error(`Move to ${entry.target} failed; source retained at ${entry.sourceLocation.backend}:${entry.sourceLocation.key}`),
+                    { id, code: 'MOVE_SYNC_FAILED' },
+                ));
+            } else {
+                remaining.push(entry);
+            }
+        }
+
+        if (remaining.length) this.#pendingMoves.set(id, remaining);
+        else this.#pendingMoves.delete(id);
+    }
+
+    /** Upsert locations by (backend, key), preserving order. */
+    #mergeLocations(meta, added = []) {
+        const out = [...(meta.locations || [])];
+        for (const loc of added) {
+            const at = out.findIndex(l => l.backend === loc.backend && l.key === loc.key);
+            if (at >= 0) out[at] = loc;
+            else out.push(loc);
+        }
+        return out;
+    }
+
+    #endpoint(location) {
+        return {
+            backend: location.backend,
+            key: location.key,
+            url: `stored://${location.backend}/${location.key}`,
+        };
+    }
+
+    #emitLocationEvent(suffix, meta, location, extra = {}) {
+        this.#emitObject(suffix, {
+            id: meta.id,
+            checksums: meta.checksums,
+            backend: location.backend,
+            key: location.key,
+            location: this.#describeLocation(location),
+            locations: (meta.locations || []).map(l => this.#describeLocation(l)),
+            ...extra,
+        });
+    }
+
+    /**
+     * Suppress watcher events for keys we are about to write or delete
+     * ourselves. Refcounted (concurrent transfers may overlap) and released on a
+     * delay, because the events arrive well after the syscall returns.
+     */
+    #holdKeys(keys) {
+        for (const key of keys) this.#suppressedKeys.set(key, (this.#suppressedKeys.get(key) || 0) + 1);
+        let released = false;
+        return () => {
+            if (released) return;
+            released = true;
+            const timer = setTimeout(() => {
+                for (const key of keys) {
+                    const next = (this.#suppressedKeys.get(key) || 1) - 1;
+                    if (next <= 0) this.#suppressedKeys.delete(key);
+                    else this.#suppressedKeys.set(key, next);
+                }
+            }, MOVE_SUPPRESS_MS);
+            timer.unref?.();
+        };
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Private — reads
     // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Synced locations whose backend is registered and readable, cheapest first:
+     * local disk, then network mounts, then `type:'remote'` protocol backends
+     * (S3/HTTP — a real request, not just a slower filesystem).
+     */
+    #readableLocations(meta) {
+        const cost = (backend) => (backend.type === 'remote' ? 2 : (backend.remote ? 1 : 0));
+        return (meta?.locations || [])
+            .filter(l => l.synced)
+            .map(l => ({ l, backend: this.#backends.get(l.backend) }))
+            .filter(({ backend }) => backend && backend.canRead)
+            .sort((a, b) => cost(a.backend) - cost(b.backend))
+            .map(({ l }) => l);
+    }
 
     async #read(idOrKey, stream) {
         const meta = this.#index.get(idOrKey);
@@ -449,8 +980,10 @@ export default class Stored extends EventEmitter2 {
             try { return (await this.#cache.get(meta.id)).data; } catch { /* miss */ }
         }
 
-        // 2. First synced backend location.
-        const location = meta.locations?.find(l => l.synced);
+        // 2. Best available backend location — local before remote (see
+        //    #readableLocations); a LAN round-trip must never win over a copy
+        //    sitting on local disk just because it was indexed first.
+        const location = this.#readableLocations(meta)[0];
         const backend = location && this.#backends.get(location.backend);
         if (!backend) return null;
 
@@ -552,14 +1085,18 @@ export default class Stored extends EventEmitter2 {
         const locations = [];
         const remoteTargets = [];
 
-        for (const { name, backend } of targets) {
+        for (const { name, backend, key } of targets) {
+            // A target may carry its own key: conflict resolution can rename per
+            // backend (`photo.jpg` is free on one, taken on another). `put()`
+            // targets never do, so they all land on `finalKey`.
+            const targetKey = key || finalKey;
             if (backend.type === 'local') {
-                if (source.data) await backend.put(finalKey, source.data);
-                else await backend.commit(finalKey, source.file);
-                locations.push(this.#buildLocation(name, finalKey, true, { size: meta.size }));
+                if (source.data) await backend.put(targetKey, source.data);
+                else await backend.commit(targetKey, source.file);
+                locations.push(this.#buildLocation(name, targetKey, true, { size: meta.size }));
             } else {
-                locations.push(this.#buildLocation(name, finalKey, false, { size: meta.size }));
-                remoteTargets.push({ name, driver: backend.config.driver, root: backend.config.root, key: finalKey });
+                locations.push(this.#buildLocation(name, targetKey, false, { size: meta.size }));
+                remoteTargets.push({ name, driver: backend.config.driver, root: backend.config.root, key: targetKey });
             }
         }
 
@@ -632,6 +1169,7 @@ export default class Stored extends EventEmitter2 {
     }
 
     #buildSourceDescriptor(backendName, key, config = {}) {
+        const backend = this.#backends.get(backendName);
         const [providerHint, ...accountHintParts] = String(backendName || '').split(':').filter(Boolean);
         const provider = config.provider || providerHint || config.driver || 'unknown';
         const account = config.account
@@ -642,11 +1180,22 @@ export default class Stored extends EventEmitter2 {
             || config.folder
             || (config.root ? path.basename(path.resolve(config.root)) : 'root');
 
+        // `remote`/`transport` are recorded on the location itself, not just read
+        // off the live backend: a location must stay self-describing after its
+        // backend is unmounted or dropped from config (the offline case is
+        // exactly when a consumer needs to know "this lived on the NAS").
+        // Sparse on purpose — local locations are the overwhelming majority and
+        // carry no extra bytes.
+        const remote = backend ? backend.remote : (config.remote === true);
+        const transport = backend ? backend.transport : (config.transport ?? null);
+
         return {
             provider,
             account,
             container,
             path: key,
+            ...(remote ? { remote: true } : {}),
+            ...(remote && transport ? { transport } : {}),
         };
     }
 
@@ -686,6 +1235,14 @@ export default class Stored extends EventEmitter2 {
 
     #handleFileEvent(event, data) {
         const pathKey = `${data.backend}:${data.key}`;
+        // Our own copy/move touching a watched root — the index was already
+        // updated by the operation itself. Re-processing the echo would emit a
+        // spurious add (or, worse, an unlink that drops the location we just
+        // moved the object to).
+        if (this.#suppressedKeys.has(pathKey)) {
+            debug(`Suppressed ${event} for in-flight transfer ${pathKey}`);
+            return;
+        }
         const location = this.#buildLocation(data.backend, data.key, true, {
             size: data.size,
             mtime: data.modified,
