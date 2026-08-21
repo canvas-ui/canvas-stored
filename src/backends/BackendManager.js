@@ -3,17 +3,27 @@ import FileBackend from './file/index.js';
 import CacacheBackend from './cacache/index.js';
 import S3Backend from './s3/index.js';
 import HttpBackend from './http/index.js';
+import GdriveBackend from './gdrive/index.js';
 
 const debug = Debug('stored:backends');
 
 // `s3`/`http` are skeletons (see their index.js). `smb`/`webdav` are reserved
-// scheme names with no driver yet — register a driver class here when
-// implemented. Non-blob connectors (mail/git/…) are NOT stored drivers; they
-// live in separate workspace services and only use stored to persist blobs.
-const DRIVERS = { file: FileBackend, cacache: CacacheBackend, s3: S3Backend, http: HttpBackend };
+// scheme names with no driver yet — register a driver class here (or at
+// runtime via BackendManager.register) when implemented. `gdrive` is the first
+// real remote driver. Non-blob connectors (mail/git/…) are NOT stored drivers;
+// they live in separate workspace services and only use stored to persist blobs.
+const DRIVERS = { file: FileBackend, cacache: CacacheBackend, s3: S3Backend, http: HttpBackend, gdrive: GdriveBackend };
 
 export default class BackendManager {
     #backends = new Map();
+
+    /** Register (or override) a driver class under `driver` — plugin/test seam. */
+    static register(driver, Driver) {
+        if (!driver || typeof Driver !== 'function') throw new Error('register(driver, DriverClass) required');
+        DRIVERS[driver] = Driver;
+    }
+
+    static drivers() { return Object.keys(DRIVERS); }
 
     get(name) { return this.#backends.get(name); }
     has(name) { return this.#backends.has(name); }

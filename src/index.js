@@ -66,8 +66,11 @@ export default class Stored extends EventEmitter2 {
         this.#backends = new BackendManager();
         this.#index = new Index(this.#paths.index);
 
-        // Background sync queue for remote backends (worker spawned lazily)
-        this.#syncQueue = new SyncQueue();
+        // Background sync queue for remote backends: file targets are copied by
+        // a worker thread, network drivers (gdrive, …) are committed in-process
+        // through their live backend (async I/O — nothing to offload, and the
+        // driver's credentials/path cache stay on the main thread).
+        this.#syncQueue = new SyncQueue({ resolveBackend: (name) => this.#backends.get(name) });
         this.#syncQueue.on('synced', ({ id, results }) => this.#handleSyncResult(id, results));
         this.#syncQueue.on('error', (err) => this.emit('error', err));
 

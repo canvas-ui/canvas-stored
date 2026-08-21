@@ -9,7 +9,7 @@ import { dirname, join } from 'path';
 // straight from the cache content store to each target.
 const CACHE_OPTS = { memoize: false };
 
-parentPort.on('message', async ({ id, cacheRoot, cacheKey, targets }) => {
+parentPort.on('message', async ({ seq, id, cacheRoot, cacheKey, targets }) => {
     const results = [];
 
     // Confirm the entry exists before fanning out (cheap index lookup, no read).
@@ -18,7 +18,7 @@ parentPort.on('message', async ({ id, cacheRoot, cacheKey, targets }) => {
         for (const target of targets) {
             results.push({ backend: target.name, success: false, error: 'Cache read failed: entry not found' });
         }
-        parentPort.postMessage({ id, results });
+        parentPort.postMessage({ seq, id, results });
         return;
     }
 
@@ -37,7 +37,9 @@ parentPort.on('message', async ({ id, cacheRoot, cacheKey, targets }) => {
                     results.push({ backend: target.name, key: target.key, success: true });
                     break;
                 }
-                // Future: 's3', 'smb', etc.
+                // Non-file drivers (gdrive, …) are committed in-process by the
+                // SyncQueue through their live backend instance — they never
+                // reach this worker. Anything else here is a routing bug.
                 default:
                     results.push({ backend: target.name, success: false, error: `Unknown driver: ${target.driver}` });
             }
@@ -46,5 +48,5 @@ parentPort.on('message', async ({ id, cacheRoot, cacheKey, targets }) => {
         }
     }
 
-    parentPort.postMessage({ id, results });
+    parentPort.postMessage({ seq, id, results });
 });

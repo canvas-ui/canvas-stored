@@ -4,12 +4,12 @@
 
 # StoreD
 
-Cache-first blob storage with a content-addressable local cache, LMDB metadata index and pluggable backends. Local backends write immediately remote backends sync through a worker-thread queue.
+Cache-first blob storage with a content-addressable local cache, LMDB metadata index and pluggable backends. Local backends write immediately; remote backends are fed from the cache by a sync queue (disk copies on a worker thread, network drivers such as Google Drive committed in-process).
 
 Used with canvas-server/synapsd to build virtual context trees over indexed data: checksum-based identity, multi-location replication, and `stored://` URLs as the canonical fetch form.
 
 ```
-put(blob)  → stream hash → local backends (hardlink/rename) + remote (cacache → SyncQueue / worker_threads)
+put(blob)  → stream hash → local backends (hardlink/rename) + remote (cacache → SyncQueue → backend.commit)
 get(id)    → cacache → synced backend location → cache on read (buffers only)
 ```
 
@@ -50,6 +50,37 @@ await stored.getByUrl('stored://fs:home/docs/hello.txt');
 
 await stored.stop();
 ```
+
+### Drivers
+
+| driver | type | notes |
+|---|---|---|
+| `file` | local | Any directory; chokidar watch, inode-based rename matching, container (folder) ops |
+| `cacache` | local | Content-addressable blob store (managed; opaque keys) |
+| `gdrive` | remote | Google Drive folder subtree over OAuth refresh token — see below |
+| `s3`, `http` | remote | Skeletons: URL parsing only (`http` has a read-only `get`) |
+
+Register additional drivers at runtime with `BackendManager.register(name, Class)` (`import BackendManager from 'canvas-stored/src/backends/BackendManager.js'`).
+
+### Google Drive backend
+
+```js
+stored.addBackend('gdrive:work', {
+  driver: 'gdrive',
+  clientId: '…apps.googleusercontent.com',   // OAuth client (Desktop/Web app) with the drive scope
+  clientSecret: '…',
+  refreshToken: '1//…',                      // offline-access grant (access_type=offline, prompt=consent)
+  folderId: 'root',                          // subtree root; default = My Drive
+  watch: true,                               // poll changes.list (pollInterval, default 60000 ms)
+  permanentDelete: false,                    // default: delete() trashes instead of purging
+});
+```
+
+- Keys are `/`-joined Drive *names* below the root folder. Duplicate siblings get a ` (<id-prefix>)` suffix, `/` in a name becomes `∕`. Native Google Docs/Sheets/Slides (no bytes) are skipped.
+- `scan()` takes sha256/sha1/md5 straight from file metadata — no downloads unless you ask for an algorithm Drive doesn't serve.
+- Writes go cache → SyncQueue → `commit(key, path)` (resumable upload, 8 MiB chunks, in-place update when the key exists). Reads (`get`, `getRange`) stream from the API.
+- `watch()` emits `file:add|change|unlink` from the changes feed; renames/moves carry `ino = fileId`, so Stored's rename window rewrites the location in place instead of orphaning the document.
+- `verifyRoot()` → `{ ok, reason: 'unauthorized' | 'root-missing' | 'unreachable' }` is the liveness gate (credentials + root folder).
 
 ---
 
