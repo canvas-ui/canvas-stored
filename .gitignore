@@ -10,6 +10,10 @@
 /.fossil-settings
 /_SCRATCH_
 
+# Default Stored root (`root ?? './.stored'`) — an LMDB index a stray `new
+# Stored()` with no root creates right here. Runtime state, never source.
+/.stored/
+
 # Logs
 *.log
 */*/logs/*
