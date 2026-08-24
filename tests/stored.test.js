@@ -2,11 +2,15 @@ import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert';
 import fs from 'fs-extra';
 import path from 'path';
+import os from 'os';
 import { Readable } from 'stream';
 import Stored from '../src/index.js';
 
-const TEST_DIR = '~/Desktop/Notes';
-const STORED_ROOT = '~/Desktop/Notes.stored';
+// A literal '~' is not a home directory to path.resolve() — it is a folder
+// called '~', which these paths were creating inside the repo on every run.
+const TMP_ROOT = path.join(os.tmpdir(), 'stored-tests');
+const TEST_DIR = path.join(TMP_ROOT, 'Notes');
+const STORED_ROOT = path.join(TMP_ROOT, 'Notes.stored');
 
 describe('Stored', async () => {
     let stored;
@@ -87,7 +91,7 @@ describe('Stored', async () => {
             assert.deepStrictEqual(meta.locations[0].source, {
                 provider: 'fs',
                 account: 'test',
-                container: 'Notes.stored',
+                container: 'Notes',
                 path: 'buffer.txt',
             });
             assert.ok(meta.created);
@@ -283,7 +287,7 @@ describe('Stored', async () => {
                 assert.deepStrictEqual(meta.locations[0].source, {
                     provider: 'fs',
                     account: 'test',
-                    container: 'Notes.stored',
+                    container: 'Notes',
                     path: 'scan1.txt',
                 });
             }

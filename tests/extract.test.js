@@ -38,7 +38,7 @@ test('extract: empty source → {}', async () => {
 test('Stored.put runs the injected extractor → custom carries dimensions', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'stored-extract-'));
     try {
-        const s = new Stored({ rootPath: root, extract });
+        const s = new Stored({ root, extract });
         s.addBackend('data', { driver: 'file', root: path.join(root, 'data'), watch: false });
 
         const r = await s.put(PNG_10x5, { backends: ['data'], mimeType: 'image/png' });
@@ -63,7 +63,7 @@ test('Stored.put runs the injected extractor → custom carries dimensions', asy
 test('Stored.put without an extractor → no custom extraction', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'stored-noextract-'));
     try {
-        const s = new Stored({ rootPath: root }); // no extract injected
+        const s = new Stored({ root }); // no extract injected
         s.addBackend('data', { driver: 'file', root: path.join(root, 'data'), watch: false });
         const r = await s.put(PNG_10x5, { backends: ['data'], mimeType: 'image/png' });
         assert.equal(r.ok, true);
