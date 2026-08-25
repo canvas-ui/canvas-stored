@@ -13,7 +13,7 @@ Shipped in stored (`copy()`/`move()` emit them, `delete()` emits
 `location:remove`) and bound in canvas-server
 (`WorkspaceStoredIndex.#applyLocationChange`). Verified end-to-end against the
 dev server: a move between backends keeps the document id, swaps `locations[]`
-in place and leaves no `data/no-location` marker.
+in place and leaves no `feature/orphaned` marker.
 
 One deviation from the plan below: **no in-flight-move set is needed in
 canvas-server.** Stored suppresses watcher events for the keys it writes and
@@ -28,7 +28,7 @@ migration) mutates `locations[]` without changing content identity. Today the
 only vocabulary stored has for that is `object:add` / `object:unlink`, and a
 consumer that sees an unlink drops the location — in canvas-server,
 `WorkspaceStoredIndex.#purgeOrphanedPaths` / `#reconcileRemovedLocations` will
-strip it and orphan the doc (`data/no-location`), losing its tree positions and
+strip it and orphan the doc (`feature/orphaned`), losing its tree positions and
 document id. The event surface has to exist before the operations that need it.
 
 Intra-backend renames are already handled (inode pairing in `#handleFileEvent`
