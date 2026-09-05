@@ -3,6 +3,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { createReadStream, createWriteStream, promises as fsp } from 'fs';
 import { once } from 'events';
+import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
 import Debug from 'debug';
 import Cache from './cache/index.js';
@@ -64,7 +65,12 @@ export default class Stored extends EventEmitter2 {
 
         this.#cache = new Cache({ path: this.#paths.cache, algorithms: this.#config.checksums });
         this.#backends = new BackendManager();
-        this.#index = new Index(this.#paths.index);
+        // The index's change log is re-emitted as `change` events (one per
+        // entry, after the transaction that produced them committed).
+        this.#index = new Index(this.#paths.index, {
+            changes: config.changes,
+            onChange: (entries) => { for (const entry of entries) this.emit('change', entry); },
+        });
 
         // Background sync queue for remote backends: file targets are copied by
         // a worker thread, network drivers (gdrive, …) are committed in-process
@@ -230,9 +236,10 @@ export default class Stored extends EventEmitter2 {
             .filter(t => t.backend);
         if (!targets.length) return { ok: false, reason: 'unknown-backend' };
 
+        const ingestOptions = { mtime: options.mtime ?? null };
         const ingest = (isBuffer(blob) || (typeof blob === 'string' && !isFile(blob)))
-            ? await this.#ingestMemory(blob, targets, key, options.mimeType)
-            : await this.#ingestStream(blob, targets, key, options.mimeType);
+            ? await this.#ingestMemory(blob, targets, key, options.mimeType, ingestOptions)
+            : await this.#ingestStream(blob, targets, key, options.mimeType, ingestOptions);
 
         // Caller-supplied metadata + inline-extracted (EXIF/GPS/dimensions/media)
         // → persisted under `custom`, returned to caller + on the 'put' event.
@@ -243,7 +250,7 @@ export default class Stored extends EventEmitter2 {
             mimeType: ingest.mimeType,
             locations: ingest.locations,
             custom: extracted ? { ...metadata, ...extracted } : metadata,
-        });
+        }, { origin: options.origin });
 
         if (ingest.remoteTargets.length) {
             this.#syncQueue.enqueue({ id: ingest.id, cacheRoot: this.#cache.root, cacheKey: ingest.id, targets: ingest.remoteTargets });
@@ -300,6 +307,267 @@ export default class Stored extends EventEmitter2 {
     async has(idOrKey) { return this.#index.has(idOrKey); }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // Change log + listing — the feed remote mirrors tail
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /** See Index.changes(): `{ changes, head, oldest, cursor, cursorTooOld }`. */
+    changes(options = {}) { return this.#index.changes(options); }
+    head() { return this.#index.head(); }
+    oldest() { return this.#index.oldest(); }
+    trimChanges(options = {}) { return this.#index.trimChanges(options); }
+
+    /** Page one backend's indexed keys in key order: `{ objects, cursor }`. */
+    listObjects(backendName, options = {}) {
+        if (!this.#backends.get(backendName)) return { objects: [], cursor: null, reason: 'unknown-backend' };
+        return this.#index.locationsByBackend(backendName, options);
+    }
+
+    /**
+     * Suppress watcher echoes for keys an external caller is about to write
+     * or delete through the backend directly. Returns the release function.
+     */
+    holdKeys(keys) { return this.#holdKeys(Array.isArray(keys) ? keys : [keys]); }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Keyed object writes — precondition-checked, succession-preserving
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Write `source` (Buffer | string content | file path | Readable) to
+     * `backend:key`, replacing whatever is there, with HTTP-style preconditions
+     * evaluated against the index right before the swap:
+     *   - `ifMatch`: the sha256 (or content id) the caller believes is there
+     *   - `ifNoneMatch: '*'`: the key must be free
+     *   - `sha256`: what the bytes must hash to (a corrupted upload is refused)
+     * The bytes are staged on the backend's own filesystem and renamed into
+     * place, then the SAME watcher path a local edit takes is fed with the
+     * resulting stat — so consumers see one `object:add` (with `previous` on
+     * an edit) exactly as if the file had been dropped into the folder, and
+     * the backend's own watcher echo is suppressed.
+     *
+     * Returns `{ ok:true, id, sha256, size, mtime, seq, previous, unchanged? }`
+     * or `{ ok:false, reason, ... }` — `reason:'precondition-failed'` carries
+     * `current` (`{ id, sha256, size, mtime }` | null) so callers can report
+     * what is actually there.
+     */
+    async writeObject(backendName, key, source, options = {}) {
+        const backend = this.#backends.get(backendName);
+        if (!backend) return { ok: false, reason: 'unknown-backend', backend: backendName };
+        if (!backend.canWrite) return { ok: false, reason: 'read-only-target', backend: backendName };
+        if (backend.type !== 'local' || typeof backend.commit !== 'function') {
+            return { ok: false, reason: 'unsupported-backend', backend: backendName };
+        }
+        const destKey = this.#normalizeKey(key, { nfc: true });
+        if (!destKey || !this.#isSafeKey(destKey)) return { ok: false, reason: 'invalid-key', key };
+        const live = await this.#verifyBackendRoot(backend);
+        if (!live.ok) return { ok: false, reason: 'target-offline', backend: backendName, detail: live.reason };
+
+        const pathKey = `${backendName}:${destKey}`;
+        const tempDir = backend.tempDir || path.join(this.#paths.cache, '.tmp');
+        const tempPath = path.join(tempDir, `${Date.now()}-${crypto.randomUUID()}`);
+        await fsp.mkdir(tempDir, { recursive: true });
+
+        try {
+            const stream = isBuffer(source) ? Readable.from([source])
+                : (typeof source === 'string' && !isFile(source)) ? Readable.from([Buffer.from(source)])
+                    : (isStream(source) ? source : createReadStream(source));
+            const { checksums, size, head } = await this.#hashToFile(stream, tempPath);
+            const id = formatId(checksums, this.#config.primaryChecksum);
+            const sha256 = checksums.sha256 ?? null;
+            if (options.sha256 && sha256 && String(options.sha256).toLowerCase() !== sha256) {
+                return { ok: false, reason: 'checksum-mismatch', expected: String(options.sha256).toLowerCase(), actual: sha256 };
+            }
+
+            const current = this.#index.get(pathKey);
+            const currentLoc = current?.locations?.find(l => l.backend === backendName && l.key === destKey) || null;
+            const failed = this.#checkPrecondition(current, currentLoc, options);
+            if (failed) return failed;
+
+            if (current && current.id === id) {
+                // Same bytes already there — nothing to write, nothing to log.
+                let mtime = currentLoc?.mtime ?? null;
+                if (options.mtime != null && typeof backend.utimes === 'function') {
+                    await backend.utimes(destKey, options.mtime).catch(() => {});
+                    const st = await backend.stat(destKey).catch(() => null);
+                    if (st?.modified != null && currentLoc) {
+                        mtime = st.modified;
+                        this.#index.put(current.id, {
+                            ...current,
+                            locations: current.locations.map(l => (l === currentLoc ? { ...l, mtime: st.modified, size: st.size } : l)),
+                        });
+                    }
+                }
+                return { ok: true, unchanged: true, id, sha256, checksums, size: current.size, mtime, seq: this.#index.head(), previous: null };
+            }
+
+            const mimeType = options.mimeType || await detectMimeFromHead(head, destKey);
+            const release = this.#holdKeys([pathKey]);
+            try {
+                let placed = null;
+                if (typeof backend.renameFrom === 'function') {
+                    try { placed = await backend.renameFrom(destKey, tempPath); }
+                    catch (err) { if (err.code !== 'EXDEV') throw err; }
+                }
+                if (!placed) {
+                    await backend.commit(destKey, tempPath);
+                    placed = await backend.stat(destKey).catch(() => null);
+                }
+                if (options.mtime != null && typeof backend.utimes === 'function') {
+                    await backend.utimes(destKey, options.mtime).catch(() => {});
+                    placed = (await backend.stat(destKey).catch(() => null)) || placed;
+                }
+                const absPath = typeof backend.resolveKeyPath === 'function' ? backend.resolveKeyPath(destKey) : null;
+                this.#handleFileEvent(current ? 'file:change' : 'file:add', {
+                    backend: backendName,
+                    key: destKey,
+                    path: absPath,
+                    checksums,
+                    mimeType,
+                    size,
+                    modified: placed?.modified,
+                    dev: placed?.dev,
+                    ino: placed?.ino,
+                    ...(options.origin ? { origin: options.origin } : {}),
+                }, { force: true });
+
+                const saved = this.#index.get(id);
+                const loc = saved?.locations?.find(l => l.backend === backendName && l.key === destKey) || null;
+                debug(`WRITE ${pathKey} ← ${id.slice(0, 19)}...${current ? ` (replaces ${current.id.slice(0, 19)}...)` : ''}`);
+                return {
+                    ok: true,
+                    id,
+                    sha256,
+                    checksums,
+                    size,
+                    mimeType,
+                    mtime: loc?.mtime ?? placed?.modified ?? null,
+                    seq: this.#index.head(),
+                    previous: current ? { id: current.id, checksums: current.checksums } : null,
+                };
+            } finally {
+                release();
+            }
+        } finally {
+            await fsp.rm(tempPath, { force: true }).catch(() => {});
+        }
+    }
+
+    /**
+     * Delete the bytes at `backend:key` (precondition-checked like
+     * writeObject) and process it as the genuine unlink it is: consumers get
+     * `object:unlink`, the change log gets a `delete`.
+     */
+    async removeObject(backendName, key, options = {}) {
+        const backend = this.#backends.get(backendName);
+        if (!backend) return { ok: false, reason: 'unknown-backend', backend: backendName };
+        if (!backend.canDelete) return { ok: false, reason: 'read-only-backend', backend: backendName };
+        const destKey = this.#normalizeKey(key, { nfc: true });
+        if (!destKey || !this.#isSafeKey(destKey)) return { ok: false, reason: 'invalid-key', key };
+
+        const pathKey = `${backendName}:${destKey}`;
+        const current = this.#index.get(pathKey);
+        const currentLoc = current?.locations?.find(l => l.backend === backendName && l.key === destKey) || null;
+        if (!current) return { ok: false, reason: 'not-found', key: destKey };
+        const failed = this.#checkPrecondition(current, currentLoc, options);
+        if (failed) return failed;
+
+        const release = this.#holdKeys([pathKey]);
+        try {
+            await backend.delete(destKey);   // false = bytes already gone; the location still goes
+            this.#processUnlink({ backend: backendName, key: destKey, ...(options.origin ? { origin: options.origin } : {}) });
+            debug(`REMOVE ${pathKey}`);
+            return { ok: true, id: current.id, sha256: current.checksums?.sha256 ?? null, seq: this.#index.head() };
+        } finally {
+            release();
+        }
+    }
+
+    /**
+     * Rename `backend:from` to `backend:to` on the same backend: one
+     * `rename(2)` where the driver supports it, identity and inode intact,
+     * `object:move` for consumers, a single `rename` change-log entry.
+     * Refuses an occupied destination (`target-exists`).
+     */
+    async renameObject(backendName, from, to, options = {}) {
+        const backend = this.#backends.get(backendName);
+        if (!backend) return { ok: false, reason: 'unknown-backend', backend: backendName };
+        const fromKey = this.#normalizeKey(from, { nfc: true });
+        const toKey = this.#normalizeKey(to, { nfc: true });
+        if (!fromKey || !this.#isSafeKey(fromKey)) return { ok: false, reason: 'invalid-key', key: from };
+        if (!toKey || !this.#isSafeKey(toKey)) return { ok: false, reason: 'invalid-key', key: to };
+        if (fromKey === toKey) return { ok: false, reason: 'same-key', key: fromKey };
+
+        const current = this.#index.get(`${backendName}:${fromKey}`);
+        const currentLoc = current?.locations?.find(l => l.backend === backendName && l.key === fromKey) || null;
+        if (!current) return { ok: false, reason: 'not-found', key: fromKey };
+        const failed = this.#checkPrecondition(current, currentLoc, options);
+        if (failed) return failed;
+        if (this.#index.get(`${backendName}:${toKey}`) || await backend.stat(toKey).catch(() => null)) {
+            return { ok: false, reason: 'target-exists', key: toKey };
+        }
+
+        const result = await this.move(`${backendName}:${fromKey}`, {
+            to: backendName,
+            key: toKey,
+            from: `stored://${backendName}/${fromKey}`,
+            onConflict: 'error',
+            origin: options.origin,
+        });
+        if (!result.ok) return result;
+        return {
+            ok: true,
+            id: current.id,
+            sha256: current.checksums?.sha256 ?? null,
+            from: fromKey,
+            to: toKey,
+            state: result.state,
+            seq: this.#index.head(),
+        };
+    }
+
+    // `If-Match` / `If-None-Match` semantics over the index. Returns the typed
+    // failure (with what is actually there) or null when the write may go on.
+    #checkPrecondition(current, currentLoc, { ifMatch = null, ifNoneMatch = null } = {}) {
+        const strip = (v) => String(v).trim().replace(/^W\//, '').replace(/^"|"$/g, '').toLowerCase();
+        const describe = () => ({
+            ok: false,
+            reason: 'precondition-failed',
+            code: 'PRECONDITION_FAILED',
+            current: current ? {
+                id: current.id,
+                sha256: current.checksums?.sha256 ?? null,
+                size: currentLoc?.size ?? current.size ?? null,
+                mtime: currentLoc?.mtime ?? null,
+            } : null,
+        });
+        if (ifNoneMatch != null && String(ifNoneMatch).trim() === '*' && current) return describe();
+        if (ifMatch != null) {
+            if (!current) return describe();
+            const want = strip(ifMatch);
+            const have = String(current.checksums?.sha256 || '').toLowerCase();
+            if (want !== '*' && want !== have && want !== String(current.id).toLowerCase()) return describe();
+        }
+        return null;
+    }
+
+    // Collapse duplicate slashes, trim edge slashes; optionally NFC-normalize
+    // (the canonical spelling for keys that arrive over the wire from other
+    // platforms — macOS reports NFD).
+    #normalizeKey(key, { nfc = false } = {}) {
+        let out = String(key ?? '').replace(/\/{2,}/g, '/').replace(/^\/+|\/+$/g, '');
+        if (nfc) out = out.normalize('NFC');
+        return out;
+    }
+
+    // A key must stay inside the backend root: no empty, '.' or '..' segments,
+    // no NUL, no absolute/backslash-absolute forms.
+    #isSafeKey(key) {
+        if (typeof key !== 'string' || !key.length || key.includes('\0')) return false;
+        if (path.isAbsolute(key) || /^[a-zA-Z]:[\\/]/.test(key)) return false;
+        return key.split('/').every(seg => seg.length > 0 && seg !== '.' && seg !== '..');
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Copy / move — location mutations that preserve content identity
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -332,17 +600,26 @@ export default class Stored extends EventEmitter2 {
             return { ok: true, id: meta.id, added: [], unchanged: true, locations: await this.locations(meta.id) };
         }
 
-        const release = this.#holdKeys(targets.map(t => `${t.name}:${destKey}`));
+        const release = this.#holdKeys(targets.map(t => `${t.name}:${t.key || destKey}`));
         try {
-            const transferred = await this.#streamToTargets(meta, sourceLocation, targets, destKey);
+            const transferred = await this.#streamToTargets(meta, sourceLocation, targets, destKey, { mtime: options.mtime });
             if (!transferred.ok) return transferred;
 
-            const saved = this.#index.put(meta.id, { ...meta, locations: this.#mergeLocations(meta, transferred.locations) });
+            // Displace-then-record in one transaction: the change log must
+            // never show the new owner of a key before the old one let go.
+            const { saved, previous } = this.#index.transaction(() => {
+                const previous = this.#displaceTargets(targets, destKey, meta.id, options);
+                const current = this.#index.get(meta.id) || meta;
+                const saved = this.#index.put(meta.id, { ...current, locations: this.#mergeLocations(current, transferred.locations) }, { origin: options.origin });
+                return { saved, previous };
+            });
             if (transferred.remoteTargets.length) {
                 this.#syncQueue.enqueue({ id: meta.id, cacheRoot: this.#cache.root, cacheKey: meta.id, targets: transferred.remoteTargets });
             }
 
-            for (const loc of transferred.locations) this.#emitLocationEvent('location:add', saved, loc);
+            for (const loc of transferred.locations) {
+                this.#emitLocationEvent('location:add', saved, loc, previous ? { previous } : {});
+            }
             debug(`COPY ${meta.id.slice(0, 19)}... → ${targets.map(t => t.name).join(', ')}/${destKey}`);
             return {
                 ok: true,
@@ -401,17 +678,25 @@ export default class Stored extends EventEmitter2 {
                     size: renamed.size, mtime: renamed.modified, dev: renamed.dev, ino: renamed.ino,
                 });
                 debug(`MOVE (rename) ${sourceLocation.backend}:${sourceLocation.key} → ${target.name}:${targetKey}`);
-                return this.#finalizeMove(meta.id, sourceLocation, location, { removeSourceBytes: false });
+                return this.#index.transaction(() => {
+                    const previous = this.#displaceTargets(targets, destKey, meta.id, options);
+                    return this.#finalizeMove(meta.id, sourceLocation, location, { removeSourceBytes: false, origin: options.origin, previous });
+                });
             }
 
-            const transferred = await this.#streamToTargets(meta, sourceLocation, targets, destKey);
+            const transferred = await this.#streamToTargets(meta, sourceLocation, targets, destKey, { mtime: options.mtime });
             if (!transferred.ok) return transferred;
             const location = transferred.locations[0];
 
             // Add-first: the destination location is recorded before the source
             // is touched, so a crash here leaves a copy — never an orphan.
-            const saved = this.#index.put(meta.id, { ...meta, locations: this.#mergeLocations(meta, transferred.locations) });
-            this.#emitLocationEvent('location:add', saved, location);
+            const { saved, previous } = this.#index.transaction(() => {
+                const previous = this.#displaceTargets(targets, destKey, meta.id, options);
+                const current = this.#index.get(meta.id) || meta;
+                const saved = this.#index.put(meta.id, { ...current, locations: this.#mergeLocations(current, transferred.locations) }, { origin: options.origin });
+                return { saved, previous };
+            });
+            this.#emitLocationEvent('location:add', saved, location, previous ? { previous } : {});
 
             if (transferred.remoteTargets.length) {
                 const pending = this.#pendingMoves.get(meta.id) || [];
@@ -430,7 +715,7 @@ export default class Stored extends EventEmitter2 {
             }
 
             debug(`MOVE ${sourceLocation.backend}:${sourceLocation.key} → ${target.name}:${targetKey}`);
-            return this.#finalizeMove(meta.id, sourceLocation, location, { removeSourceBytes: true });
+            return this.#finalizeMove(meta.id, sourceLocation, location, { removeSourceBytes: true, origin: options.origin });
         } finally {
             release();
         }
@@ -655,10 +940,9 @@ export default class Stored extends EventEmitter2 {
         // segment ('Fotky//2019') writes a file the OS reports back under the
         // collapsed path, and the watcher would then index it a SECOND time as
         // a new location. The index must spell keys the way the filesystem does.
-        const destKey = String(options.key || sourceLocation.key)
-            .replace(/\/{2,}/g, '/')
-            .replace(/^\/+|\/+$/g, '');
+        const destKey = this.#normalizeKey(options.key || sourceLocation.key);
         if (!destKey) return { ok: false, reason: 'invalid-key' };
+        const conflictKey = options.conflictKey ? this.#normalizeKey(options.conflictKey) : null;
         const targets = [];
         for (const name of toNames) {
             const backend = this.#backends.get(name);
@@ -680,15 +964,22 @@ export default class Stored extends EventEmitter2 {
             // Somebody else's bytes are sitting on the destination key. Writing
             // over them is silent data loss, so it takes an explicit policy.
             let key = destKey;
+            let overwrite = false;
             if (present && !ours && !this.#isSameContent(name, destKey, meta.id)) {
                 if (onConflict === 'error') return { ok: false, reason: 'target-exists', backend: name, key: destKey };
                 if (onConflict === 'rename') {
-                    key = await this.#freeKey(backend, destKey);
+                    // A caller-chosen conflict name (`… (conflict from laptop …).ext`)
+                    // wins when free; otherwise the generic `name-1.ext` ladder.
+                    const wanted = conflictKey && conflictKey !== destKey && !(await backend.stat(conflictKey).catch(() => null))
+                        ? conflictKey : null;
+                    key = wanted || await this.#freeKey(backend, destKey);
                     debug(`Conflict on ${name}:${destKey} — using ${key}`);
                 }
-                // 'overwrite' keeps destKey and lets the commit replace it.
+                // 'overwrite' keeps destKey and lets the commit replace it; the
+                // displaced content is reconciled after the bytes landed.
+                if (onConflict === 'overwrite') overwrite = true;
             }
-            targets.push({ name, backend, key });
+            targets.push({ name, backend, key, overwrite });
         }
 
         return { ok: true, meta, sourceLocation, sourceBackend, targets, destKey };
@@ -755,7 +1046,7 @@ export default class Stored extends EventEmitter2 {
      * content identity before committing. The temp file is staged on the first
      * local target's filesystem so `#commit` can hardlink instead of copying.
      */
-    async #streamToTargets(meta, sourceLocation, targets, destKey) {
+    async #streamToTargets(meta, sourceLocation, targets, destKey, options = {}) {
         const sourceBackend = this.#backends.get(sourceLocation.backend);
         const source = await sourceBackend.get(sourceLocation.key, { stream: true });
         if (!source) return { ok: false, reason: 'source-unreadable', backend: sourceLocation.backend, key: sourceLocation.key };
@@ -773,7 +1064,7 @@ export default class Stored extends EventEmitter2 {
                 return { ok: false, reason: 'checksum-mismatch', expected: meta.id, actual: id };
             }
             const { locations, remoteTargets } = await this.#commit(
-                targets, destKey, meta.id, { file: tempPath }, { checksums, size, mimeType: meta.mimeType },
+                targets, destKey, meta.id, { file: tempPath }, { checksums, size, mimeType: meta.mimeType }, options,
             );
             return { ok: true, locations, remoteTargets, size };
         } catch (err) {
@@ -818,7 +1109,7 @@ export default class Stored extends EventEmitter2 {
      * a stale second copy left behind. That is a cleanup problem, never data
      * loss, and the caller must be able to tell the two apart.
      */
-    async #finalizeMove(id, sourceLocation, newLocation, { removeSourceBytes }) {
+    async #finalizeMove(id, sourceLocation, newLocation, { removeSourceBytes, origin = null, previous = null }) {
         const release = this.#holdKeys([`${sourceLocation.backend}:${sourceLocation.key}`]);
         try {
             if (removeSourceBytes) {
@@ -842,7 +1133,12 @@ export default class Stored extends EventEmitter2 {
             if (!current) return { ok: false, reason: 'not-found' };
             const locations = this.#mergeLocations(current, [newLocation])
                 .filter(l => !(l.backend === sourceLocation.backend && l.key === sourceLocation.key));
-            const saved = this.#index.put(id, { ...current, locations });
+            // Same backend, new key = a rename for the change log (one entry,
+            // `from` carried), not a delete + put pair.
+            const rename = sourceLocation.backend === newLocation.backend
+                ? { backend: newLocation.backend, from: sourceLocation.key, to: newLocation.key }
+                : null;
+            const saved = this.#index.put(id, { ...current, locations }, { origin, rename });
 
             this.#emitObject('move', {
                 id,
@@ -851,6 +1147,8 @@ export default class Stored extends EventEmitter2 {
                 to: this.#endpoint(newLocation),
                 location: this.#describeLocation(newLocation),
                 locations: saved.locations.map(l => this.#describeLocation(l)),
+                ...(previous ? { previous } : {}),
+                ...(origin ? { origin } : {}),
             });
 
             return {
@@ -897,6 +1195,46 @@ export default class Stored extends EventEmitter2 {
 
         if (remaining.length) this.#pendingMoves.set(id, remaining);
         else this.#pendingMoves.delete(id);
+    }
+
+    /**
+     * After an `onConflict:'overwrite'` transfer landed, reconcile the content
+     * that used to own each overwritten key: strip the stale location from
+     * the displaced entry (drop the entry when that was its last home) and
+     * tell consumers with the same succession vocabulary a watcher-observed
+     * edit uses — `object:unlink` carrying `successor` — so the document
+     * behind the old bytes is re-pointed or orphaned, never left claiming a
+     * path it lost. Returns the first displaced `{ id, checksums }` (for the
+     * `previous` hint on the follow-up add) or null.
+     */
+    #displaceTargets(targets, destKey, newId, options = {}) {
+        let previous = null;
+        for (const t of targets) {
+            if (!t.overwrite) continue;
+            const displaced = this.#displace(t.name, t.key || destKey, newId, options);
+            if (displaced && !previous) previous = displaced;
+        }
+        return previous;
+    }
+
+    #displace(backendName, key, newId, { origin = null } = {}) {
+        const prev = this.#index.get(`${backendName}:${key}`);
+        if (!prev || prev.id === newId) return null;
+        const remaining = (prev.locations || []).filter(l => !(l.backend === backendName && l.key === key));
+        if (remaining.length === 0) this.#index.delete(prev.id, { origin });
+        else this.#index.put(prev.id, { ...prev, locations: remaining }, { origin });
+        this.#emitObject('unlink', {
+            backend: backendName,
+            key,
+            id: prev.id,
+            checksums: prev.checksums,
+            locations: remaining,
+            successor: { id: newId },
+            reason: 'overwritten',
+            ...(origin ? { origin } : {}),
+        });
+        debug(`Displaced ${prev.id.slice(0, 19)}... from ${backendName}:${key}`);
+        return { id: prev.id, checksums: prev.checksums };
     }
 
     /** Upsert locations by (backend, key), preserving order. */
@@ -1009,7 +1347,7 @@ export default class Stored extends EventEmitter2 {
     }
 
     // Buffer / string: already resident, write directly (no temp file).
-    async #ingestMemory(blob, targets, key, mimeHint) {
+    async #ingestMemory(blob, targets, key, mimeHint, options = {}) {
         const data = isBuffer(blob) ? blob : Buffer.from(blob);
         const checksums = checksumBuffer(data, this.#config.checksums);
         const id = formatId(checksums, this.#config.primaryChecksum);
@@ -1017,13 +1355,13 @@ export default class Stored extends EventEmitter2 {
         const mimeType = mimeHint || await detectMimeType(data);
 
         const extracted = await this.#maybeExtract({ data }, mimeType, finalKey);
-        const { locations, remoteTargets } = await this.#commit(targets, finalKey, id, { data }, { checksums, size: data.length, mimeType });
+        const { locations, remoteTargets } = await this.#commit(targets, finalKey, id, { data }, { checksums, size: data.length, mimeType }, options);
         return { id, finalKey, checksums, size: data.length, mimeType, locations, remoteTargets, extracted };
     }
 
     // Path / stream: stream through a hash pass into a temp file on the primary
     // local backend's filesystem, then commit (hardlink/rename) to targets.
-    async #ingestStream(blob, targets, key, mimeHint) {
+    async #ingestStream(blob, targets, key, mimeHint, options = {}) {
         const source = isStream(blob) ? blob : createReadStream(blob);
         const firstLocal = targets.find(t => t.backend.type === 'local')?.backend;
         const tempDir = firstLocal ? firstLocal.tempDir : path.join(this.#paths.cache, '.tmp');
@@ -1040,7 +1378,7 @@ export default class Stored extends EventEmitter2 {
             // Extract from the whole temp file (head=4KB is too small for EXIF),
             // before the finally-block deletes it.
             const extracted = await this.#maybeExtract({ file: tempPath }, mimeType, finalKey);
-            const { locations, remoteTargets } = await this.#commit(targets, finalKey, id, { file: tempPath }, { checksums, size, mimeType });
+            const { locations, remoteTargets } = await this.#commit(targets, finalKey, id, { file: tempPath }, { checksums, size, mimeType }, options);
             result = { id, finalKey, checksums, size, mimeType, locations, remoteTargets, extracted };
         } finally {
             await fsp.rm(tempPath, { force: true }).catch(() => {});
@@ -1084,7 +1422,7 @@ export default class Stored extends EventEmitter2 {
     // Place ingested bytes on every target: local backends get the bytes now
     // (buffer write or hardlink/copy from temp); remote targets get a cache
     // entry + a SyncQueue placeholder. Returns { locations, remoteTargets }.
-    async #commit(targets, finalKey, id, source, meta) {
+    async #commit(targets, finalKey, id, source, meta, options = {}) {
         const locations = [];
         const remoteTargets = [];
 
@@ -1096,7 +1434,18 @@ export default class Stored extends EventEmitter2 {
             if (backend.type === 'local') {
                 if (source.data) await backend.put(targetKey, source.data);
                 else await backend.commit(targetKey, source.file);
-                locations.push(this.#buildLocation(name, targetKey, true, { size: meta.size }));
+                if (options.mtime != null && typeof backend.utimes === 'function') {
+                    await backend.utimes(targetKey, options.mtime).catch(() => {});
+                }
+                // Record the on-disk identity (mtime + inode) the way the
+                // watcher/scan paths do, so a later rename of this file pairs
+                // as a move and a rescan can skip the rehash.
+                const st = typeof backend.stat === 'function' ? await backend.stat(targetKey).catch(() => null) : null;
+                locations.push(this.#buildLocation(name, targetKey, true, {
+                    size: st?.size ?? meta.size,
+                    ...(st?.modified != null ? { mtime: st.modified } : {}),
+                    ...(st?.ino != null ? { ino: st.ino, dev: st.dev } : {}),
+                }));
             } else {
                 locations.push(this.#buildLocation(name, targetKey, false, { size: meta.size }));
                 remoteTargets.push({ name, driver: backend.config.driver, root: backend.config.root, key: targetKey });
@@ -1236,21 +1585,43 @@ export default class Stored extends EventEmitter2 {
         this.emit(`object:${suffix}`, { kind: 'file', ...payload });
     }
 
-    #handleFileEvent(event, data) {
+    // `options.force` bypasses the echo suppression — used when stored itself
+    // wrote the bytes (writeObject) and feeds the resulting stat through the
+    // very same path a watcher-observed change takes.
+    #handleFileEvent(event, data, options = {}) {
         const pathKey = `${data.backend}:${data.key}`;
         // Our own copy/move touching a watched root — the index was already
         // updated by the operation itself. Re-processing the echo would emit a
         // spurious add (or, worse, an unlink that drops the location we just
         // moved the object to).
-        if (this.#suppressedKeys.has(pathKey)) {
-            debug(`Suppressed ${event} for in-flight transfer ${pathKey}`);
-            return;
+        if (!options.force && this.#suppressedKeys.has(pathKey)) {
+            // Our own echo carries exactly the bytes we just indexed under the
+            // key; anything else arriving inside the hold is a genuine change
+            // made underneath the transfer and must not be lost. Unlink echoes
+            // (the source of a move) are always ours.
+            const indexed = data.checksums ? this.#index.get(pathKey) : null;
+            const sameBytes = !!indexed && formatId(data.checksums, this.#config.primaryChecksum) === indexed.id;
+            if (event === 'file:unlink' || !data.checksums || sameBytes) {
+                debug(`Suppressed ${event} for in-flight transfer ${pathKey}`);
+                return;
+            }
+            debug(`Held key ${pathKey} changed underneath the transfer — processing ${event}`);
         }
+        const origin = data.origin || null;
         const location = this.#buildLocation(data.backend, data.key, true, {
-            size: data.size,
-            mtime: data.modified,
+            ...(data.size != null ? { size: data.size } : {}),
+            ...(data.modified != null ? { mtime: data.modified } : {}),
             ...(data.ino != null ? { ino: data.ino, dev: data.dev } : {}),
         });
+        // Refresh an already-indexed location in place (size/mtime/inode may
+        // have been unknown — a `put()`-created location learns its inode from
+        // the first watcher event it gets) or append a new one.
+        const upsertLocation = (locations) => {
+            const at = locations.findIndex(l => l.backend === data.backend && l.key === data.key);
+            if (at >= 0) locations[at] = { ...locations[at], ...location };
+            else locations.push(location);
+            return locations;
+        };
 
         if (event === 'file:add' && data.checksums) {
             const id = formatId(data.checksums, this.#config.primaryChecksum);
@@ -1258,8 +1629,9 @@ export default class Stored extends EventEmitter2 {
             // Rename pairing: an add whose inode matches a held unlink is the
             // second half of a move. Same content → silently drop the old-path
             // location (no unlink emission, no identity churn) and let the add
-            // land the new path on the same id. Content changed mid-move →
-            // release the held unlink first; the succession flow handles it.
+            // land the new path on the same id, as ONE index write so the
+            // change log records a rename. Content changed mid-move → release
+            // the held unlink first; the succession flow handles it.
             let renamedFrom = null;
             if (data.ino != null) {
                 const pendingKey = `${data.backend}|${data.dev}:${data.ino}`;
@@ -1268,12 +1640,8 @@ export default class Stored extends EventEmitter2 {
                     clearTimeout(pending.timer);
                     this.#pendingUnlinks.delete(pendingKey);
                     const oldMeta = this.#index.get(`${pending.data.backend}:${pending.data.key}`);
-                    if (oldMeta && oldMeta.id === id) {
+                    if (oldMeta && oldMeta.id === id && pending.data.backend === data.backend) {
                         renamedFrom = pending.data.key;
-                        oldMeta.locations = oldMeta.locations.filter(l =>
-                            !(l.backend === pending.data.backend && l.key === pending.data.key)
-                        );
-                        this.#index.put(oldMeta.id, oldMeta);
                     } else {
                         this.#processUnlink(pending.data);
                     }
@@ -1281,16 +1649,18 @@ export default class Stored extends EventEmitter2 {
             }
 
             const existing = this.#index.get(id);
-            const locations = existing?.locations || [];
-            if (!locations.some(l => l.backend === data.backend && l.key === data.key)) {
-                locations.push(location);
-            }
+            const locations = upsertLocation((existing?.locations || []).filter(l =>
+                !(renamedFrom && l.backend === data.backend && l.key === renamedFrom)
+            ));
 
             this.#index.put(id, {
                 checksums: data.checksums,
                 size: data.size,
                 mimeType: data.mimeType,
                 locations,
+            }, {
+                origin,
+                rename: renamedFrom ? { backend: data.backend, from: renamedFrom, to: data.key } : null,
             });
             this.#emitObject('add', { ...data, id, locations, ...(renamedFrom ? { renamedFrom } : {}) });
 
@@ -1299,33 +1669,36 @@ export default class Stored extends EventEmitter2 {
             const oldMeta = this.#index.get(pathKey);
             // Same path, new bytes = a successor under content identity. Carry
             // the predecessor's identity on the add event so consumers can
-            // migrate curated placements instead of orphaning them.
+            // migrate curated placements instead of orphaning them. The two
+            // index writes share one transaction: the change log then holds a
+            // single `put` for the key, never a transient delete.
             let previous = null;
-            if (oldMeta && oldMeta.id !== newId) {
-                previous = { id: oldMeta.id, checksums: oldMeta.checksums };
-                oldMeta.locations = oldMeta.locations.filter(l =>
-                    !(l.backend === data.backend && l.key === data.key)
-                );
-                if (oldMeta.locations.length === 0) {
-                    this.#index.delete(oldMeta.id);
-                } else {
-                    this.#index.put(oldMeta.id, oldMeta);
+            const locations = this.#index.transaction(() => {
+                if (oldMeta && oldMeta.id !== newId) {
+                    previous = { id: oldMeta.id, checksums: oldMeta.checksums };
+                    oldMeta.locations = oldMeta.locations.filter(l =>
+                        !(l.backend === data.backend && l.key === data.key)
+                    );
+                    if (oldMeta.locations.length === 0) {
+                        this.#index.delete(oldMeta.id, { origin });
+                    } else {
+                        this.#index.put(oldMeta.id, oldMeta, { origin });
+                    }
                 }
-                this.#emitObject('unlink', { ...data, id: oldMeta.id, checksums: oldMeta.checksums, successor: { id: newId, checksums: data.checksums } });
-            }
 
-            const existing = this.#index.get(newId);
-            const locations = existing?.locations || [];
-            if (!locations.some(l => l.backend === data.backend && l.key === data.key)) {
-                locations.push(location);
-            }
-
-            this.#index.put(newId, {
-                checksums: data.checksums,
-                size: data.size,
-                mimeType: data.mimeType,
-                locations,
+                const existing = this.#index.get(newId);
+                const next = upsertLocation(existing?.locations || []);
+                this.#index.put(newId, {
+                    checksums: data.checksums,
+                    size: data.size,
+                    mimeType: data.mimeType,
+                    locations: next,
+                }, { origin });
+                return next;
             });
+            if (previous) {
+                this.#emitObject('unlink', { ...data, id: previous.id, checksums: previous.checksums, successor: { id: newId, checksums: data.checksums } });
+            }
             this.#emitObject('add', { ...data, id: newId, locations, previous });
 
         } else if (event === 'file:unlink') {
@@ -1361,14 +1734,15 @@ export default class Stored extends EventEmitter2 {
     #processUnlink(data) {
         const pathKey = `${data.backend}:${data.key}`;
         const meta = this.#index.get(pathKey);
+        const origin = data.origin || null;
         if (meta) {
             meta.locations = meta.locations.filter(l =>
                 !(l.backend === data.backend && l.key === data.key)
             );
             if (meta.locations.length === 0) {
-                this.#index.delete(meta.id);
+                this.#index.delete(meta.id, { origin });
             } else {
-                this.#index.put(meta.id, meta);
+                this.#index.put(meta.id, meta, { origin });
             }
             this.#emitObject('unlink', { ...data, id: meta.id, checksums: meta.checksums, locations: meta.locations });
         } else {

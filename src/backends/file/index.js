@@ -13,12 +13,16 @@ const debug = Debug('stored:backend:file');
 
 // Per-backend staging dir for streaming puts. Lives inside the backend root so
 // temp files share a filesystem with their final destination (cheap rename /
-// hardlink), and is always excluded from the watcher.
+// hardlink), and is always excluded from the watcher. `config.tempDir`
+// (relative to the root, or absolute) relocates it — a mirror keeps all of
+// its state under one hidden directory.
 const TMP_DIR = '.stored-tmp';
 const TMP_IGNORE = /(^|[/\\])\.stored-tmp([/\\]|$)/;
 
 export default class FileBackend extends StorageBackend {
     #root;
+    #tempDir;
+    #tempRel = null;
     #watcher = null;
     #watchEnabled;
     #ignored;
@@ -32,6 +36,9 @@ export default class FileBackend extends StorageBackend {
         super(name, config);
         if (!config.root) throw new Error('FileBackend requires root path');
         this.#root = path.resolve(config.root);
+        this.#tempDir = config.tempDir ? path.resolve(this.#root, String(config.tempDir)) : path.join(this.#root, TMP_DIR);
+        const tempRel = path.relative(this.#root, this.#tempDir).split(path.sep).join('/');
+        this.#tempRel = tempRel && !tempRel.startsWith('..') && !path.isAbsolute(tempRel) ? tempRel : null;
         this.#watchEnabled = config.watch ?? false;
         this.#ignored = config.ignored || null;
         this.#ignoreMatcher = this.#buildIgnoreMatcher(this.#ignored);
@@ -57,7 +64,7 @@ export default class FileBackend extends StorageBackend {
     }
 
     get root() { return this.#root; }
-    get tempDir() { return path.join(this.#root, TMP_DIR); }
+    get tempDir() { return this.#tempDir; }
     get watching() { return !!this.#watcher; }
     get capabilities() { return { ...super.capabilities, canEnumerate: true }; }
     get remote() { return this.#remote; }
@@ -108,7 +115,15 @@ export default class FileBackend extends StorageBackend {
     }
 
     #isIgnored(relPath) {
+        if (this.#isTempPath(relPath)) return true;
         return this.#ignoreMatcher ? this.#ignoreMatcher(relPath) : false;
+    }
+
+    // The staging dir (default or configured) never counts as content.
+    #isTempPath(relPath) {
+        const rel = String(relPath).split(path.sep).join('/');
+        if (TMP_IGNORE.test(rel)) return true;
+        return !!this.#tempRel && (rel === this.#tempRel || rel.startsWith(`${this.#tempRel}/`));
     }
 
     // Truthful server-side location. Consumers decide whether to surface a local
@@ -253,6 +268,19 @@ export default class FileBackend extends StorageBackend {
         return true;
     }
 
+    /**
+     * Set the modification time of `key` (ms since epoch, Date, or ISO
+     * string). A mirror pulls a file with the hub's mtime so both sides agree
+     * on "when" without a second hash.
+     */
+    async utimes(key, mtime) {
+        const filePath = this.#resolvePath(key);
+        const when = mtime instanceof Date ? mtime : new Date(typeof mtime === 'string' ? Date.parse(mtime) : Number(mtime));
+        if (Number.isNaN(when.getTime())) throw new Error(`Invalid mtime: ${mtime}`);
+        await fs.utimes(filePath, when, when);
+        return { key, modified: when.getTime() };
+    }
+
     async stat(key) {
         const filePath = this.#resolvePath(key);
         if (!await fs.pathExists(filePath)) return null;
@@ -313,10 +341,18 @@ export default class FileBackend extends StorageBackend {
             return false;
         }
 
+        // `stabilityThreshold`: how long a file must stop growing before it is
+        // hashed (a mirror bumps it — a multi-GB copy from a USB stick must
+        // not be hashed mid-write). `followSymlinks`: chokidar's default is
+        // true; a mirror turns it off so a symlink into /etc is never synced.
         const watchOpts = {
             persistent: true,
             ignoreInitial: true,
-            awaitWriteFinish: { stabilityThreshold: 200, pollInterval: 50 },
+            awaitWriteFinish: {
+                stabilityThreshold: Number(this.config.stabilityThreshold) > 0 ? Number(this.config.stabilityThreshold) : 200,
+                pollInterval: 50,
+            },
+            ...(this.config.followSymlinks != null ? { followSymlinks: this.config.followSymlinks !== false } : {}),
         };
         // Opt-in polling (the only way to see other clients' writes on a network
         // mount). Deliberately slow by default: each tick stats every watched
@@ -440,7 +476,7 @@ export default class FileBackend extends StorageBackend {
             const entries = await fs.readdir(this.#resolvePath(rel), { withFileTypes: true }).catch(() => []);
             for (const entry of entries) {
                 const relativePath = path.join(rel, entry.name);
-                if (TMP_IGNORE.test(relativePath) || this.#isIgnored(relativePath)) continue;
+                if (this.#isIgnored(relativePath)) continue;
                 if (entry.isDirectory()) {
                     dirs.push(relativePath.split(path.sep).join('/'));
                     await walk(relativePath);
