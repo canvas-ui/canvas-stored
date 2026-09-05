@@ -119,6 +119,13 @@ export default class FileBackend extends StorageBackend {
         return this.#ignoreMatcher ? this.#ignoreMatcher(relPath) : false;
     }
 
+    /**
+     * Would this relative key be excluded from watch/list/scan? Public so a
+     * write API can refuse a key the index would never see (a dotfile pushed
+     * by a device would otherwise land on disk invisibly).
+     */
+    isIgnored(relPath) { return this.#isIgnored(relPath); }
+
     // The staging dir (default or configured) never counts as content.
     #isTempPath(relPath) {
         const rel = String(relPath).split(path.sep).join('/');
