@@ -58,6 +58,7 @@ await stored.stop();
 | `file` | local | Any directory; chokidar watch, inode-based rename matching, container (folder) ops |
 | `cacache` | local | Content-addressable blob store (managed; opaque keys) |
 | `gdrive` | remote | Google Drive folder subtree over OAuth refresh token — see below |
+| `canvas` | remote | One backend of a workspace on a canvas hub, over the objects/sync protocol — see *Sync engine* below |
 | `s3`, `http` | remote | Skeletons: URL parsing only (`http` has a read-only `get`) |
 
 Register additional drivers at runtime with `BackendManager.register(name, Class)` (`import BackendManager from 'canvas-stored/src/backends/BackendManager.js'`).
@@ -81,6 +82,67 @@ stored.addBackend('gdrive:work', {
 - Writes go cache → SyncQueue → `commit(key, path)` (resumable upload, 8 MiB chunks, in-place update when the key exists). Reads (`get`, `getRange`) stream from the API.
 - `watch()` emits `file:add|change|unlink` from the changes feed; renames/moves carry `ino = fileId`, so Stored's rename window rewrites the location in place instead of orphaning the document.
 - `verifyRoot()` → `{ ok, reason: 'unauthorized' | 'root-missing' | 'unreachable' }` is the liveness gate (credentials + root folder).
+
+### Canvas hub backend
+
+```js
+stored.addBackend('hub', {
+  driver: 'canvas',
+  url: 'https://canvas.example',            // hub base URL
+  workspaceId: 'ws-id',
+  backend: 'workspace:home',                // hub backend address (default)
+  token: '<device or api token>',
+  deviceId: 'dev-…',                        // stamped as X-Canvas-Origin on every mutation
+  deviceName: 'laptop',
+  instanceId: '…',                          // optional: refuse a hub whose /ping instanceId differs
+  prefixes: ['Docs'],                       // optional selective scope (prefixes or globs)
+  pollInterval: 30000,                      // change-feed poll (watch)
+  cursor: null,                             // feed position to resume from
+});
+```
+
+Speaks `canvas-server/docs/sync-protocol.md`: `stat` = `HEAD`, `get`/`getRange` = `GET` (Range), `list`/`scan` page the listing, `putStream(key, source, { ifMatch, ifNoneMatch, sha256, mtime, origin, conflictOf, conflictMode, baseSha256, deviceName, mimeType })` is a streaming `PUT`, `delete(key, { ifMatch })`, `rename(from, to, { ifMatch })`, `changes(since, limit)`, `poll()`, `watch()`. Rows carry `checksums.sha256`, `ino = sha256`, `dev = canvas:<instanceId>`, so a hub-side rename (`unlink(from) + add(to)`, same ino) is paired by Stored into an in-place location rewrite. Own-origin feed entries are applied but not emitted; a `410` clears the cursor and emits `backend:state { reason:'cursor-too-old' }`. Errors are typed on `err.code`: `PRECONDITION_FAILED` (`err.current`), `CURSOR_TOO_OLD`, `TARGET_EXISTS`, `NOT_FOUND`, `UNAUTHORIZED`, `REFUSED`, `RETRYABLE` (429/5xx, retried in-call first), `OFFLINE`.
+
+`copy()`/`move()` onto a `canvas` target stream straight to the hub (no temp file, cache or SyncQueue) and forward `ifMatch`/`ifNoneMatch`/`origin`/`mtime`/conflict headers; a `412` comes back as `{ ok:false, reason:'precondition-failed', current }`. A same-backend `move()`/`renameObject()` on the hub is one server-side rename.
+
+---
+
+## Sync engine (device mirror)
+
+```js
+import Stored, { Mirror } from 'canvas-stored';
+
+const stored = new Stored({ root: '~/Workspaces/notes/.workspace/db/stored' });
+stored.addBackend('local',     { driver: 'file', root: '~/Workspaces/notes', watch: true, ignored: ['.workspace/**'] });
+stored.addBackend('trash',     { driver: 'file', root: '~/Workspaces/notes/.workspace/trash' });
+stored.addBackend('conflicts', { driver: 'file', root: '~/Workspaces/notes/.workspace/conflicts' });
+stored.addBackend('hub',       { driver: 'canvas', url, workspaceId, token, deviceId, deviceName });
+
+const mirror = new Mirror(stored, {
+  id: 'notes', local: 'local', remote: 'hub', trash: 'trash', conflicts: 'conflicts',
+  deviceId, deviceName,
+  prefixes: [],                 // selective sync (prefixes / globs), applied on both sides
+  ignore: [],                   // on top of MIRROR_IGNORE_DEFAULTS (+ the hub's exclusions you pass here)
+  deletes: 'propagate',         // | 'keep'  — local deletes reach the hub, or only drop the base
+  conflictMode: 'prompt',       // | 'rename' — inbox upload, or Dropbox-style conflict copy on the hub
+  debounceMs: 1500, fullReconcileEvery: 6 * 3600e3,
+});
+await mirror.start();           // scan local → list/poll hub → reconcile → watch → worker
+mirror.on('conflict', (c) => …); mirror.on('skip', ({ key, reason }) => …);
+mirror.on('offline', …); mirror.on('online', …); mirror.on('status', (s) => …);
+await mirror.nudge();           // "poll now" (socket nudge)
+mirror.status();                // { state, cursor, head, pending, running, failed, conflicts, lastSyncAt, lastError, skipped, skips }
+await mirror.stop();            // drains running jobs
+```
+
+- **View**: Stored's index holds both sides — local keys through the file watcher/scan, hub keys through the `canvas` driver's feed poller. **Base ledger** (`Ledger`, LMDB sub-db `mirror`): `base/<mirror>/<key>` → `{ sha256, size, mtime, remoteSeq }`, `cursor/<mirror>`, `skip/<mirror>/<key>`, `state/<mirror>`. Keys + digests are the identity; hub document ids are never stored.
+- **Decision**: per dirty key, the protocol's three-way table (`decide(L, B, R)`, exported from `src/sync/Mirror.js`); R is confirmed with `HEAD` before a push or a conflict.
+- **Jobs** (`JobQueue`, LMDB sub-dbs `jobs` + `jobs.dedupe`): `push`, `pull`, `delete-remote`, `trash-local`, `rename-remote`, `rename-local`, `conflict`; dedupe per `<kind>|<key>`, backoff `min(60s·2^n, 1h)`, running→pending recovery on open, one job per key in flight, concurrency 2. Every byte move goes through `stored.copy`/`move`/`renameObject`/`removeObject`, so locations, succession and echo suppression are the ordinary ones. Base is written only after the operation succeeded; the feed cursor after a whole batch reconciled.
+- **Conflicts** (`prompt`): the device version is copied to the `conflicts` backend as `<stem> (conflict from <device> <YYYY-MM-DD HHmm>).<ext>`, uploaded with `X-Canvas-Conflict-Of` (inbox), the hub version is pulled into place, base := R. `rename`: the upload is an ordinary object at the conflict-copy key (the hub tags it); the copy then arrives on every device like any other object.
+- **Renames**: a local `mv` (paired by Stored's inode window) → `POST objects/rename`; a hub rename → local `rename(2)` when the local copy is clean. **Hub delete** → local copy to the `trash` backend. **Offline** is a state: jobs stay queued, the engine retries with backoff and catches up (`poll`, or a full listing after `410`).
+- **Keys**: `src/sync/keys.js` — `normalizeKey` (NFC, `/`), `validateKey` (traversal, NUL, Windows reserved names, `<>:"|?*`, trailing dot/space, length) → skipped visibly (`skip` event, `status().skips`), `isIgnored(key, patterns)` (picomatch, `dot:true`), `matchesPrefixes`, `conflictKey`, `MIRROR_IGNORE_DEFAULTS`.
+
+`JobQueue`, `Ledger`, `Mirror`, `BackendManager` and `Index` are named exports next to the default `Stored`.
 
 ---
 

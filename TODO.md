@@ -291,18 +291,23 @@ reserved scheme names with no driver — remote shares are OS mounts.
 - S3 should not pretend to watch; use polling or disable entirely
 - Remote fs mounts (`remote: true`) likewise — inotify is not reliable there
 
-#### SyncD
+#### SyncD ✅ DONE (1.6.0 — `src/sync/JobQueue.js`, `Mirror.js`, `Ledger.js`)
 
-- Retries, exponential backoff, observability
+- Retries, exponential backoff (`min(60s·2^n, 1h)`), observability (`counters()`, `status()`, `job:*` events) ✅
 
-**Queue requirements (LMDB-backed):**
-- append job
-- iterate jobs in order
-- mark as completed / failed
-- retry strategy
-- ability to survive restart
-- atomic operations
-- counters, timestamps
+**Queue requirements (LMDB-backed):** all landed in `JobQueue`
+- append job ✅ (`append`, dedupe per `<kind>|<key>` replaces a pending job)
+- iterate jobs in order ✅ (`pending(now)`, `all()`)
+- mark as completed / failed ✅ (`complete`, `fail`, `retry`, `cancel`)
+- retry strategy ✅ (backoff; `permanent` parks the job)
+- ability to survive restart ✅ (`recover()`: running→pending on open)
+- atomic operations ✅ (LMDB transactions)
+- counters, timestamps ✅
 
-To eval: Support sync policies
+Sync policies ✅: the device mirror (`Mirror`) implements the protocol's
+three-way table with `deletes: propagate|keep`, `conflictMode: prompt|rename`,
+`prefixes`/`ignore`. The in-process `SyncQueue` (cache → remote `commit`) stays
+for gdrive-style targets; `canvas` targets stream directly (`putStream`).
+Still open: the hub-side mirror to gdrive/NAS (08-31 §5) reusing the same
+engine with a non-canvas remote.
 Not needed: cluster mode, pub/sub, cron expressions, priorities

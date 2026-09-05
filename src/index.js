@@ -10,6 +10,9 @@ import Cache from './cache/index.js';
 import BackendManager from './backends/BackendManager.js';
 import Index from './index/index.js';
 import SyncQueue from './sync/SyncQueue.js';
+import JobQueue from './sync/JobQueue.js';
+import Ledger from './sync/Ledger.js';
+import Mirror from './sync/Mirror.js';
 import { isBuffer, isFile, isStream, resolveStoredPaths } from './utils/common.js';
 import { checksumBuffer, formatId } from './utils/checksum.js';
 import { detectMimeType, detectMimeFromHead } from './utils/mime.js';
@@ -473,7 +476,10 @@ export default class Stored extends EventEmitter2 {
 
         const release = this.#holdKeys([pathKey]);
         try {
-            await backend.delete(destKey);   // false = bytes already gone; the location still goes
+            // false = bytes already gone; the location still goes. A remote
+            // driver re-evaluates the precondition at the other end (412 →
+            // typed error, nothing is unlinked here).
+            await backend.delete(destKey, { ifMatch: options.ifMatch, origin: options.origin });
             this.#processUnlink({ backend: backendName, key: destKey, ...(options.origin ? { origin: options.origin } : {}) });
             debug(`REMOVE ${pathKey}`);
             return { ok: true, id: current.id, sha256: current.checksums?.sha256 ?? null, seq: this.#index.head() };
@@ -512,6 +518,7 @@ export default class Stored extends EventEmitter2 {
             from: `stored://${backendName}/${fromKey}`,
             onConflict: 'error',
             origin: options.origin,
+            ifMatch: options.ifMatch,
         });
         if (!result.ok) return result;
         return {
@@ -602,8 +609,12 @@ export default class Stored extends EventEmitter2 {
 
         const release = this.#holdKeys(targets.map(t => `${t.name}:${t.key || destKey}`));
         try {
-            const transferred = await this.#streamToTargets(meta, sourceLocation, targets, destKey, { mtime: options.mtime });
+            const transferred = await this.#streamToTargets(meta, sourceLocation, targets, destKey, this.#transferOptions(options));
             if (!transferred.ok) return transferred;
+            // A conflict-inbox upload placed nothing at the key: no location.
+            if (transferred.conflict && !transferred.locations.length) {
+                return { ok: true, id: meta.id, added: [], conflict: transferred.conflict, locations: await this.locations(meta.id) };
+            }
 
             // Displace-then-record in one transaction: the change log must
             // never show the new owner of a key before the old one let go.
@@ -626,6 +637,8 @@ export default class Stored extends EventEmitter2 {
                 id: meta.id,
                 added: transferred.locations.map(l => `stored://${l.backend}/${l.key}`),
                 locations: saved.locations.map(l => this.#describeLocation(l)),
+                ...(transferred.result ? { remote: transferred.result } : {}),
+                ...(transferred.conflict ? { conflict: transferred.conflict } : {}),
             };
         } finally {
             release();
@@ -684,7 +697,19 @@ export default class Stored extends EventEmitter2 {
                 });
             }
 
-            const transferred = await this.#streamToTargets(meta, sourceLocation, targets, destKey, { mtime: options.mtime });
+            // Same remote backend, new key: the driver renames server-side
+            // (one request, no bytes through here, identity intact).
+            if (sourceLocation.backend === target.name && sourceBackend.type === 'remote' && typeof sourceBackend.rename === 'function') {
+                const renamedRemote = await this.#tryRemoteRename(sourceBackend, sourceLocation, targetKey, options);
+                if (!renamedRemote.ok) return renamedRemote;
+                debug(`MOVE (remote rename) ${sourceLocation.backend}:${sourceLocation.key} → ${target.name}:${targetKey}`);
+                return this.#index.transaction(() => {
+                    const previous = this.#displaceTargets(targets, destKey, meta.id, options);
+                    return this.#finalizeMove(meta.id, sourceLocation, renamedRemote.location, { removeSourceBytes: false, origin: options.origin, previous });
+                });
+            }
+
+            const transferred = await this.#streamToTargets(meta, sourceLocation, targets, destKey, this.#transferOptions(options));
             if (!transferred.ok) return transferred;
             const location = transferred.locations[0];
 
@@ -1048,6 +1073,12 @@ export default class Stored extends EventEmitter2 {
      */
     async #streamToTargets(meta, sourceLocation, targets, destKey, options = {}) {
         const sourceBackend = this.#backends.get(sourceLocation.backend);
+        // One remote target that speaks `putStream`: stream straight to it —
+        // no temp file, no cache entry, no SyncQueue. The hub verifies the
+        // digest (`X-Canvas-Sha256`) and answers the precondition itself.
+        if (targets.length === 1 && targets[0].backend.type === 'remote' && typeof targets[0].backend.putStream === 'function') {
+            return this.#streamToRemote(meta, sourceBackend, sourceLocation, targets[0], destKey, options);
+        }
         const source = await sourceBackend.get(sourceLocation.key, { stream: true });
         if (!source) return { ok: false, reason: 'source-unreadable', backend: sourceLocation.backend, key: sourceLocation.key };
 
@@ -1071,6 +1102,83 @@ export default class Stored extends EventEmitter2 {
             return { ok: false, reason: 'transfer-failed', error: err.message };
         } finally {
             await fsp.rm(tempPath, { force: true }).catch(() => {});
+        }
+    }
+
+    // Protocol options a copy/move forwards verbatim to a remote `putStream`.
+    #transferOptions(options = {}) {
+        const out = { mtime: options.mtime };
+        for (const k of ['ifMatch', 'ifNoneMatch', 'origin', 'conflictOf', 'conflictMode', 'baseSha256', 'deviceName']) {
+            if (options[k] != null) out[k] = options[k];
+        }
+        return out;
+    }
+
+    // Typed driver failures → the `{ ok:false, reason }` vocabulary the
+    // keyed-write API already speaks (412 → `precondition-failed` + `current`).
+    #remoteFailure(err, backendName, key) {
+        const code = err?.code || null;
+        const base = { ok: false, code, backend: backendName, key, error: err?.message, status: err?.status ?? null };
+        if (code === 'PRECONDITION_FAILED') return { ...base, reason: 'precondition-failed', current: err.current ?? null };
+        if (code === 'TARGET_EXISTS') return { ...base, reason: 'target-exists' };
+        if (code === 'NOT_FOUND') return { ...base, reason: 'not-found' };
+        if (code === 'OFFLINE') return { ...base, reason: 'target-offline', detail: 'offline' };
+        if (code === 'UNAUTHORIZED') return { ...base, reason: 'target-offline', detail: 'unauthorized' };
+        return { ...base, reason: 'transfer-failed' };
+    }
+
+    async #streamToRemote(meta, sourceBackend, sourceLocation, target, destKey, options = {}) {
+        const targetKey = target.key || destKey;
+        const source = await sourceBackend.get(sourceLocation.key, { stream: true });
+        if (!source) return { ok: false, reason: 'source-unreadable', backend: sourceLocation.backend, key: sourceLocation.key };
+        const sha256 = meta.checksums?.sha256 ?? null;
+        try {
+            const res = await target.backend.putStream(targetKey, source, {
+                ...options,
+                sha256,
+                mtime: options.mtime ?? sourceLocation.mtime ?? null,
+                mimeType: meta.mimeType || undefined,
+                size: sourceLocation.size ?? meta.size ?? null,
+            });
+            if (res?.conflict) {
+                // Inbox mode places nothing at the key; rename mode wrote an
+                // ordinary object at the conflict key.
+                const locations = options.conflictMode === 'rename'
+                    ? [this.#buildLocation(target.name, targetKey, true, {
+                        size: sourceLocation.size ?? meta.size, ...(sourceLocation.mtime != null ? { mtime: sourceLocation.mtime } : {}),
+                        ...(sha256 ? { ino: sha256, dev: target.backend.dev ?? null } : {}),
+                    })]
+                    : [];
+                return { ok: true, locations, remoteTargets: [], size: meta.size, conflict: res };
+            }
+            if (sha256 && res?.sha256 && res.sha256 !== sha256) {
+                return { ok: false, reason: 'checksum-mismatch', expected: meta.id, actual: `sha256:${res.sha256}` };
+            }
+            const location = this.#buildLocation(target.name, targetKey, true, {
+                size: res?.size ?? sourceLocation.size ?? meta.size,
+                ...(res?.mtime != null ? { mtime: res.mtime } : (sourceLocation.mtime != null ? { mtime: sourceLocation.mtime } : {})),
+                ...(sha256 ? { ino: sha256, dev: target.backend.dev ?? null } : {}),
+            });
+            return { ok: true, locations: [location], remoteTargets: [], size: location.size, result: res };
+        } catch (err) {
+            source.destroy?.();
+            debug(`Remote transfer to ${target.name}:${targetKey} failed: ${err.code || ''} ${err.message}`);
+            return this.#remoteFailure(err, target.name, targetKey);
+        }
+    }
+
+    // Server-side rename on a remote driver; the location keeps its identity.
+    async #tryRemoteRename(backend, sourceLocation, targetKey, options = {}) {
+        try {
+            const r = await backend.rename(sourceLocation.key, targetKey, { ifMatch: options.ifMatch, origin: options.origin });
+            const location = this.#buildLocation(backend.name, targetKey, true, {
+                size: r?.size ?? sourceLocation.size,
+                ...((r?.modified ?? sourceLocation.mtime) != null ? { mtime: r?.modified ?? sourceLocation.mtime } : {}),
+                ...(sourceLocation.ino != null ? { ino: sourceLocation.ino, dev: sourceLocation.dev } : {}),
+            });
+            return { ok: true, location, result: r };
+        } catch (err) {
+            return this.#remoteFailure(err, backend.name, sourceLocation.key);
         }
     }
 
@@ -1273,7 +1381,15 @@ export default class Stored extends EventEmitter2 {
      * ourselves. Refcounted (concurrent transfers may overlap) and released on a
      * delay, because the events arrive well after the syscall returns.
      */
-    #holdKeys(keys) {
+    #holdKeys(allKeys) {
+        // Drivers that already filter their own echoes (a canvas hub feed
+        // stamped with our origin) need no hold — and holding would swallow
+        // a genuine remote change that lands right after our write.
+        const keys = allKeys.filter((pathKey) => {
+            const name = this.#backends.list().filter((n) => pathKey.startsWith(`${n}:`)).sort((a, b) => b.length - a.length)[0];
+            const backend = name ? this.#backends.get(name) : null;
+            return !(backend && backend.suppressEchoes === false);
+        });
         for (const key of keys) this.#suppressedKeys.set(key, (this.#suppressedKeys.get(key) || 0) + 1);
         let released = false;
         return () => {
@@ -1601,7 +1717,15 @@ export default class Stored extends EventEmitter2 {
             // (the source of a move) are always ours.
             const indexed = data.checksums ? this.#index.get(pathKey) : null;
             const sameBytes = !!indexed && formatId(data.checksums, this.#config.primaryChecksum) === indexed.id;
-            if (event === 'file:unlink' || !data.checksums || sameBytes) {
+            if (event === 'file:unlink') {
+                // Ours (the source of a move, a remove-before-link) — or a
+                // genuine delete landing inside the window. Decide once the
+                // hold is over, from what is actually on disk.
+                debug(`Deferred unlink under in-flight transfer ${pathKey}`);
+                this.#recheckUnlink(data);
+                return;
+            }
+            if (!data.checksums || sameBytes) {
                 debug(`Suppressed ${event} for in-flight transfer ${pathKey}`);
                 return;
             }
@@ -1625,6 +1749,15 @@ export default class Stored extends EventEmitter2 {
 
         if (event === 'file:add' && data.checksums) {
             const id = formatId(data.checksums, this.#config.primaryChecksum);
+            // An `add` on a path the index already attributes to other bytes
+            // (chokidar coalesces a write that follows a rename into one add)
+            // is a succession: take the change path so the previous owner is
+            // displaced and never re-claims the key.
+            const occupant = this.#index.get(pathKey);
+            if (occupant && occupant.id !== id) {
+                this.#handleFileEvent('file:change', data, { ...options, force: true });
+                return;
+            }
 
             // Rename pairing: an add whose inode matches a held unlink is the
             // second half of a move. Same content → silently drop the old-path
@@ -1729,6 +1862,27 @@ export default class Stored extends EventEmitter2 {
         }
     }
 
+    // An unlink observed while its key was held: once the hold expires, a key
+    // the index still claims but the backend no longer has was a real delete
+    // (the user removed the file right after we wrote it) and is processed
+    // through the normal path; the echo of our own remove/rename is a no-op
+    // (the transfer already rewrote the index, or the file is back).
+    #recheckUnlink(data) {
+        const pathKey = `${data.backend}:${data.key}`;
+        const timer = setTimeout(async () => {
+            if (this.#suppressedKeys.has(pathKey)) { this.#recheckUnlink(data); return; }
+            const meta = this.#index.get(pathKey);
+            if (!meta) return;
+            const backend = this.#backends.get(data.backend);
+            if (!backend) return;
+            const present = await backend.stat(data.key).catch(() => null);
+            if (present) return;
+            debug(`Deferred unlink confirmed for ${pathKey}`);
+            this.#handleFileEvent('file:unlink', data);
+        }, MOVE_SUPPRESS_MS + 100);
+        timer.unref?.();
+    }
+
     // The genuine-deletion path for a file:unlink (immediate when the inode is
     // unknown, deferred through #pendingUnlinks otherwise).
     #processUnlink(data) {
@@ -1750,3 +1904,5 @@ export default class Stored extends EventEmitter2 {
         }
     }
 }
+
+export { Mirror, JobQueue, Ledger, BackendManager, Index };

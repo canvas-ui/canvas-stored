@@ -50,6 +50,13 @@ export default class Index {
 
     get size() { return this.#db.getKeysCount(); }
 
+    /**
+     * Open (or reuse) a named sub-database in the index environment. The
+     * sync engine keeps its ledger and job queue here so a device's whole
+     * state lives in one LMDB env with one lifecycle.
+     */
+    openDB(name, options = {}) { return this.#db.openDB({ name, ...options }); }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Transactions
     // ─────────────────────────────────────────────────────────────────────────
