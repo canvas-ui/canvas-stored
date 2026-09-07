@@ -687,6 +687,9 @@ export default class Stored extends EventEmitter2 {
             // Fast path — same filesystem, both file backends.
             const renamed = await this.#tryRename(sourceBackend, sourceLocation.key, target.backend, targetKey);
             if (renamed) {
+                // The source's folder may be empty now (a hub delete moves the
+                // last file of a folder to trash) — drop the shell like delete() does.
+                if (typeof sourceBackend.pruneEmptyParents === 'function') await sourceBackend.pruneEmptyParents(sourceLocation.key).catch(() => {});
                 const location = this.#buildLocation(target.name, targetKey, true, {
                     size: renamed.size, mtime: renamed.modified, dev: renamed.dev, ino: renamed.ino,
                 });

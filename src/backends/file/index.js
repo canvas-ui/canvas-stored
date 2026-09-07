@@ -272,7 +272,27 @@ export default class FileBackend extends StorageBackend {
         if (!await fs.pathExists(filePath)) return false;
         await fs.remove(filePath);
         debug(`DELETE ${key}`);
+        await this.pruneEmptyParents(key);
         return true;
+    }
+
+    /**
+     * Remove the now-empty directories above `key`, stopping at the first one
+     * that still has entries and never touching the root or the staging dir.
+     * Directories are not objects — a mirror deletes a folder file by file —
+     * so without this a hub keeps every emptied folder as a shell forever.
+     * `rmdir(2)` refuses a non-empty dir, so a concurrent write is safe.
+     */
+    async pruneEmptyParents(key) {
+        let rel = path.posix.dirname(String(key).split(path.sep).join('/'));
+        while (rel && rel !== '.' && rel !== '/') {
+            if (this.#isTempPath(rel) || (this.#tempRel && this.#tempRel.startsWith(`${rel}/`))) return;
+            const dir = this.#resolvePath(rel);
+            if (dir === this.#root) return;
+            try { await fs.rmdir(dir); } catch { return; }
+            debug(`RMDIR (empty) ${rel}`);
+            rel = path.posix.dirname(rel);
+        }
     }
 
     /**
@@ -352,11 +372,12 @@ export default class FileBackend extends StorageBackend {
         // hashed (a mirror bumps it — a multi-GB copy from a USB stick must
         // not be hashed mid-write). `followSymlinks`: chokidar's default is
         // true; a mirror turns it off so a symlink into /etc is never synced.
+        const stabilityMs = Number(this.config.stabilityThreshold) > 0 ? Number(this.config.stabilityThreshold) : 200;
         const watchOpts = {
             persistent: true,
             ignoreInitial: true,
             awaitWriteFinish: {
-                stabilityThreshold: Number(this.config.stabilityThreshold) > 0 ? Number(this.config.stabilityThreshold) : 200,
+                stabilityThreshold: stabilityMs,
                 pollInterval: 50,
             },
             ...(this.config.followSymlinks != null ? { followSymlinks: this.config.followSymlinks !== false } : {}),
@@ -383,31 +404,73 @@ export default class FileBackend extends StorageBackend {
         const toKey = p => path.relative(this.#root, p);
 
         this.#watcher
-            .on('add', async p => {
-                const key = toKey(p);
-                const [checksums, mimeType, stats] = await Promise.all([
-                    checksumFile(p, this.#defaultAlgorithms).catch(() => null),
-                    detectMimeType(p).catch(() => null),
-                    fs.stat(p).catch(() => null),
-                ]);
-                this.emit('file:add', { backend: this.name, key, path: p, checksums, mimeType, size: stats?.size, modified: stats?.mtimeMs, dev: stats?.dev, ino: stats?.ino });
-            })
-            .on('change', async p => {
-                const key = toKey(p);
-                const [checksums, mimeType, stats] = await Promise.all([
-                    checksumFile(p, this.#defaultAlgorithms).catch(() => null),
-                    detectMimeType(p).catch(() => null),
-                    fs.stat(p).catch(() => null),
-                ]);
-                this.emit('file:change', { backend: this.name, key, path: p, checksums, mimeType, size: stats?.size, modified: stats?.mtimeMs, dev: stats?.dev, ino: stats?.ino });
-            })
+            .on('add', p => this.#emitFileEvent('file:add', p))
+            .on('change', p => this.#emitFileEvent('file:change', p))
             .on('unlink', p => {
                 this.emit('file:unlink', { backend: this.name, key: toKey(p), path: p });
             })
+            // chokidar (v4 and v5) with followSymlinks:false loses a directory
+            // that is created and populated before its own watch is set up
+            // (`cp -r`, unzip, a clone): no add for the files, no watch on the
+            // dir, so later edits and deletes in it are invisible too. Every
+            // addDir schedules a walk that adopts what chokidar missed.
+            .on('addDir', p => this.#scheduleHeal(p, stabilityMs))
             .on('error', err => this.emit('error', err));
 
         debug(`Watching ${this.#root}`);
         return true;
+    }
+
+    async #emitFileEvent(event, p) {
+        const key = path.relative(this.#root, p);
+        const [checksums, mimeType, stats] = await Promise.all([
+            checksumFile(p, this.#defaultAlgorithms).catch(() => null),
+            detectMimeType(p).catch(() => null),
+            fs.stat(p).catch(() => null),
+        ]);
+        if (!stats) return;   // gone again before we could hash it; unlink follows
+        this.emit(event, { backend: this.name, key, path: p, checksums, mimeType, size: stats.size, modified: stats.mtimeMs, dev: stats.dev, ino: stats.ino });
+    }
+
+    // Walk `dir` once the burst that created it has settled and compare the
+    // disk against what chokidar tracks: an untracked subdirectory is handed
+    // to the watcher (it then watches it, silently — ignoreInitial), an
+    // untracked file is announced as if the watcher had seen it. A file still
+    // being written (mtime inside the stability window) defers one more round.
+    #scheduleHeal(dir, stabilityMs, attempt = 0) {
+        const timer = setTimeout(() => {
+            this.#healSubtree(dir, stabilityMs, attempt).catch((err) => debug(`heal ${dir} failed: ${err.message}`));
+        }, stabilityMs + 250);
+        timer.unref?.();
+    }
+
+    async #healSubtree(dir, stabilityMs, attempt) {
+        const watcher = this.#watcher;
+        if (!watcher) return;
+        const watched = watcher.getWatched();
+        const tracked = (parent, name) => Array.isArray(watched[parent]) && watched[parent].includes(name);
+        let unsettled = false;
+        const walk = async (d) => {
+            let entries;
+            try { entries = await fs.readdir(d, { withFileTypes: true }); } catch { return; }
+            for (const entry of entries) {
+                const full = path.join(d, entry.name);
+                const rel = path.relative(this.#root, full);
+                if (this.#isIgnored(rel)) continue;
+                if (entry.isDirectory()) {
+                    if (!tracked(d, entry.name)) { debug(`heal: adopting directory ${rel}`); watcher.add(full); }
+                    await walk(full);
+                } else if (entry.isFile() && !tracked(d, entry.name)) {
+                    const stats = await fs.stat(full).catch(() => null);
+                    if (!stats) continue;
+                    if (Date.now() - stats.mtimeMs < stabilityMs) { unsettled = true; continue; }
+                    debug(`heal: adopting file ${rel}`);
+                    await this.#emitFileEvent('file:add', full);
+                }
+            }
+        };
+        await walk(dir);
+        if (unsettled && attempt < 5) this.#scheduleHeal(dir, stabilityMs, attempt + 1);
     }
 
     /**
