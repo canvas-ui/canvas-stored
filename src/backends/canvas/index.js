@@ -36,6 +36,12 @@ const PING_CACHE_MS = 30_000;
 const LIST_PAGE = 1000;
 const CHANGES_PAGE = 1000;
 const RETRY_DELAYS_MS = [500, 1500, 4000];
+// A request that gets no response is aborted, otherwise a connection a proxy
+// silently dropped pins a worker slot until undici's own 5-minute timeout —
+// two of those and a mirror looks dead. Uploads get extra time per byte so a
+// large file on a slow uplink is never cut short.
+const REQUEST_TIMEOUT_MS = 60_000;
+const MIN_UPLOAD_BYTES_PER_SEC = 50_000;
 const JSON_HEADERS = { Accept: 'application/json' };
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -87,6 +93,8 @@ export default class CanvasBackend extends StorageBackend {
     #instanceId = null;
     #prefixes;
     #retryDelays;
+    #requestTimeoutMs;
+    #minUploadBytesPerSec;
 
     // key → row { key, size, modified, mimeType, checksums:{sha256}, dev, ino, docId }
     #files = new Map();
@@ -112,6 +120,8 @@ export default class CanvasBackend extends StorageBackend {
         this.#expectedInstanceId = config.instanceId || null;
         this.#prefixes = Array.isArray(config.prefixes) ? config.prefixes.filter(Boolean) : [];
         this.#retryDelays = Array.isArray(config.retryDelays) ? config.retryDelays : RETRY_DELAYS_MS;
+        this.#requestTimeoutMs = Number(config.requestTimeoutMs) > 0 ? Number(config.requestTimeoutMs) : REQUEST_TIMEOUT_MS;
+        this.#minUploadBytesPerSec = Number(config.minUploadBytesPerSec) > 0 ? Number(config.minUploadBytesPerSec) : MIN_UPLOAD_BYTES_PER_SEC;
         this.#cursor = config.cursor == null ? null : Number(config.cursor);
         debug(`CanvasBackend "${name}" initialized (${this.#url} ws=${this.#workspaceId} backend=${this.#backend})`);
     }
@@ -181,9 +191,10 @@ export default class CanvasBackend extends StorageBackend {
      * body is sent once and a retryable status surfaces as `RETRYABLE`.
      * `okStatuses` widens success (304, 404 for stat-like calls).
      */
-    async #call(url, init = {}, { okStatuses = [], key = null } = {}) {
+    async #call(url, init = {}, { okStatuses = [], key = null, uploadBytes = null } = {}) {
         const { body: bodySpec, ...rest } = init;
         const streaming = bodySpec != null && typeof bodySpec !== 'function' && !Buffer.isBuffer(bodySpec) && typeof bodySpec !== 'string';
+        const timeoutMs = this.#requestTimeoutMs + (uploadBytes > 0 ? Math.ceil(uploadBytes / this.#minUploadBytesPerSec) * 1000 : 0);
         let last = null;
         for (let attempt = 0; ; attempt += 1) {
             const body = typeof bodySpec === 'function' ? bodySpec() : bodySpec;
@@ -192,16 +203,23 @@ export default class CanvasBackend extends StorageBackend {
                 options.body = body;
                 if (typeof body === 'object' && typeof body.getReader === 'function') options.duplex = 'half';
             }
+            const abort = new AbortController();
+            const timer = setTimeout(() => abort.abort(new Error(`no response within ${timeoutMs} ms`)), timeoutMs);
+            timer.unref?.();
+            options.signal = abort.signal;
             let res;
             try {
                 res = await this.#fetch(url, options);
             } catch (err) {
-                last = new CanvasHubError(`canvas hub unreachable: ${err?.cause?.message || err.message}`, { code: 'OFFLINE', key });
+                clearTimeout(timer);
+                const reason = abort.signal.aborted ? (abort.signal.reason?.message || 'timeout') : (err?.cause?.message || err.message);
+                last = new CanvasHubError(`canvas hub unreachable: ${reason}`, { code: 'OFFLINE', key });
                 this.#lastPing = null;   // a transport failure voids the cached liveness
                 if (streaming || attempt >= this.#retryDelays.length) throw last;
                 await sleep(this.#retryDelays[attempt]);
                 continue;
             }
+            clearTimeout(timer);
             if (res.ok || okStatuses.includes(res.status)) return res;
             if (res.status === 429 || res.status >= 500) {
                 last = await this.#classify(res, key);
@@ -448,7 +466,7 @@ export default class CanvasBackend extends StorageBackend {
         else body = this.#toWeb(source);
         if (size != null) headers['Content-Length'] = String(size);
 
-        const { payload, status } = await this.#json(this.#objectUrl(clean), { method: 'PUT', headers, body }, { key: clean });
+        const { payload, status } = await this.#json(this.#objectUrl(clean), { method: 'PUT', headers, body }, { key: clean, uploadBytes: size });
         if (options.conflictOf) {
             debug(`CONFLICT PUT ${clean} (of ${options.conflictOf})`);
             return { conflict: true, ...(payload || {}), key: clean };

@@ -13,7 +13,7 @@ const DEFAULTS = {
     conflictMode: 'prompt',
     debounceMs: 1500,
     fullReconcileEvery: 6 * 60 * 60_000,
-    concurrency: 2,
+    concurrency: 4,
     offlineBackoffMs: [5_000, 10_000, 20_000, 40_000, 60_000],
 };
 
@@ -587,7 +587,12 @@ export default class Mirror extends EventEmitter {
         const key = job.key;
         const { L, B, Lloc, Lmeta } = this.#local3(key);
         if (!L || !Lmeta) { this.#markDirty(key); return; }
-        const stat = await this.#remote.stat(key);           // confirm R
+        // A brand-new key (no base, nothing in the hub view) skips the HEAD:
+        // the PUT carries If-None-Match:* and a 412 re-decides below, so the
+        // extra round trip bought nothing — and on a slow link it was half the
+        // per-file cost of a bulk upload.
+        const fresh = !B && !this.#stored.index.get(`${this.#opts.remote}:${key}`);
+        const stat = fresh ? null : await this.#remote.stat(key);           // confirm R
         const R = stat?.checksums?.sha256 ?? null;
         if (R !== B) {
             // The hub moved since the decision — decide again with what it has.
