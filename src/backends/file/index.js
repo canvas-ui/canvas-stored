@@ -1,4 +1,5 @@
 import fs from 'fs-extra';
+import { promises as fsp } from 'fs';
 import path from 'path';
 import { pathToFileURL } from 'url';
 import chokidar from 'chokidar';
@@ -211,31 +212,94 @@ export default class FileBackend extends StorageBackend {
         return { from: fromKey, to: toKey };
     }
 
+    // A fresh staging path inside the backend root (same filesystem as every
+    // destination, so the final step is always one rename(2)).
+    async #stagingPath() {
+        await fs.ensureDir(this.#tempDir);
+        return path.join(this.#tempDir, `${Date.now()}-${process.pid}-${Math.random().toString(16).slice(2)}`);
+    }
+
+    // Every placement ends with rename(2) over the destination: a reader sees
+    // either the previous bytes or the complete new ones, never a partial
+    // file, and a crash mid-write leaves only a staging file behind. This is
+    // also what makes hardlink-based retention safe (see retain()): the old
+    // inode is never written to in place, it is displaced.
     async put(key, data) {
         const filePath = this.#resolvePath(key);
         await fs.ensureDir(path.dirname(filePath));
-        await fs.writeFile(filePath, data);
+        const tmp = await this.#stagingPath();
+        try {
+            const fh = await fsp.open(tmp, 'w');
+            try { await fh.writeFile(data); await fh.sync(); } finally { await fh.close(); }
+            await fs.rename(tmp, filePath);
+        } finally {
+            await fs.remove(tmp).catch(() => {});
+        }
         const stats = await fs.stat(filePath);
         debug(`PUT ${key} (${stats.size} bytes)`);
         return { key, size: stats.size };
     }
 
-    // Place an already-written file (e.g. a streamed temp) at `key`. Hardlinks
-    // when on the same filesystem (zero copy, shared inode), falling back to a
-    // byte copy across filesystems. Used by the streaming put path.
+    // Place an already-written file (e.g. a streamed temp) at `key`: hardlink
+    // it to a staging name (zero copy on the same filesystem; a byte copy
+    // across filesystems), then rename over the destination.
     async commit(key, srcPath) {
         const dest = this.#resolvePath(key);
         await fs.ensureDir(path.dirname(dest));
-        await fs.remove(dest);
+        const tmp = await this.#stagingPath();
         try {
-            await fs.link(srcPath, dest);
-        } catch (err) {
-            if (err.code === 'EXDEV') await fs.copyFile(srcPath, dest);
-            else throw err;
+            try {
+                await fs.link(srcPath, tmp);
+            } catch (err) {
+                if (!['EXDEV', 'EPERM', 'EMLINK', 'ENOTSUP', 'EOPNOTSUPP'].includes(err.code)) throw err;
+                await fs.copyFile(srcPath, tmp);
+            }
+            await fs.rename(tmp, dest);
+        } finally {
+            await fs.remove(tmp).catch(() => {});
         }
         const stats = await fs.stat(dest);
         debug(`COMMIT ${key} (${stats.size} bytes)`);
         return { key, size: stats.size };
+    }
+
+    // ── Retention ─────────────────────────────────────────────────────────
+    //
+    // Bytes an overwrite or delete is about to displace are kept for a while
+    // under `<tempDir>/retained/<sha256>` (Stored decides when; the window is
+    // its config). A hardlink shares the inode with the visible file only
+    // until the placement above renames a new inode over it — placements are
+    // never in-place writes, so the retained copy stays what it was. On
+    // filesystems without hardlinks the bytes are copied.
+
+    get retainDir() { return path.join(this.#tempDir, 'retained'); }
+    retainedPath(sha256) { return path.join(this.retainDir, String(sha256).toLowerCase()); }
+
+    async retain(key, sha256) {
+        const src = this.#resolvePath(key);
+        if (!sha256 || !await fs.pathExists(src)) return null;
+        const dest = this.retainedPath(sha256);
+        const existing = await fs.stat(dest).catch(() => null);
+        if (existing) return { path: dest, size: existing.size, existing: true };
+        await fs.ensureDir(this.retainDir);
+        try {
+            await fs.link(src, dest);
+        } catch (err) {
+            if (!['EXDEV', 'EPERM', 'EMLINK', 'ENOTSUP', 'EOPNOTSUPP'].includes(err.code)) throw err;
+            const tmp = await this.#stagingPath();
+            try { await fs.copyFile(src, tmp); await fs.rename(tmp, dest); }
+            finally { await fs.remove(tmp).catch(() => {}); }
+        }
+        const stats = await fs.stat(dest);
+        debug(`RETAIN ${key} → ${sha256.slice(0, 12)} (${stats.size} bytes)`);
+        return { path: dest, size: stats.size, existing: false };
+    }
+
+    async dropRetained(sha256) {
+        const dest = this.retainedPath(sha256);
+        if (!await fs.pathExists(dest)) return false;
+        await fs.remove(dest);
+        return true;
     }
 
     /**

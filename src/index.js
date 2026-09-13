@@ -53,6 +53,9 @@ export default class Stored extends EventEmitter2 {
     // backend, held until the SyncQueue confirms the destination write. The
     // source is only removed once the copy is durable somewhere else.
     #pendingMoves = new Map();
+    #retention = null;
+    #retainedDb = null;
+    #sweepTimer = null;
 
     constructor(config = {}) {
         // Wildcards (':' delimiter) let consumers bind `object:*` across backends.
@@ -63,6 +66,10 @@ export default class Stored extends EventEmitter2 {
             primaryChecksum: config.primaryChecksum || 'sha256',
             ...config,
         };
+        // Retention window for displaced bytes (overwrite/delete on a local
+        // file backend): `{ days }`; absent/false = off. See #retain().
+        const days = config.retention ? Number(config.retention.days ?? 30) : 0;
+        this.#retention = days > 0 ? { days, sweepEveryMs: Number(config.retention.sweepEveryMs ?? 60 * 60_000) } : null;
 
         this.#extract = typeof config.extract === 'function' ? config.extract : null;
 
@@ -196,6 +203,7 @@ export default class Stored extends EventEmitter2 {
         const backend = this.#backends.get(p.backend);
         if (!backend) return { ok: false, reason: 'unknown-backend' };
         if (!backend.canDelete) return { ok: false, reason: 'read-only-backend' };
+        await this.#retain(p.backend, p.key, this.#index.get(`${p.backend}:${p.key}`));
         const deleted = !!(await backend.delete(p.key));
         if (deleted) this.#dropLocation(p.backend, p.key);
         return { ok: deleted };
@@ -285,6 +293,7 @@ export default class Stored extends EventEmitter2 {
         const removed = new Set();
         for (const loc of targets) {
             const backend = this.#backends.get(loc.backend);
+            if (backend) await this.#retain(loc.backend, loc.key, meta);
             if (backend && await backend.delete(loc.key)) {
                 deleted.push(loc.backend);
                 removed.add(loc);
@@ -406,6 +415,7 @@ export default class Stored extends EventEmitter2 {
             const mimeType = options.mimeType || await detectMimeFromHead(head, destKey);
             const release = this.#holdKeys([pathKey]);
             try {
+                if (current) await this.#retain(backendName, destKey, current);
                 let placed = null;
                 if (typeof backend.renameFrom === 'function') {
                     try { placed = await backend.renameFrom(destKey, tempPath); }
@@ -455,6 +465,140 @@ export default class Stored extends EventEmitter2 {
         }
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Retention — displaced bytes stay recoverable for a window
+    // ─────────────────────────────────────────────────────────────────────────
+    //
+    // Every path that overwrites or deletes bytes on a local file backend
+    // (writeObject over an existing key, removeObject, remove()/deleteByUrl,
+    // an `onConflict:'overwrite'` transfer) first asks the backend to retain
+    // the current bytes under their sha256. The `retained` sub-db records
+    // when and from where; `sweepRetained` drops entries older than the
+    // window. Digest-addressed, so the same bytes displaced from ten keys are
+    // kept once. Off unless Stored was given `retention: { days }`.
+
+    get retention() { return this.#retention ? { ...this.#retention } : null; }
+
+    get #retained() {
+        if (!this.#retainedDb) this.#retainedDb = this.#index.openDB('retained');
+        return this.#retainedDb;
+    }
+
+    async #retain(backendName, key, meta) {
+        if (!this.#retention || !meta) return null;
+        const backend = this.#backends.get(backendName);
+        if (!backend || backend.type !== 'local' || typeof backend.retain !== 'function') return null;
+        const sha256 = meta.checksums?.sha256 ? String(meta.checksums.sha256).toLowerCase() : null;
+        if (!sha256) return null;
+        try {
+            const kept = await backend.retain(key, sha256);
+            if (!kept) return null;
+            const now = Date.now();
+            const prev = this.#retained.get(sha256) || null;
+            const keys = [...new Set([...(prev?.keys || []), `${backendName}:${key}`])].slice(-20);
+            const entry = {
+                sha256,
+                backend: prev?.backend || backendName,
+                size: kept.size ?? prev?.size ?? meta.size ?? null,
+                mimeType: meta.mimeType ?? prev?.mimeType ?? null,
+                id: meta.id ?? prev?.id ?? null,
+                keys,
+                firstAt: prev?.firstAt ?? now,
+                lastAt: now,
+            };
+            this.#retained.putSync(sha256, entry);
+            this.#scheduleSweep();
+            return entry;
+        } catch (err) {
+            debug(`retain ${backendName}:${key} failed: ${err.message}`);
+            this.emit('error', Object.assign(new Error(`retention failed for ${backendName}:${key}: ${err.message}`), { code: 'RETAIN_FAILED' }));
+            return null;
+        }
+    }
+
+    #scheduleSweep() {
+        if (this.#sweepTimer || !this.#retention) return;
+        this.#sweepTimer = setInterval(() => { this.sweepRetained().catch(() => {}); }, this.#retention.sweepEveryMs);
+        this.#sweepTimer.unref?.();
+    }
+
+    /** Retained entries, newest displaced first: `[{ sha256, backend, size, mimeType, id, keys, firstAt, lastAt }]`. */
+    listRetained({ backend = null, key = null, limit = 1000 } = {}) {
+        if (!this.#retention) return [];
+        const out = [];
+        for (const { value } of this.#retained.getRange()) {
+            if (!value?.sha256) continue;
+            if (backend && value.backend !== backend && !value.keys?.some((k) => k.startsWith(`${backend}:`))) continue;
+            if (key && !value.keys?.some((k) => k === key || k.endsWith(`:${key}`))) continue;
+            out.push(value);
+        }
+        out.sort((a, b) => (b.lastAt ?? 0) - (a.lastAt ?? 0));
+        return out.slice(0, limit);
+    }
+
+    getRetained(sha256) {
+        if (!this.#retention) return null;
+        return this.#retained.get(String(sha256).toLowerCase()) || null;
+    }
+
+    /** Readable stream of retained bytes, or null. */
+    async retainedStream(sha256) {
+        const entry = this.getRetained(sha256);
+        const backend = entry && this.#backends.get(entry.backend);
+        if (!backend || typeof backend.retainedPath !== 'function') return null;
+        const p = backend.retainedPath(entry.sha256);
+        if (!await fsp.stat(p).catch(() => null)) return null;
+        return createReadStream(p);
+    }
+
+    /**
+     * Put retained bytes back at `backend:key` through the ordinary keyed
+     * write (succession, change log, preconditions). `ifNoneMatch:'*'` refuses
+     * an occupied key; pass `ifMatch` (digest) to replace a known current.
+     */
+    async restoreRetained(sha256, { backend, key, ifMatch = null, ifNoneMatch = null, origin = null, mtime = null } = {}) {
+        const entry = this.getRetained(sha256);
+        if (!entry) return { ok: false, reason: 'not-found', sha256 };
+        const stream = await this.retainedStream(entry.sha256);
+        if (!stream) return { ok: false, reason: 'not-found', sha256, detail: 'retained bytes missing on disk' };
+        const target = backend || entry.backend;
+        const targetKey = key || entry.keys?.at(-1)?.slice(target.length + 1) || null;
+        if (!targetKey) return { ok: false, reason: 'invalid-key', key };
+        const res = await this.writeObject(target, targetKey, stream, {
+            sha256: entry.sha256, mimeType: entry.mimeType || undefined,
+            ...(ifMatch != null ? { ifMatch } : {}), ...(ifNoneMatch != null ? { ifNoneMatch } : {}),
+            ...(origin ? { origin } : {}), ...(mtime != null ? { mtime } : {}),
+        });
+        return res.ok ? { ...res, key: targetKey, backend: target, restored: entry.sha256 } : res;
+    }
+
+    /** Drop entries (and their bytes) displaced longer than the window ago. Returns `{ swept, kept }`. */
+    async sweepRetained({ olderThanMs = null, now = Date.now() } = {}) {
+        if (!this.#retention) return { swept: 0, kept: 0 };
+        const window = olderThanMs ?? this.#retention.days * 86_400_000;
+        let swept = 0;
+        let kept = 0;
+        for (const { key: sha, value } of [...this.#retained.getRange()]) {
+            if (!value?.sha256) continue;
+            if ((now - (value.lastAt ?? 0)) < window) { kept += 1; continue; }
+            const backend = this.#backends.get(value.backend);
+            if (backend && typeof backend.dropRetained === 'function') await backend.dropRetained(value.sha256).catch(() => {});
+            this.#retained.removeSync(sha);
+            swept += 1;
+        }
+        if (swept) debug(`retention sweep: ${swept} dropped, ${kept} kept`);
+        return { swept, kept };
+    }
+
+    async forgetRetained(sha256) {
+        const entry = this.getRetained(sha256);
+        if (!entry) return false;
+        const backend = this.#backends.get(entry.backend);
+        if (backend && typeof backend.dropRetained === 'function') await backend.dropRetained(entry.sha256).catch(() => {});
+        this.#retained.removeSync(entry.sha256);
+        return true;
+    }
+
     /**
      * Delete the bytes at `backend:key` (precondition-checked like
      * writeObject) and process it as the genuine unlink it is: consumers get
@@ -479,6 +623,7 @@ export default class Stored extends EventEmitter2 {
             // false = bytes already gone; the location still goes. A remote
             // driver re-evaluates the precondition at the other end (412 →
             // typed error, nothing is unlinked here).
+            await this.#retain(backendName, destKey, current);
             await backend.delete(destKey, { ifMatch: options.ifMatch, origin: options.origin });
             this.#processUnlink({ backend: backendName, key: destKey, ...(options.origin ? { origin: options.origin } : {}) });
             debug(`REMOVE ${pathKey}`);
@@ -903,6 +1048,7 @@ export default class Stored extends EventEmitter2 {
     // ─────────────────────────────────────────────────────────────────────────
 
     async stop() {
+        if (this.#sweepTimer) { clearInterval(this.#sweepTimer); this.#sweepTimer = null; }
         await this.#syncQueue.stop();
         await this.#backends.stopAll();
         // Flush held unlinks (watchers are stopped — no add can claim them now)
@@ -1545,12 +1691,13 @@ export default class Stored extends EventEmitter2 {
         const locations = [];
         const remoteTargets = [];
 
-        for (const { name, backend, key } of targets) {
+        for (const { name, backend, key, overwrite } of targets) {
             // A target may carry its own key: conflict resolution can rename per
             // backend (`photo.jpg` is free on one, taken on another). `put()`
             // targets never do, so they all land on `finalKey`.
             const targetKey = key || finalKey;
             if (backend.type === 'local') {
+                if (overwrite) await this.#retain(name, targetKey, this.#index.get(`${name}:${targetKey}`));
                 if (source.data) await backend.put(targetKey, source.data);
                 else await backend.commit(targetKey, source.file);
                 if (options.mtime != null && typeof backend.utimes === 'function') {
