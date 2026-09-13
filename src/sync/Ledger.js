@@ -8,12 +8,15 @@ const debug = Debug('stored:sync:ledger');
  *
  * One LMDB sub-database (`mirror`, in the stored index env) keyed by
  * `<kind>/<mirror>/<key>`:
- *   - `base/<mirror>/<key>` → `{ sha256, size, mtime, remoteSeq, at }`
+ *   - `base/<mirror>/<key>` → `{ sha256, size, mtime, remoteSeq, docId, version, at }`
  *   - `cursor/<mirror>`     → hub change-feed seq reconciled up to
  *   - `skip/<mirror>/<key>` → `{ reason, ts }` (keys the mirror refuses)
  *   - `state/<mirror>`      → free-form engine state (instanceId, head, …)
  *
- * Keys and digests are the identity; hub document ids are never stored.
+ * Keys and digests are the identity for reconciliation. `docId`/`version`
+ * (the hub document behind the key and its row version, when the hub told
+ * us) are protection evidence only — what this replica reports as applied —
+ * never an input to the three-way decision.
  */
 export default class Ledger {
     #db;
@@ -41,9 +44,10 @@ export default class Ledger {
 
     getBase(key) { return this.#db.get(this.#k('base', key)) || null; }
 
-    setBase(key, { sha256, size = null, mtime = null, remoteSeq = 0 } = {}) {
+    setBase(key, { sha256, size = null, mtime = null, remoteSeq = 0, docId = null, version = null } = {}) {
         if (!sha256) throw new Error(`Ledger.setBase(${key}): sha256 required`);
-        const base = { sha256: String(sha256).toLowerCase(), size, mtime, remoteSeq: Number(remoteSeq) || 0, at: Date.now() };
+        const int = (v) => (Number.isInteger(Number(v)) && Number(v) > 0 ? Number(v) : null);
+        const base = { sha256: String(sha256).toLowerCase(), size, mtime, remoteSeq: Number(remoteSeq) || 0, docId: int(docId), version: int(version), at: Date.now() };
         this.#db.putSync(this.#k('base', key), base);
         debug(`base ${key} = ${base.sha256.slice(0, 12)} (seq ${base.remoteSeq})`);
         return base;

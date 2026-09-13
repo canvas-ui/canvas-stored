@@ -54,6 +54,7 @@ const num = (v, fallback = null) => {
     const n = Number(v);
     return Number.isFinite(n) ? n : fallback;
 };
+const intOrNull = (v) => { if (v == null || v === '') return null; const n = Number(v); return Number.isInteger(n) && n > 0 ? n : null; };
 const parseMs = (v) => {
     if (v == null || v === '') return null;
     if (typeof v === 'number') return Number.isFinite(v) ? v : null;
@@ -96,7 +97,9 @@ export default class CanvasBackend extends StorageBackend {
     #requestTimeoutMs;
     #minUploadBytesPerSec;
 
-    // key → row { key, size, modified, mimeType, checksums:{sha256}, dev, ino, docId }
+    // key → row { key, size, modified, mimeType, checksums:{sha256}, dev, ino, docId, version }
+    // (docId/version = the hub document behind the key and its row version —
+    // the pair a replica records as "I hold the current version").
     #files = new Map();
     #cursor = null;
     #head = 0;
@@ -275,7 +278,7 @@ export default class CanvasBackend extends StorageBackend {
     // Rows
     // ─────────────────────────────────────────────────────────────────────────
 
-    #row(key, { sha256, size, mtime, mimeType = null, docId = null }) {
+    #row(key, { sha256, size, mtime, mimeType = null, docId = null, version = null }) {
         const sha = lower(sha256);
         return {
             key,
@@ -285,8 +288,15 @@ export default class CanvasBackend extends StorageBackend {
             checksums: sha ? { sha256: sha } : null,
             dev: this.dev,
             ino: sha,
-            docId: docId ?? null,
+            docId: intOrNull(docId),
+            version: intOrNull(version),
         };
+    }
+
+    /** `{ docId, version }` the hub last reported for `key` (null when unknown). */
+    describe(key) {
+        const row = this.#files.get(normalizeKey(key));
+        return row ? { docId: row.docId ?? null, version: row.version ?? null } : null;
     }
 
     #rowFromHeaders(key, headers) {
@@ -298,6 +308,7 @@ export default class CanvasBackend extends StorageBackend {
             mtime: headers.get('x-canvas-mtime') || headers.get('last-modified'),
             mimeType: headers.get('content-type'),
             docId: headers.get('x-canvas-doc-id'),
+            version: headers.get('x-canvas-version'),
         });
     }
 
@@ -477,12 +488,13 @@ export default class CanvasBackend extends StorageBackend {
             size: num(payload?.size, size ?? 0),
             mtime: parseMs(payload?.mtime) ?? (options.mtime != null ? Number(options.mtime) : null),
             seq: num(payload?.seq, 0),
-            docId: payload?.docId ?? null,
+            docId: intOrNull(payload?.docId),
+            version: intOrNull(payload?.version),
             unchanged: payload?.unchanged === true,
             previous: payload?.previous || null,
             created: status === 201,
         };
-        this.#files.set(clean, this.#row(clean, { sha256: result.sha256, size: result.size, mtime: result.mtime, mimeType: options.mimeType, docId: result.docId }));
+        this.#files.set(clean, this.#row(clean, { sha256: result.sha256, size: result.size, mtime: result.mtime, mimeType: options.mimeType, docId: result.docId, version: result.version }));
         if (result.seq) this.#head = Math.max(this.#head, result.seq);
         debug(`PUT ${clean} (${result.size} bytes, seq ${result.seq}${result.unchanged ? ', unchanged' : ''})`);
         return result;
@@ -538,11 +550,13 @@ export default class CanvasBackend extends StorageBackend {
         }, { key: fromKey });
         const row = this.#files.get(fromKey);
         this.#files.delete(fromKey);
-        if (row) this.#files.set(toKey, { ...row, key: toKey });
+        const docId = intOrNull(payload?.docId) ?? row?.docId ?? null;
+        const version = intOrNull(payload?.version) ?? null;
+        if (row) this.#files.set(toKey, { ...row, key: toKey, docId, version: version ?? row.version ?? null });
         const seq = num(payload?.seq, 0);
         if (seq) this.#head = Math.max(this.#head, seq);
         debug(`RENAME ${fromKey} -> ${toKey} (seq ${seq})`);
-        return { from: fromKey, to: toKey, sha256: lower(payload?.sha256) || row?.checksums?.sha256 || null, seq, docId: payload?.docId ?? null, size: row?.size ?? null, modified: row?.modified ?? null };
+        return { from: fromKey, to: toKey, sha256: lower(payload?.sha256) || row?.checksums?.sha256 || null, seq, docId, version, size: row?.size ?? null, modified: row?.modified ?? null };
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -565,6 +579,8 @@ export default class CanvasBackend extends StorageBackend {
             size: num(c.size, 0),
             mtime: parseMs(c.mtime),
             origin: c.origin ?? null,
+            docId: intOrNull(c.docId),
+            version: intOrNull(c.version),
         }));
         const head = num(payload?.head, 0);
         this.#head = Math.max(this.#head, head);
@@ -626,7 +642,7 @@ export default class CanvasBackend extends StorageBackend {
         if (change.op === 'rename' && change.from) {
             const prev = this.#files.get(change.from) || null;
             this.#files.delete(change.from);
-            const row = this.#row(key, { sha256: change.sha256 || prev?.checksums?.sha256, size: change.size ?? prev?.size, mtime: change.mtime ?? prev?.modified, mimeType: prev?.mimeType });
+            const row = this.#row(key, { sha256: change.sha256 || prev?.checksums?.sha256, size: change.size ?? prev?.size, mtime: change.mtime ?? prev?.modified, mimeType: prev?.mimeType, docId: change.docId ?? prev?.docId, version: change.version ?? prev?.version });
             if (this.#inScope(key)) this.#files.set(key, row);
             if (own) return;
             // unlink(from) + add(to) sharing ino = sha256: Stored pairs them.
@@ -644,7 +660,7 @@ export default class CanvasBackend extends StorageBackend {
         }
         if (change.op === 'put') {
             const prev = this.#files.get(key) || null;
-            const row = this.#row(key, { sha256: change.sha256, size: change.size, mtime: change.mtime, mimeType: prev?.mimeType });
+            const row = this.#row(key, { sha256: change.sha256, size: change.size, mtime: change.mtime, mimeType: prev?.mimeType, docId: change.docId, version: change.version });
             this.#files.set(key, row);
             if (own || !row.checksums) return;
             if (prev?.checksums?.sha256 === row.checksums.sha256) return;

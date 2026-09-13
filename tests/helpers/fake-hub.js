@@ -49,6 +49,11 @@ export async function createFakeHub({ root, token = 'device-token', instanceId =
     let docSeq = 1000;
     const docIds = new Map();   // sha256 → docId (recycled-ish, never to be trusted by clients)
     const docIdFor = (sha) => { if (!docIds.has(sha)) docIds.set(sha, ++docSeq); return docIds.get(sha); };
+    // Row version per document (synapsd 3.20+ semantics: 1 on first write, +1
+    // on every hub-side row write — here: every PUT/rename that lands on it).
+    const versions = new Map();  // docId → version
+    const versionOf = (docId) => versions.get(docId) ?? (versions.set(docId, 1), 1);
+    const touch = (docId) => { const v = (versions.get(docId) ?? 0) + 1; versions.set(docId, v); return v; };
 
     const hub = {
         url: null,
@@ -73,6 +78,9 @@ export async function createFakeHub({ root, token = 'device-token', instanceId =
         listKeys() { return stored.listObjects(backend, { limit: 100000 }).objects.map((o) => o.key); },
         puts(key = null) { return hub.calls.filter((c) => c.method === 'PUT' && (!key || c.key === key)); },
     };
+    hub.versionOf = (key) => { const sha = stored.index.get(`${backend}:${key}`)?.checksums?.sha256; return sha ? versionOf(docIdFor(sha)) : null; };
+    hub.docIdOf = (key) => { const sha = stored.index.get(`${backend}:${key}`)?.checksums?.sha256; return sha ? docIdFor(sha) : null; };
+    hub.touch = (key) => touch(hub.docIdOf(key));
 
     const send = (res, statusCode, body, headers = {}) => {
         const json = JSON.stringify(body);
@@ -95,6 +103,7 @@ export async function createFakeHub({ root, token = 'device-token', instanceId =
         'X-Canvas-Size': String(loc?.size ?? meta.size ?? 0),
         'X-Canvas-Mtime': loc?.mtime != null ? String(loc.mtime) : '',
         'X-Canvas-Doc-Id': String(docIdFor(meta.checksums.sha256)),
+        'X-Canvas-Version': String(versionOf(docIdFor(meta.checksums.sha256))),
         ...(loc?.mtime != null ? { 'Last-Modified': new Date(loc.mtime).toUTCString() } : {}),
         'Accept-Ranges': 'bytes',
         'Content-Type': meta.mimeType || 'application/octet-stream',
@@ -137,13 +146,17 @@ export async function createFakeHub({ root, token = 'device-token', instanceId =
             const limit = Math.min(1000, Number.parseInt(url.searchParams.get('limit') || '1000', 10) || 1000);
             const page = stored.changes({ backend, since, limit });
             if (page.cursorTooOld) return done(410, envelope(410, { since, head: page.head, oldest: page.oldest }, { message: 'Cursor too old', code: 'CURSOR_TOO_OLD' }));
-            const changes = page.changes.map((c) => ({ seq: c.seq, ts: c.ts, op: c.op, key: c.key, ...(c.from ? { from: c.from } : {}), sha256: c.id?.startsWith('sha256:') ? c.id.slice(7) : null, size: c.size, mtime: c.mtime, ...(c.origin ? { origin: c.origin } : {}) }));
+            const changes = page.changes.map((c) => {
+                const sha256 = c.id?.startsWith('sha256:') ? c.id.slice(7) : null;
+                const docId = sha256 ? docIdFor(sha256) : null;
+                return { seq: c.seq, ts: c.ts, op: c.op, key: c.key, ...(c.from ? { from: c.from } : {}), sha256, size: c.size, mtime: c.mtime, ...(c.origin ? { origin: c.origin } : {}), docId, version: docId ? versionOf(docId) : null };
+            });
             return done(200, envelope(200, { changes, head: page.head, oldest: page.oldest, cursor: page.cursor }, { count: changes.length }));
         }
 
         if (tail == null && req.method === 'GET') {
             const page = stored.listObjects(backend, { prefix: url.searchParams.get('prefix') || '', after: url.searchParams.get('cursor') || null, limit: Math.min(1000, Number(url.searchParams.get('limit')) || 1000) });
-            const objects = page.objects.map((o) => ({ key: o.key, sha256: o.checksums?.sha256 ?? null, size: o.size, mtime: o.mtime, mimeType: o.mimeType }));
+            const objects = page.objects.map((o) => { const sha = o.checksums?.sha256 ?? null; const docId = sha ? docIdFor(sha) : null; return { key: o.key, sha256: sha, size: o.size, mtime: o.mtime, mimeType: o.mimeType, docId, version: docId ? versionOf(docId) : null }; });
             return done(200, envelope(200, { objects, cursor: page.cursor, head: stored.head() }, { count: objects.length }));
         }
 
@@ -151,7 +164,7 @@ export async function createFakeHub({ root, token = 'device-token', instanceId =
             const body = JSON.parse((await readAll(req)).toString() || '{}');
             const result = await stored.renameObject(backend, body.from, body.to, { ifMatch: strip(body.ifMatch), origin: strip(body.origin) ?? strip(req.headers['x-canvas-origin']) });
             if (!result.ok) { record.status = REASON_STATUS[result.reason]?.[0] ?? 500; return fail(res, result); }
-            return done(200, envelope(200, { from: result.from, to: result.to, sha256: result.sha256, seq: result.seq, docId: docIdFor(result.sha256) }, { message: 'Object renamed' }));
+            return done(200, envelope(200, { from: result.from, to: result.to, sha256: result.sha256, seq: result.seq, docId: docIdFor(result.sha256), version: touch(docIdFor(result.sha256)) }, { message: 'Object renamed' }));
         }
 
         const key = tail;
@@ -188,7 +201,7 @@ export async function createFakeHub({ root, token = 'device-token', instanceId =
         if (req.method === 'DELETE') {
             const result = await stored.removeObject(backend, key, { ifMatch: strip(req.headers['if-match']), origin: strip(req.headers['x-canvas-origin']) });
             if (!result.ok) { record.status = REASON_STATUS[result.reason]?.[0] ?? 500; return fail(res, result); }
-            return done(200, envelope(200, { key, sha256: result.sha256, seq: result.seq, docId: docIdFor(result.sha256) }, { message: 'Object deleted' }));
+            return done(200, envelope(200, { key, sha256: result.sha256, seq: result.seq, docId: docIdFor(result.sha256), version: versionOf(docIdFor(result.sha256)) }, { message: 'Object deleted' }));
         }
 
         if (req.method === 'PUT') {
@@ -221,7 +234,9 @@ export async function createFakeHub({ root, token = 'device-token', instanceId =
                 mimeType: contentType && contentType !== 'application/octet-stream' ? contentType.split(';')[0].trim() : undefined,
             });
             if (!result.ok) { record.status = REASON_STATUS[result.reason]?.[0] ?? 500; return fail(res, result); }
-            const payload = { key, sha256: result.sha256, size: result.size, mtime: result.mtime ?? null, seq: result.seq, docId: docIdFor(result.sha256), previous: result.previous ? { sha256: result.previous.checksums?.sha256 ?? null } : null, unchanged: result.unchanged === true };
+            const docId = docIdFor(result.sha256);
+            const version = result.unchanged ? versionOf(docId) : touch(docId);
+            const payload = { key, sha256: result.sha256, size: result.size, mtime: result.mtime ?? null, seq: result.seq, docId, version, previous: result.previous ? { sha256: result.previous.checksums?.sha256 ?? null } : null, unchanged: result.unchanged === true };
             const created = !result.unchanged && !result.previous;
             return done(created ? 201 : 200, envelope(created ? 201 : 200, payload, { message: created ? 'Object created' : (result.unchanged ? 'Object unchanged' : 'Object replaced') }), { ETag: `"${result.sha256}"` });
         }

@@ -11,6 +11,7 @@ const DEFAULTS = {
     ignore: [],
     deletes: 'propagate',
     conflictMode: 'prompt',
+    direction: 'bi',
     debounceMs: 1500,
     fullReconcileEvery: 6 * 60 * 60_000,
     concurrency: 4,
@@ -57,8 +58,24 @@ export function decide(L, B, R) {
  * as for any other transfer. Base is written only after the byte operation
  * succeeded; the feed cursor only after a whole batch reconciled.
  *
+ * `direction` (rclone vocabulary) narrows the table AFTER it decided:
+ *   - `bi`   both ways (default);
+ *   - `pull` the hub is the only writer — a local edit of a tracked file is
+ *            preserved in the conflicts folder and the hub's bytes put back
+ *            (`revert`), a local delete pulls the hub copy back, a local-only
+ *            file is left alone and reported as a skip; nothing is ever sent
+ *            upstream (a backup target);
+ *   - `push` local is the only writer — hub-side additions/edits are reported
+ *            as skips and never applied locally (a one-shot import).
+ *
+ * Every base row also records the hub document behind the key and its row
+ * version when the hub told us (`docId`/`version`): `takeApplied()` hands the
+ * pairs agreed since the last call to the status reporter, `appliedSnapshot()`
+ * lists them all. That is what "this replica holds the current version" is
+ * computed from on the hub.
+ *
  * Events: `status` (snapshot), `job:start|done|failed` (job), `conflict`,
- * `skip`, `offline`, `online`, `error`.
+ * `revert`, `skip`, `offline`, `online`, `error`.
  */
 export default class Mirror extends EventEmitter {
     #stored;
@@ -79,6 +96,8 @@ export default class Mirror extends EventEmitter {
     #lastSyncAt = null;
     #lastError = null;
     #conflicts = 0;
+    #reverted = 0;
+    #applied = new Map();      // docId → version agreed since the last takeApplied()
     #stopping = false;
     #started = false;
     #unbind = [];
@@ -96,6 +115,7 @@ export default class Mirror extends EventEmitter {
         // ('prompt' = inbox upload, 'rename' = Dropbox-style copy on the hub).
         if (!['prompt', 'rename'].includes(opts.conflictMode)) opts.conflictMode = 'prompt';
         if (!['propagate', 'keep'].includes(opts.deletes)) opts.deletes = 'propagate';
+        if (!['bi', 'pull', 'push'].includes(opts.direction)) opts.direction = 'bi';
         this.#stored = stored;
         this.#opts = opts;
         this.#ignorePatterns = [...MIRROR_IGNORE_DEFAULTS, ...(opts.ignore || [])];
@@ -103,8 +123,9 @@ export default class Mirror extends EventEmitter {
         this.#queue = new JobQueue({ index: stored.index });
         const st = this.#ledger.getState();
         this.#conflicts = Number(st.conflicts) || 0;
+        this.#reverted = Number(st.reverted) || 0;
         this.#lastSyncAt = st.lastSyncAt ?? null;
-        debug(`Mirror ${opts.id}: ${opts.local} ⇄ ${opts.remote} (trash ${opts.trash}, conflicts ${opts.conflicts}, ${opts.conflictMode}, deletes ${opts.deletes})`);
+        debug(`Mirror ${opts.id}: ${opts.local} ⇄ ${opts.remote} (${opts.direction}, trash ${opts.trash}, conflicts ${opts.conflicts}, ${opts.conflictMode}, deletes ${opts.deletes})`);
     }
 
     get id() { return this.#opts.id; }
@@ -114,6 +135,37 @@ export default class Mirror extends EventEmitter {
     get options() { return { ...this.#opts }; }
     get deviceId() { return this.#opts.deviceId || this.#remote?.deviceId || null; }
     get deviceName() { return this.#opts.deviceName || this.#remote?.deviceName || this.deviceId || 'device'; }
+    get direction() { return this.#opts.direction; }
+
+    /** `[[docId, version], …]` agreed since the last call (cleared). Merge it back with `restoreApplied` when a report fails. */
+    takeApplied() {
+        const out = [...this.#applied.entries()];
+        this.#applied.clear();
+        return out;
+    }
+
+    restoreApplied(pairs = []) {
+        for (const [docId, version] of pairs) {
+            if (!(this.#applied.get(docId) > version)) this.#applied.set(docId, version);
+        }
+    }
+
+    /** Every (docId, version) this replica currently holds, from the ledger. */
+    appliedSnapshot() {
+        const best = new Map();
+        for (const [, base] of this.#ledger.bases()) {
+            if (!base?.docId || !base?.version) continue;
+            if (!(best.get(base.docId) > base.version)) best.set(base.docId, base.version);
+        }
+        return [...best.entries()];
+    }
+
+    // Base write + protection bookkeeping in one place.
+    #agree(key, base) {
+        const row = this.#ledger.setBase(key, base);
+        if (row.docId && row.version) this.#applied.set(row.docId, row.version);
+        return row;
+    }
 
     get #remote() { return this.#stored.getBackend(this.#opts.remote); }
     get #local() { return this.#stored.getBackend(this.#opts.local); }
@@ -164,7 +216,7 @@ export default class Mirror extends EventEmitter {
         if (this.#drainLoop) await this.#drainLoop.catch(() => {});
         await Promise.allSettled([...this.#running.values()]);
         if (this.#reconcilePass) await this.#reconcilePass.catch(() => {});
-        this.#ledger.setState({ lastSyncAt: this.#lastSyncAt, conflicts: this.#conflicts });
+        this.#ledger.setState({ lastSyncAt: this.#lastSyncAt, conflicts: this.#conflicts, reverted: this.#reverted });
         this.#started = false;
         this.#setState('stopped');
     }
@@ -221,6 +273,7 @@ export default class Mirror extends EventEmitter {
         const skips = [...this.#ledger.skips()];
         return {
             id: this.#opts.id,
+            direction: this.#opts.direction,
             state: this.#state,
             cursor: this.#ledger.cursor,
             head: this.#remote?.head ?? null,
@@ -228,6 +281,7 @@ export default class Mirror extends EventEmitter {
             running: counters.running,
             failed: counters.failed,
             conflicts: this.#conflicts,
+            reverted: this.#reverted,
             lastSyncAt: this.#lastSyncAt,
             lastError: this.#lastError,
             skipped: skips.length,
@@ -407,12 +461,16 @@ export default class Mirror extends EventEmitter {
         if (!key || !this.#inScope(key)) return null;
         const invalid = validateKey(key);
         if (invalid) { this.#skip(key, invalid); return null; }
-        if (this.#ledger.isSkipped(key)) this.#ledger.unskip(key);
         const { L, B, R, Lloc, Rloc, base } = this.#local3(key);
-        const d = decide(L, B, R);
-        debug(`reconcile ${key}: L=${L?.slice(0, 8) ?? '∅'} B=${B?.slice(0, 8) ?? '∅'} R=${R?.slice(0, 8) ?? '∅'} → ${d.action}`);
+        const d = this.#direct(decide(L, B, R), { L, B, R });
+        debug(`reconcile ${key}: L=${L?.slice(0, 8) ?? '∅'} B=${B?.slice(0, 8) ?? '∅'} R=${R?.slice(0, 8) ?? '∅'} → ${d.action}${d.reason ? ` (${d.reason})` : ''}`);
+        if (d.action === 'skip') { this.#queue.cancelByKey(key, this.#opts.id); this.#skip(key, d.reason); return d; }
+        if (this.#ledger.isSkipped(key)) this.#ledger.unskip(key);
         switch (d.action) {
             case 'nothing':
+                return d;
+            case 'revert':
+                this.#enqueue('revert', key, { local: L, base: B, remote: R });
                 return d;
             case 'push':
                 if (!d.ifMatch && base) this.#ledger.removeBase(key);   // hub deleted it: the base is void
@@ -430,7 +488,7 @@ export default class Mirror extends EventEmitter {
                 return d;
             case 'adopt':
                 this.#queue.cancelByKey(key, this.#opts.id);
-                if (L) this.#ledger.setBase(key, { sha256: L, size: Lloc?.size ?? Rloc?.size ?? null, mtime: Rloc?.mtime ?? Lloc?.mtime ?? null, remoteSeq: this.#remote?.head ?? 0 });
+                if (L) this.#agree(key, { sha256: L, size: Lloc?.size ?? Rloc?.size ?? null, mtime: Rloc?.mtime ?? Lloc?.mtime ?? null, remoteSeq: this.#remote?.head ?? 0, ...(this.#remote?.describe?.(key) || {}) });
                 else this.#ledger.removeBase(key);
                 return d;
             case 'conflict':
@@ -438,6 +496,26 @@ export default class Mirror extends EventEmitter {
                 return d;
             default:
                 return d;
+        }
+    }
+
+    // Narrow a decision to the mirror's direction (see the class comment).
+    #direct(d, { B, R }) {
+        const dir = this.#opts.direction;
+        if (dir === 'bi') return d;
+        if (dir === 'pull') {
+            switch (d.action) {
+                case 'push':          return R ? { action: 'revert', remote: R } : { action: 'skip', reason: 'local-only' };
+                case 'delete-remote': return R ? { action: 'pull', sha256: R } : { action: 'nothing' };
+                case 'conflict':      return { action: 'revert', remote: R };
+                default:              return d;
+            }
+        }
+        switch (d.action) {   // push
+            case 'pull':        return { action: 'skip', reason: B ? 'remote-changed' : 'remote-only' };
+            case 'trash-local': return { action: 'nothing' };
+            case 'conflict':    return { action: 'skip', reason: 'conflict' };
+            default:            return d;
         }
     }
 
@@ -453,7 +531,7 @@ export default class Mirror extends EventEmitter {
     // the source. A file never pushed is simply pushed under its new name.
     #localRenamed(from, to) {
         const base = this.#ledger.getBase(from);
-        if (!base || this.#ledger.getBase(to) || !this.#inScope(from) || !this.#inScope(to)) {
+        if (this.#opts.direction === 'pull' || !base || this.#ledger.getBase(to) || !this.#inScope(from) || !this.#inScope(to)) {
             this.#markDirty(from);
             this.#markDirty(to);
             return;
@@ -468,7 +546,7 @@ export default class Mirror extends EventEmitter {
     // durable and serialized with the rest); a dirty source stays put.
     #remoteRenamed(from, to) {
         const { L, B } = this.#local3(from);
-        if (L && L === B && !this.#stored.index.get(`${this.#opts.local}:${to}`) && this.#inScope(from) && this.#inScope(to)) {
+        if (this.#opts.direction !== 'push' && L && L === B && !this.#stored.index.get(`${this.#opts.local}:${to}`) && this.#inScope(from) && this.#inScope(to)) {
             this.#queue.append({ kind: 'rename-local', mirror: this.#opts.id, key: to, payload: { from, to }, dedupe: `rename-local|${from}→${to}` });
             this.#kick();
             return;
@@ -559,6 +637,7 @@ export default class Mirror extends EventEmitter {
             case 'rename-remote': return this.#runRenameRemote(job);
             case 'rename-local': return this.#runRenameLocal(job);
             case 'conflict': return this.#runConflict(job);
+            case 'revert': return this.#runRevert(job);
             default: throw Object.assign(new Error(`unknown job kind ${job.kind}`), { code: 'REFUSED' });
         }
     }
@@ -611,7 +690,7 @@ export default class Mirror extends EventEmitter {
         if (res.ok) {
             const seq = res.remote?.seq ?? this.#remote.head ?? 0;
             const mtime = res.remote?.mtime ?? Lloc?.mtime ?? null;
-            this.#ledger.setBase(key, { sha256: L, size: Lloc?.size ?? Lmeta.size ?? null, mtime, remoteSeq: seq });
+            this.#agree(key, { sha256: L, size: Lloc?.size ?? Lmeta.size ?? null, mtime, remoteSeq: seq, docId: res.remote?.docId ?? null, version: res.remote?.version ?? null });
             debug(`pushed ${key} (${Lloc?.size ?? '?'} bytes, seq ${seq})`);
             return;
         }
@@ -661,7 +740,7 @@ export default class Mirror extends EventEmitter {
             origin: this.deviceId || undefined,
         });
         if (res.ok) {
-            this.#ledger.setBase(key, { sha256: R, size: Rloc?.size ?? Rmeta.size ?? null, mtime: Rloc?.mtime ?? null, remoteSeq: this.#remote.head ?? 0 });
+            this.#agree(key, { sha256: R, size: Rloc?.size ?? Rmeta.size ?? null, mtime: Rloc?.mtime ?? null, remoteSeq: this.#remote.head ?? 0, ...(this.#remote.describe?.(key) || {}) });
             debug(`pulled ${key} (${Rloc?.size ?? '?'} bytes)${Lloc ? ' over local' : ''}`);
             return;
         }
@@ -727,7 +806,7 @@ export default class Mirror extends EventEmitter {
             res = { ok: false, reason: err.code === 'PRECONDITION_FAILED' ? 'precondition-failed' : (err.code === 'NOT_FOUND' ? 'not-found' : (err.code === 'TARGET_EXISTS' ? 'target-exists' : 'transfer-failed')), error: err.message, code: err.code, current: err.current };
         }
         if (res.ok) {
-            this.#ledger.setBase(to, { ...base, remoteSeq: res.seq ?? base.remoteSeq });
+            this.#agree(to, { ...base, remoteSeq: res.seq ?? base.remoteSeq, docId: res.docId ?? base.docId ?? null, version: res.version ?? null });
             debug(`renamed ${from} → ${to} on the hub`);
             return;
         }
@@ -764,7 +843,8 @@ export default class Mirror extends EventEmitter {
             origin: this.deviceId || undefined,
         });
         if (res.ok) {
-            this.#ledger.moveBase(from, to, { remoteSeq: this.#remote.head ?? 0 });
+            const moved = this.#ledger.moveBase(from, to, { remoteSeq: this.#remote.head ?? 0, ...(this.#remote.describe?.(to) || {}) });
+            if (moved?.docId && moved?.version) this.#applied.set(moved.docId, moved.version);
             debug(`renamed ${from} → ${to} locally (hub rename)`);
             return;
         }
@@ -822,12 +902,41 @@ export default class Mirror extends EventEmitter {
             to: this.#opts.local, key, from: this.#opts.remote, onConflict: 'overwrite', mtime: Rloc?.mtime ?? undefined, origin: this.deviceId || undefined,
         });
         if (!pulled.ok) throw this.#failure(pulled, key);
-        this.#ledger.setBase(key, { sha256: R, size: Rloc?.size ?? null, mtime: Rloc?.mtime ?? null, remoteSeq: this.#remote.head ?? 0 });
+        this.#agree(key, { sha256: R, size: Rloc?.size ?? null, mtime: Rloc?.mtime ?? null, remoteSeq: this.#remote.head ?? 0, ...(this.#remote.describe?.(key) || {}) });
         this.#conflicts += 1;
         this.#ledger.setState({ conflicts: this.#conflicts });
         const event = { key, mode, local: L, base: B, remote: R, copy: kept.added?.[0] ?? `stored://${this.#opts.conflicts}/${copyKey}`, conflictKey: mode === 'rename' ? copyKey : null, upload, at: now.getTime() };
         debug(`conflict ${key}: kept ${copyKey}, uploaded (${mode}), hub version in place`);
         this.emit('conflict', event);
+    }
+
+    // `pull` direction: a tracked file was edited here. Keep the edit next to
+    // the folder (conflicts backend, conflict-copy name), put the hub's bytes
+    // back and agree on them. Nothing goes upstream.
+    async #runRevert(job) {
+        const key = job.key;
+        const { L, B, Lloc } = this.#local3(key);
+        if (!L) { this.#markDirty(key); return; }
+        const Rmeta = await this.#freshRemote(key, job.payload?.remote ?? null);
+        const R = Rmeta?.checksums?.sha256 ?? null;
+        if (!R || R === L) { this.#reconcileKey(key); return; }    // hub gone → local-only skip; equal → adopt
+        const now = new Date();
+        const copyKey = conflictKey(key, this.deviceName, now);
+        const kept = await this.#stored.copy(`${this.#opts.local}:${key}`, {
+            to: this.#opts.conflicts, key: copyKey, from: this.#opts.local, onConflict: 'rename', mtime: Lloc?.mtime ?? undefined,
+        });
+        if (!kept.ok && kept.reason !== 'unchanged') throw this.#failure(kept, copyKey);
+        const Rloc = Rmeta.locations.find((x) => x.backend === this.#opts.remote && x.key === key) || null;
+        const pulled = await this.#stored.copy(`${this.#opts.remote}:${key}`, {
+            to: this.#opts.local, key, from: this.#opts.remote, onConflict: 'overwrite', mtime: Rloc?.mtime ?? undefined, origin: this.deviceId || undefined,
+        });
+        if (!pulled.ok) throw this.#failure(pulled, key);
+        this.#agree(key, { sha256: R, size: Rloc?.size ?? null, mtime: Rloc?.mtime ?? null, remoteSeq: this.#remote.head ?? 0, ...(this.#remote.describe?.(key) || {}) });
+        this.#reverted += 1;
+        this.#ledger.setState({ reverted: this.#reverted });
+        const event = { key, local: L, base: B, remote: R, copy: kept.added?.[0] ?? `stored://${this.#opts.conflicts}/${copyKey}`, at: now.getTime() };
+        debug(`revert ${key}: local edit kept as ${copyKey}, hub version back in place`);
+        this.emit('revert', event);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
