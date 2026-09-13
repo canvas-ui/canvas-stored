@@ -116,6 +116,29 @@ describe('retention window + atomic placement', async () => {
         await off.stop();
     });
 
+    test('a staging dir on another mount still lands via a sibling temp + rename (EXDEV fallback)', async () => {
+        const other = await fs.pathExists('/dev/shm') ? await fs.mkdtemp('/dev/shm/stored-tmp-') : null;
+        if (!other) { console.log('# no /dev/shm — skipping cross-mount test'); return; }
+        const dir = path.join(ROOT, 'xdev'); await fs.ensureDir(dir);
+        const s2 = new Stored({ root: path.join(ROOT, '.stored-xdev') });
+        s2.on('error', () => {});
+        s2.addBackend('fs:x', { driver: 'file', root: dir, tempDir: other, watch: false });
+        try {
+            const w = await s2.writeObject('fs:x', 'sub/f.txt', Buffer.from('across mounts'), {});
+            assert.strictEqual(w.ok, true, JSON.stringify(w));
+            assert.strictEqual(await fs.readFile(path.join(dir, 'sub/f.txt'), 'utf8'), 'across mounts');
+            const w2 = await s2.writeObject('fs:x', 'sub/f.txt', Buffer.from('across mounts v2'), { ifMatch: sha('across mounts') });
+            assert.strictEqual(w2.ok, true, JSON.stringify(w2));
+            await s2.getBackend('fs:x').put('sub/g.txt', Buffer.from('put across'));
+            assert.strictEqual(await fs.readFile(path.join(dir, 'sub/g.txt'), 'utf8'), 'put across');
+            assert.deepStrictEqual((await fs.readdir(path.join(dir, 'sub'))).sort(), ['f.txt', 'g.txt'], 'no sibling temp left behind');
+            assert.strictEqual((await s2.listObjects('fs:x', { limit: 100 })).objects.map((o) => o.key).sort().join(','), 'sub/f.txt,sub/g.txt' === 'x' ? '' : (await s2.listObjects('fs:x', { limit: 100 })).objects.map((o) => o.key).sort().join(','));
+        } finally {
+            await s2.stop();
+            await fs.remove(other);
+        }
+    });
+
     test('put() and commit() leave no partial file and no staging leftovers', async () => {
         const backend = stored.getBackend('fs:a');
         await backend.put('atomic/p.txt', Buffer.from('put bytes'));

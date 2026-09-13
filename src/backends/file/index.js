@@ -18,7 +18,9 @@ const debug = Debug('stored:backend:file');
 // (relative to the root, or absolute) relocates it — a mirror keeps all of
 // its state under one hidden directory.
 const TMP_DIR = '.stored-tmp';
-const TMP_IGNORE = /(^|[/\\])\.stored-tmp([/\\]|$)/;
+// The staging dir, and the `.stored-tmp-<rand>` siblings placement falls back
+// to when the staging dir is on another mount (see #finish).
+const TMP_IGNORE = /(^|[/\\])\.stored-tmp(-[^/\\]*)?([/\\]|$)/;
 
 export default class FileBackend extends StorageBackend {
     #root;
@@ -224,6 +226,29 @@ export default class FileBackend extends StorageBackend {
     // file, and a crash mid-write leaves only a staging file behind. This is
     // also what makes hardlink-based retention safe (see retain()): the old
     // inode is never written to in place, it is displaced.
+    //
+    // The staging dir normally shares the destination's filesystem, but a
+    // configured `tempDir` can sit on another mount (a container's /state next
+    // to /data; bind mounts of one disk still refuse rename across them). Then
+    // the bytes take one more hop: a `.stored-tmp-<rand>` sibling of the
+    // destination — same directory, same mount by construction — and the
+    // rename from there. Siblings are ignored by the watcher/scan like the dir.
+    async #finish(tmp, dest) {
+        try {
+            await fs.rename(tmp, dest);
+            return;
+        } catch (err) {
+            if (err.code !== 'EXDEV') throw err;
+        }
+        const sibling = path.join(path.dirname(dest), `${TMP_DIR}-${process.pid}-${Math.random().toString(16).slice(2)}`);
+        try {
+            await fs.copyFile(tmp, sibling);
+            await fs.rename(sibling, dest);
+        } finally {
+            await fs.remove(sibling).catch(() => {});
+        }
+    }
+
     async put(key, data) {
         const filePath = this.#resolvePath(key);
         await fs.ensureDir(path.dirname(filePath));
@@ -231,7 +256,7 @@ export default class FileBackend extends StorageBackend {
         try {
             const fh = await fsp.open(tmp, 'w');
             try { await fh.writeFile(data); await fh.sync(); } finally { await fh.close(); }
-            await fs.rename(tmp, filePath);
+            await this.#finish(tmp, filePath);
         } finally {
             await fs.remove(tmp).catch(() => {});
         }
@@ -254,7 +279,7 @@ export default class FileBackend extends StorageBackend {
                 if (!['EXDEV', 'EPERM', 'EMLINK', 'ENOTSUP', 'EOPNOTSUPP'].includes(err.code)) throw err;
                 await fs.copyFile(srcPath, tmp);
             }
-            await fs.rename(tmp, dest);
+            await this.#finish(tmp, dest);
         } finally {
             await fs.remove(tmp).catch(() => {});
         }
