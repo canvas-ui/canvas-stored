@@ -36,6 +36,29 @@ describe('keyed object writes', async () => {
         await fs.remove(ROOT);
     });
 
+    test('create-only uploads preserve unindexed files, directories and symlinks', async () => {
+        await fs.outputFile(path.join(A, 'unindexed.txt'), 'keep these bytes');
+        await fs.ensureDir(path.join(A, 'existing-dir'));
+        await fs.symlink(path.join(A, 'missing-target'), path.join(A, 'dangling'));
+        for (const key of ['unindexed.txt', 'existing-dir', 'dangling']) {
+            const result = await stored.writeObject('fs:a', key, Buffer.from('new upload'), { ifNoneMatch: '*' });
+            assert.strictEqual(result.ok, false);
+            assert.strictEqual(result.reason, 'precondition-failed');
+        }
+        assert.strictEqual(await fs.readFile(path.join(A, 'unindexed.txt'), 'utf8'), 'keep these bytes');
+        assert.ok((await fs.lstat(path.join(A, 'dangling'))).isSymbolicLink());
+    });
+
+    test('concurrent create-only uploads have one winner without overwrites', async () => {
+        const results = await Promise.all(['one', 'two'].map(content =>
+            stored.writeObject('fs:a', 'race.txt', Buffer.from(content), { ifNoneMatch: '*' })));
+        assert.strictEqual(results.filter(result => result.ok).length, 1);
+        assert.strictEqual(results.filter(result => result.reason === 'precondition-failed').length, 1);
+        const content = await fs.readFile(path.join(A, 'race.txt'), 'utf8');
+        const winner = results.findIndex(result => result.ok);
+        assert.strictEqual(content, ['one', 'two'][winner]);
+    });
+
     test('writeObject creates a file, indexes it with its inode, emits one object:add', async () => {
         const adds = collect(stored, 'object:add');
         const result = await stored.writeObject('fs:a', 'w/a.txt', Buffer.from('alpha'), { origin: 'laptop', mtime: 1700000000000 });

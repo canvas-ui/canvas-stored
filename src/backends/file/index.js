@@ -288,6 +288,29 @@ export default class FileBackend extends StorageBackend {
         return { key, size: stats.size };
     }
 
+    // Create-only placement: link(2) fails with EEXIST even for an unindexed
+    // file, directory or dangling symlink. Never use rename-over for this path.
+    async createFrom(key, srcPath) {
+        const dest = this.#resolvePath(key);
+        await fs.ensureDir(path.dirname(dest));
+        try {
+            await fs.link(srcPath, dest);
+        } catch (error) {
+            if (error.code !== 'EXDEV') throw error;
+            // Stage on the destination filesystem, then publish atomically.
+            const sibling = path.join(path.dirname(dest), `${TMP_DIR}-${process.pid}-${Math.random().toString(16).slice(2)}`);
+            try {
+                await fs.copyFile(srcPath, sibling);
+                await fs.link(sibling, dest);
+            } finally {
+                await fs.remove(sibling).catch(() => {});
+            }
+        }
+        const stat = await this.stat(key);
+        if (!stat) throw new Error(`Upload destination disappeared: ${key}`);
+        return stat;
+    }
+
     // ── Retention ─────────────────────────────────────────────────────────
     //
     // Bytes an overwrite or delete is about to displace are kept for a while

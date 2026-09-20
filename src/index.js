@@ -417,7 +417,14 @@ export default class Stored extends EventEmitter2 {
             try {
                 if (current) await this.#retain(backendName, destKey, current);
                 let placed = null;
-                if (typeof backend.renameFrom === 'function') {
+                if (String(options.ifNoneMatch || '').trim() === '*') {
+                    if (typeof backend.createFrom !== 'function') return { ok: false, reason: 'unsupported-backend' };
+                    try { placed = await backend.createFrom(destKey, tempPath); }
+                    catch (error) {
+                        if (error.code === 'EEXIST') return { ok: false, reason: 'precondition-failed', current: null };
+                        throw error;
+                    }
+                } else if (typeof backend.renameFrom === 'function') {
                     try { placed = await backend.renameFrom(destKey, tempPath); }
                     catch (err) { if (err.code !== 'EXDEV') throw err; }
                 }
