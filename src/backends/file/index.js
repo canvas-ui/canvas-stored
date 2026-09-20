@@ -399,8 +399,11 @@ export default class FileBackend extends StorageBackend {
 
     async stat(key) {
         const filePath = this.#resolvePath(key);
-        if (!await fs.pathExists(filePath)) return null;
-        const stats = await fs.stat(filePath);
+        let stats;
+        try { stats = await fs.stat(filePath); } catch (error) {
+            if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return null;
+            throw error;
+        }
         if (!stats.isFile()) return null;
         // dev/ino feed rename matching (same inode at a new path) and the
         // liveness checks — stored keeps them in location metadata.
@@ -413,7 +416,6 @@ export default class FileBackend extends StorageBackend {
     async *list(options = {}) {
         const { prefix = '', recursive = true, onError = null } = options;
         const searchPath = this.#resolvePath(prefix);
-        if (!await fs.pathExists(searchPath)) return;
 
         let entries;
         try {
@@ -426,7 +428,13 @@ export default class FileBackend extends StorageBackend {
             const relativePath = path.join(prefix, entry.name);
             if (this.#isIgnored(relativePath)) continue;
             if (entry.isFile()) {
-                yield { key: relativePath, ...(await this.stat(relativePath)) };
+                try {
+                    const stat = await this.stat(relativePath);
+                    if (stat) yield stat;
+                } catch (error) {
+                    if (typeof onError !== 'function') throw error;
+                    onError(relativePath, error);
+                }
             } else if (entry.isDirectory() && recursive) {
                 yield* this.list({ ...options, prefix: relativePath });
             }

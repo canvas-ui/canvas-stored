@@ -276,6 +276,24 @@ describe('Stored', async () => {
             assert.ok(scanFiles[0].mimeType);
         });
 
+        test('warm scans stream every file without rewriting the index', async () => {
+            await stored.scan('fs:test');
+            const put = stored.index.put;
+            let writes = 0;
+            stored.index.put = function (...args) { writes += 1; return put.apply(this, args); };
+            try {
+                const streamed = [];
+                const result = await stored.scan('fs:test', { onFile: file => streamed.push(file.key) });
+                assert.strictEqual(writes, 0);
+                assert.deepStrictEqual(streamed.sort(), result.files.map(file => file.key).sort());
+                await fs.writeFile(path.join(TEST_DIR, 'scan1.txt'), 'changed contents');
+                await stored.scan('fs:test');
+                assert.ok(writes > 0, 'changed files must still update the index');
+            } finally {
+                stored.index.put = put;
+            }
+        });
+
         test('scanned files are retrievable by id', async () => {
             const { files } = await stored.scan('fs:test');
             const file = files.find(r => r.key === 'scan1.txt');

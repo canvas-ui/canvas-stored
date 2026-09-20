@@ -968,6 +968,11 @@ export default class Stored extends EventEmitter2 {
                 const existing = this.#index.get(id);
                 const locations = existing?.locations || [];
                 const match = locations.find(l => l.backend === file.backend && l.key === file.key);
+                // Avoid LMDB/index/change-feed churn on warm scans. Still emit
+                // the row to consumers: their document index may need repair.
+                if (match && match.synced === true && match.size === file.size && match.mtime === file.modified
+                    && (file.ino == null || (match.ino === file.ino && match.dev === file.dev))
+                    && existing.size === file.size && existing.mimeType === file.mimeType) return;
                 if (match) {
                     match.size = file.size;
                     match.mtime = file.modified;
