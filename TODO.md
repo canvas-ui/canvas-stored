@@ -223,6 +223,58 @@ pull-through cache below.
 
 ---
 
+## P1 — staging cleanup for crashed uploads (priority)
+
+Found 2026-10-07 while pushing a 1.1 GB video through canvas-fuse. An
+object `PUT` (`Stored.writeObject`, `src/index.js:~365`) spools the body
+into a plain temp file, `<backend root>/.stored-tmp/<ts>-<uuid>` (not
+cacache — that is only `workspace:data`), hashes it in one pass, then
+`rename(2)`s it into place. Every failure path (client disconnect, sha256
+mismatch, `If-Match` failure, disk/driver error) removes the temp in a
+`finally`, so a failed upload leaves nothing behind. **A process crash,
+kill or power loss mid-upload does**, and nothing ever sweeps
+`.stored-tmp/`: the hourly `sweepRetained` only prunes `retained/<sha>`,
+`Cache.verify()` targets cacache and has no caller. Stale spools pile up
+with no bound on age or size — at 1 GB a piece that is a disk-full waiting
+to happen.
+
+- [ ] **Sweep `.stored-tmp/` on backend open and on the `sweepRetained`
+      timer.** Delete spool files (`<ts>-<uuid>`, never `retained/`) older
+      than a grace window (default 24 h, `config.tempMaxAgeMs`; a legitimately
+      running upload is a file whose mtime keeps moving, so age by mtime).
+      Same for the driver's `.stored-tmp-<rand>` siblings from the EXDEV
+      copy path (`backends/file/index.js:236-250`). Log a count, emit
+      nothing — this is housekeeping, not an object event.
+- [ ] Honour `backend.tempDir` overrides (the sweep must look where the
+      spool actually goes) and skip the dir entirely when it is not ours
+      (not under the backend root and not configured).
+- [ ] Check preconditions **before** spooling where possible: `If-Match` /
+      `If-None-Match: *` can be evaluated against the current stat up front
+      (`#resolveVersionPrecondition` already has it); only the sha256
+      verification genuinely needs the full body. Today a doomed 1 GB PUT
+      writes all of it to disk before the 412.
+
+### Optional — resumable object uploads
+
+`?sha256=<ref>` on the objects route only dedupes against bytes already
+indexed in `workspace:data` (`statBlobByChecksum`); a `workspace:home` PUT
+never populates it and a failed one leaves nothing a retry can reuse — the
+client resends everything. If large pushes over WAN keep failing midway:
+
+- keep the spool on failure when the client announced `X-Canvas-Sha256`,
+  keyed by that digest (`.stored-tmp/partial/<sha256>`), subject to the same
+  sweep;
+- accept `Content-Range: bytes <from>-` / `X-Canvas-Resume-From` on PUT and
+  append to the matching partial, verifying the digest at the end (mirror of
+  what canvas-fuse already does for downloads with `.canvas-part` + `Range`);
+- `HEAD objects/<key>?sha256=` answers `X-Canvas-Have: <bytes>` so the client
+  knows where to continue.
+
+Only worth it once the cleanup above exists, otherwise partials are one
+more thing that never gets collected.
+
+---
+
 ## P2 — cache policy / pull-through cache for remote objects
 
 cacache has no size cap and no LRU; both are ours to build.
