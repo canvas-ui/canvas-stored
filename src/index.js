@@ -56,6 +56,8 @@ export default class Stored extends EventEmitter2 {
     #retention = null;
     #retainedDb = null;
     #sweepTimer = null;
+    #directoryMovesDb = null;
+    #directoryMoveTasks = new Map();
 
     constructor(config = {}) {
         // Wildcards (':' delimiter) let consumers bind `object:*` across backends.
@@ -682,6 +684,95 @@ export default class Stored extends EventEmitter2 {
             state: result.state,
             seq: this.#index.head(),
         };
+    }
+
+    /** One filesystem rename, then an atomic re-key of indexed locations.
+     * The durable operation receipt makes a lost HTTP response safe to retry.
+     * No object streams, checksums or per-file filesystem moves are needed.
+     */
+    async renameDirectory(backendName, from, to, { operationId, origin = null } = {}) {
+        const backend = this.#backends.get(backendName);
+        if (!backend) return { ok: false, reason: 'unknown-backend' };
+        if (!backend.canWrite) return { ok: false, reason: 'read-only-target' };
+        if (!backend.root || typeof backend.resolveKeyPath !== 'function') return { ok: false, reason: 'unsupported-backend' };
+        const fromKey = this.#normalizeKey(from, { nfc: true });
+        const toKey = this.#normalizeKey(to, { nfc: true });
+        if (!fromKey || !toKey || !this.#isSafeKey(fromKey) || !this.#isSafeKey(toKey)
+            || backend.isIgnored?.(fromKey) || backend.isIgnored?.(toKey)
+            || fromKey === toKey || toKey.startsWith(`${fromKey}/`) || fromKey.startsWith(`${toKey}/`)
+            || typeof operationId !== 'string' || !operationId || operationId.length > 128) {
+            return { ok: false, reason: 'invalid-key' };
+        }
+        const receiptKey = `${backendName}:${operationId}`;
+        const prior = this.#directoryMoveTasks.get(backendName) || Promise.resolve();
+        const task = prior.catch(() => {}).then(async () => {
+            const db = this.#directoryMovesDb ||= this.#index.openDB('directory-moves');
+            let receipt = db.get(receiptKey);
+            if (receipt && (receipt.from !== fromKey || receipt.to !== toKey)) return { ok: false, reason: 'invalid-key' };
+            const result = () => ({ ok: true, directory: true, from: fromKey, to: toKey, state: 'complete', seq: this.#index.head() });
+            if (receipt?.done) return result();
+            const source = backend.resolveKeyPath(fromKey);
+            const target = backend.resolveKeyPath(toKey);
+            const root = await fsp.realpath(backend.root);
+            const contained = (p) => { const rel = path.relative(root, p); return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel)); };
+            const stat = async (p) => { try { return await fsp.lstat(p); } catch (e) { if (e.code === 'ENOENT') return null; throw e; } };
+            const sourceStat = await stat(source);
+            if (!receipt) {
+                if (!sourceStat) return { ok: false, reason: 'not-found' };
+                if (!sourceStat.isDirectory() || !contained(await fsp.realpath(source))) return { ok: false, reason: 'invalid-key' };
+                if (await stat(target)) return { ok: false, reason: 'target-exists' };
+                const rows = this.#index.locationsByBackend(backendName, { prefix: `${fromKey}/`, limit: Number.MAX_SAFE_INTEGER }).objects;
+                if (rows.some(row => backend.isIgnored?.(`${toKey}/${row.key.slice(fromKey.length + 1)}`))) return { ok: false, reason: 'invalid-key' };
+                receipt = { from: fromKey, to: toKey, dev: sourceStat.dev, ino: sourceStat.ino, keys: rows.map(row => row.key) };
+                db.putSync(receiptKey, receipt);
+            }
+            const movedKey = (key) => `${toKey}/${key.slice(fromKey.length + 1)}`;
+            const release = this.#holdKeys(receipt.keys.flatMap(key => [`${backendName}:${key}`, `${backendName}:${movedKey(key)}`]));
+            try {
+                if (sourceStat?.dev === receipt.dev && sourceStat.ino === receipt.ino) {
+                    if (!contained(await fsp.realpath(source))) return { ok: false, reason: 'invalid-key' };
+                    if (await stat(target)) return { ok: false, reason: 'target-exists' };
+                    // Check existing parents before mkdir: a symlink must not create
+                    // directories outside this backend, even if the rename fails.
+                    let parent = path.dirname(target);
+                    while (!await stat(parent)) parent = path.dirname(parent);
+                    if (!contained(await fsp.realpath(parent))) return { ok: false, reason: 'invalid-key' };
+                    await fsp.mkdir(path.dirname(target), { recursive: true });
+                    if (!contained(await fsp.realpath(path.dirname(target)))) return { ok: false, reason: 'invalid-key' };
+                    await fsp.rename(source, target); // EXDEV is an error, never a copy fallback.
+                } else {
+                    // A recreated source may now have different indexed data.
+                    // Leave both trees intact instead of re-keying that data.
+                    if (sourceStat) return { ok: false, reason: 'target-exists' };
+                    const targetStat = await stat(target);
+                    if (targetStat?.dev !== receipt.dev || targetStat.ino !== receipt.ino) return { ok: false, reason: 'target-exists' };
+                }
+                const events = [];
+                this.#index.transaction(() => {
+                    for (const key of receipt.keys) {
+                        const current = this.#index.get(`${backendName}:${key}`);
+                        const old = current?.locations?.find(l => l.backend === backendName && l.key === key);
+                        if (!old) continue;
+                        const nextKey = movedKey(key);
+                        const location = this.#buildLocation(backendName, nextKey, old.synced, { ...old, key: nextKey });
+                        const saved = this.#index.put(current.id, {
+                            ...current,
+                            locations: current.locations.map(l => l === old ? location : l),
+                        }, { origin, rename: { backend: backendName, from: key, to: nextKey } });
+                        events.push({ id: current.id, checksums: saved.checksums,
+                            from: this.#endpoint(old), to: this.#endpoint(location),
+                            location: this.#describeLocation(location),
+                            locations: saved.locations.map(l => this.#describeLocation(l)), origin });
+                    }
+                    db.putSync(receiptKey, { from: fromKey, to: toKey, done: true });
+                });
+                for (const event of events) this.#emitObject('move', event);
+                return result();
+            } finally { release(); }
+        });
+        this.#directoryMoveTasks.set(backendName, task);
+        try { return await task; }
+        finally { if (this.#directoryMoveTasks.get(backendName) === task) this.#directoryMoveTasks.delete(backendName); }
     }
 
     // `If-Match` / `If-None-Match` semantics over the index. Returns the typed

@@ -105,6 +105,17 @@ Speaks `canvas-server/docs/sync-protocol.md`: `stat` = `HEAD`, `get`/`getRange` 
 
 `copy()`/`move()` onto a `canvas` target stream straight to the hub (no temp file, cache or SyncQueue) and forward `ifMatch`/`ifNoneMatch`/`origin`/`mtime`/conflict headers; a `412` comes back as `{ ok:false, reason:'precondition-failed', current }`. A same-backend `move()`/`renameObject()` on the hub is one server-side rename.
 
+`renameDirectory(backend, from, to, { operationId, origin })` moves a complete
+directory on a writable local file backend with one native rename and an
+atomic index update. It preserves content identities and inodes, carries
+empty subdirectories, and does not stream or rehash the files. The destination
+must be absent; cross-filesystem moves fail without copying. Persist the
+unique `operationId` before the first request and reuse it on retry: a durable
+receipt recovers an interrupted index commit or acknowledges an already
+completed move without moving a recreated source. Different directory
+operations on the same backend are serialized; API callers must also
+serialize writes to either subtree (WorkspaceStoredIndex does this).
+
 ---
 
 ## Sync engine (device mirror)
