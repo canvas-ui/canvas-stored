@@ -10,7 +10,7 @@ const DEFAULTS = {
     prefixes: [],
     ignore: [],
     deletes: 'propagate',
-    conflictMode: 'prompt',
+    conflictMode: 'rename',
     direction: 'bi',
     debounceMs: 1500,
     fullReconcileEvery: 6 * 60 * 60_000,
@@ -113,7 +113,7 @@ export default class Mirror extends EventEmitter {
         }
         // `conflicts` names the conflicts backend; the policy is `conflictMode`
         // ('prompt' = inbox upload, 'rename' = Dropbox-style copy on the hub).
-        if (!['prompt', 'rename'].includes(opts.conflictMode)) opts.conflictMode = 'prompt';
+        if (!['prompt', 'rename'].includes(opts.conflictMode)) opts.conflictMode = DEFAULTS.conflictMode;
         if (!['propagate', 'keep'].includes(opts.deletes)) opts.deletes = 'propagate';
         if (!['bi', 'pull', 'push'].includes(opts.direction)) opts.direction = 'bi';
         this.#stored = stored;

@@ -166,6 +166,7 @@ describe('Mirror ⇄ fake hub', { timeout: 120_000 }, () => {
     });
 
     test('offline: both sides edit → inbox upload + conflicts/ copy + hub version in place', async () => {
+        await a.restart({ conflictMode: 'prompt' });
         hub.offline = true;
         await a.write('Docs/moved.txt', 'offline edit on a');
         await waitFor(() => a.mirror.state === 'offline' && a.mirror.queue.byKey('Docs/moved.txt', 'm').some((j) => j.kind === 'push'), { label: 'offline + push queued' });
@@ -204,8 +205,8 @@ describe('Mirror ⇄ fake hub', { timeout: 120_000 }, () => {
         assert.ok(a.mirror.events.states.includes('offline'));
     });
 
-    test('conflictMode rename: device version lands on the hub under the conflict-copy name', async () => {
-        await a.restart({ conflictMode: 'rename' });
+    test('default conflict mode: device version lands on the hub under the conflict-copy name', async () => {
+        await a.restart();
         hub.offline = true;
         await a.write('Docs/moved.txt', 'second offline edit');
         await waitFor(() => a.mirror.state === 'offline' && a.mirror.queue.byKey('Docs/moved.txt', 'm').some((j) => j.kind === 'push'), { label: 'offline + push queued' });

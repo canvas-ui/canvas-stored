@@ -124,7 +124,7 @@ const mirror = new Mirror(stored, {
   prefixes: [],                 // selective sync (prefixes / globs), applied on both sides
   ignore: [],                   // on top of MIRROR_IGNORE_DEFAULTS (+ the hub's exclusions you pass here)
   deletes: 'propagate',         // | 'keep'  — local deletes reach the hub, or only drop the base
-  conflictMode: 'prompt',       // | 'rename' — inbox upload, or Dropbox-style conflict copy on the hub
+  conflictMode: 'rename',       // default: conflict copy on the hub; 'prompt' opts into the inbox
   debounceMs: 1500, fullReconcileEvery: 6 * 3600e3,
 });
 await mirror.start();           // scan local → list/poll hub → reconcile → watch → worker
