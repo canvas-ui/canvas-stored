@@ -1112,7 +1112,11 @@ export default class Stored extends EventEmitter2 {
             const snapshot = Array.isArray(result)
                 ? { files: result, complete: true, errors: null }
                 : (Array.isArray(result?.files) ? result : null);
-            if (!snapshot) continue;
+            if (!snapshot || result?.ok === false) {
+                complete = false;
+                errors = { ...(errors || {}), [backend.name]: { root: 'scan returned no usable snapshot' } };
+                continue;
+            }
 
             if (snapshot.complete === false) complete = false;
             if (snapshot.errors) errors = { ...(errors || {}), [backend.name]: snapshot.errors };
@@ -1127,7 +1131,7 @@ export default class Stored extends EventEmitter2 {
             if (snapshot.errors?.root) continue;
             const presentKeys = new Set(snapshot.files.map(file => file.key));
             const erroredPrefixes = (snapshot.errors?.dirs || []).map(d => d.prefix).filter(Boolean);
-            this.#removeMissingLocations(backend.name, presentKeys, erroredPrefixes);
+            if (snapshot.complete !== false) this.#removeMissingLocations(backend.name, presentKeys, erroredPrefixes);
             files.push(...snapshot.files);
         }
         return { ok: true, backend: backendName ?? null, count: files.length, files, complete, errors };
