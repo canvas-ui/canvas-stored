@@ -165,3 +165,125 @@ test('pending folder deletion recovers after interruption and expiry removes its
     assert.equal((await stored.listTrash('a')).items.length, 0);
     assert.equal(await fs.pathExists(path.join(root, 'a/.stored-tmp/trash', removed.id)), false);
 });
+
+test('discard removes recovery bytes, preserves a new live original and cannot be restored', async t => {
+    const { stored, put, root } = await setup(t);
+    await put('old.txt', 'old'); await stored.removeObject('a', 'old.txt');
+    const [item] = (await stored.listTrash('a')).items;
+    await put('old.txt', 'new work');
+    assert.equal((await stored.discardTrash('b', item.id)).reason, 'not-found');
+    assert.equal((await stored.discardTrash('a', item.id)).ok, true);
+    assert.equal((await stored.discardTrash('a', item.id)).alreadyDeleted, true);
+    assert.equal(await fs.pathExists(stored.getBackend('a').retainedPath(item.sha256)), false);
+    assert.equal(stored.getRetained(item.sha256), null);
+    assert.equal((await stored.listTrash('a')).items.length, 0);
+    assert.equal((await stored.restoreTrash('a', item.id)).reason, 'not-found');
+    assert.equal(await fs.readFile(path.join(root, 'a/old.txt'), 'utf8'), 'new work');
+});
+
+test('discard keeps shared bytes until the final item is deleted, including other backends', async t => {
+    const { stored, put } = await setup(t);
+    for (const backend of ['a', 'b']) {
+        await put('shared.txt', 'shared', backend); await stored.removeObject(backend, 'shared.txt');
+    }
+    const [a] = (await stored.listTrash('a')).items;
+    const [b] = (await stored.listTrash('b')).items;
+    await stored.discardTrash('a', a.id);
+    assert.ok(await fs.pathExists(stored.getBackend('b').retainedPath(b.sha256)));
+    const stream = await stored.retainedStream(b.sha256, 'b');
+    let bytes = ''; for await (const chunk of stream) bytes += chunk.toString();
+    assert.equal(bytes, 'shared');
+    await stored.discardTrash('b', b.id);
+    for (const name of ['a', 'b']) assert.equal(await fs.pathExists(stored.getBackend(name).retainedPath(b.sha256)), false);
+});
+
+test('concurrent discards of repeated versions free bytes only after every item is discarded', async t => {
+    const { stored, put } = await setup(t);
+    for (let i = 0; i < 3; i++) { await put('same.txt', 'same'); await stored.removeObject('a', 'same.txt'); }
+    const { items } = await stored.listTrash('a');
+    await Promise.all(items.map(item => stored.discardTrash('a', item.id)));
+    assert.equal((await stored.listTrash('a')).items.length, 0);
+    assert.equal(await fs.pathExists(stored.getBackend('a').retainedPath(items[0].sha256)), false);
+});
+
+test('discard preserves retained overwrite versions even at the same original path', async t => {
+    const { stored, put } = await setup(t);
+    await put('version.txt', 'old'); await put('version.txt', 'new');
+    await put('version.txt', 'old'); await stored.removeObject('a', 'version.txt');
+    const [item] = (await stored.listTrash('a')).items;
+    await stored.discardTrash('a', item.id);
+    assert.ok(await fs.pathExists(stored.getBackend('a').retainedPath(item.sha256)));
+    assert.ok(stored.getRetained(item.sha256));
+    assert.equal((await stored.listTrash('a')).items.length, 0);
+});
+
+test('folder discard removes private contents, never a replacement directory', async t => {
+    const { stored, put, root } = await setup(t);
+    await put('Folder/file.txt', 'trash');
+    await fs.outputFile(path.join(root, 'a/Folder/.hidden'), 'private');
+    const item = await stored.trashDirectory('a', 'Folder');
+    await put('Folder/new.txt', 'keep');
+    assert.equal((await stored.discardTrash('a', item.id)).ok, true);
+    assert.equal(await stored.getBackend('a').hasTrashedDirectory(item.id), false);
+    assert.equal(await fs.readFile(path.join(root, 'a/Folder/new.txt'), 'utf8'), 'keep');
+});
+
+test('a failed purge remains retryable and blocks restore after deletion intent', async t => {
+    const { stored, put } = await setup(t);
+    await put('retry.txt', 'retry'); await stored.removeObject('a', 'retry.txt');
+    const [item] = (await stored.listTrash('a')).items;
+    const failure = t.mock.method(stored.getBackend('a'), 'dropRetained', async () => { throw new Error('permission denied'); });
+    await assert.rejects(stored.discardTrash('a', item.id), /permission denied/);
+    assert.equal((await stored.listTrash('a')).items.length, 1);
+    assert.equal((await stored.restoreTrash('a', item.id)).reason, 'deletion-pending');
+    failure.mock.restore();
+    assert.equal((await stored.discardTrash('a', item.id)).ok, true);
+    assert.equal((await stored.listTrash('a')).items.length, 0);
+});
+
+test('legacy discards never reappear on listing or after reopening metadata', async t => {
+    const { stored, root } = await setup(t);
+    const sha = crypto.createHash('sha256').update('legacy discard').digest('hex');
+    await fs.outputFile(path.join(root, 'a/.stored-tmp/retained', sha), 'legacy discard');
+    stored.index.openDB('retained').putSync(sha, { sha256: sha, backend: 'a', keys: ['a:stale.txt', 'a:keep.txt'], lastAt: Date.now() });
+    const { items } = await stored.listTrash('a');
+    const stale = items.find(item => item.key === 'stale.txt');
+    await stored.discardTrash('a', stale.id);
+    assert.deepEqual((await stored.listTrash('a')).items.map(item => item.key), ['keep.txt']);
+    const { default: BackendTrash } = await import('../src/trash.js');
+    assert.deepEqual((await new BackendTrash(stored).list('a')).items.map(item => item.key), ['keep.txt']);
+    assert.equal((await stored.restoreTrash('a', items.find(item => item.key === 'keep.txt').id)).ok, true);
+});
+
+for (const first of ['restore', 'discard']) test(`simultaneous ${first} and the other action serialize safely`, async t => {
+    const { stored, put, root } = await setup(t);
+    await put('race.txt', 'race'); await stored.removeObject('a', 'race.txt');
+    const [item] = (await stored.listTrash('a')).items;
+    const other = first === 'restore' ? 'discard' : 'restore';
+    const [winner, loser] = await Promise.all([stored[`${first}Trash`]('a', item.id), stored[`${other}Trash`]('a', item.id)]);
+    assert.equal(winner.ok, true); assert.equal(loser.ok, false);
+    assert.equal(await fs.pathExists(path.join(root, 'a/race.txt')), first === 'restore');
+});
+
+test('discard cannot free a blob being retained for another deletion of the same path', async t => {
+    const { stored, put } = await setup(t);
+    await put('again.txt', 'same'); await stored.removeObject('a', 'again.txt');
+    const [old] = (await stored.listTrash('a')).items;
+    await put('again.txt', 'same');
+    let enter, release;
+    const entered = new Promise(resolve => { enter = resolve });
+    const blocked = new Promise(resolve => { release = resolve });
+    const backend = stored.getBackend('a');
+    const retain = backend.retain.bind(backend);
+    t.mock.method(backend, 'retain', async (...args) => {
+        const result = await retain(...args); enter(); await blocked; return result;
+    });
+    const deleting = stored.removeObject('a', 'again.txt');
+    await entered;
+    const discarding = stored.discardTrash('a', old.id);
+    release();
+    await Promise.all([deleting, discarding]);
+    const [latest] = (await stored.listTrash('a')).items;
+    assert.notEqual(latest.id, old.id);
+    assert.equal((await stored.restoreTrash('a', latest.id)).ok, true);
+});

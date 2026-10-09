@@ -20,6 +20,13 @@ After folder restoration, callers must scan and project that backend into their
 index (canvas-server does this automatically). Retention expiry removes Trash
 records and their recovery data. Retention errors stop destructive mutations.
 
+`discardTrash(backend, id)` permanently removes one Trash item without touching
+its original live path. Directory contents are removed from private trash;
+file blobs are released only after their last Trash/retained-version reference.
+Deletion intent is durable, retries are idempotent, and discard serializes with
+restore. A failed discard remains listed for retry and cannot be restored after
+deletion has started.
+
 ## Overview
 
 Cache-first blob storage with a content-addressable local cache, LMDB metadata index and pluggable backends. Local backends write immediately; remote backends are fed from the cache by a sync queue (disk copies on a worker thread, network drivers such as Google Drive committed in-process).

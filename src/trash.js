@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 // Per-deletion provenance, separate from the deduplicated retained blob pool.
 // Restoring one path never consumes the bytes needed by another trash item.
 export default class BackendTrash {
+    tasks = new Map();
     constructor(stored) { this.stored = stored; }
     get db() { return this._db ??= this.stored.index.openDB('backend-trash-v1'); }
     get days() { return this.stored.retention?.days || 0; }
@@ -48,7 +49,7 @@ export default class BackendTrash {
 
     async get(backendName, id) {
         let item = this.db.get(`item:${id}`);
-        if (!item || item.backend !== backendName || item.state === 'restored' || !this.days
+        if (!item || item.backend !== backendName || ['restored', 'discarded'].includes(item.state) || !this.days
             || Date.now() - item.deletedAt >= this.days * 86400000) return null;
         if (item.state === 'pending') {
             const backend = this.stored.getBackend(backendName);
@@ -78,9 +79,21 @@ export default class BackendTrash {
             cursor: items.length > limit ? page.at(-1).id : null, retention: this.stored.retention };
     }
 
-    async restore(backendName, id, { origin = null } = {}) {
+    withItemLock(id, fn) {
+        const task = (this.tasks.get(id) || Promise.resolve()).catch(() => {}).then(fn);
+        this.tasks.set(id, task);
+        void task.finally(() => { if (this.tasks.get(id) === task) this.tasks.delete(id); }).catch(() => {});
+        return task;
+    }
+
+    restore(backendName, id, options = {}) {
+        return this.withItemLock(id, () => this.restoreItem(backendName, id, options));
+    }
+
+    async restoreItem(backendName, id, { origin = null } = {}) {
         const item = await this.get(backendName, id);
         if (!item) return { ok: false, reason: 'not-found', id };
+        if (item.state === 'discarding') return { ok: false, reason: 'deletion-pending', id };
         await this.stored.getBackend(backendName).validateTrashTarget?.(item.key);
         const result = item.type === 'directory'
             ? await this.stored.getBackend(backendName).restoreTrashedDirectory(id, item.key)
@@ -89,6 +102,35 @@ export default class BackendTrash {
             });
         if (result?.ok) this.db.putSync(`item:${id}`, { ...item, state: 'restored', restoredAt: Date.now() });
         return { ...result, id, key: item.key, type: item.type };
+    }
+
+    hasReference(sha256, exceptId, address = null) {
+        for (const { key, value } of this.db.getRange()) {
+            if (key.startsWith('item:') && value.id !== exceptId && value.sha256 === sha256
+                && !['discarded', 'restored'].includes(value.state)
+                && (!address || `${value.backend}:${value.key}` === address)) return true;
+        }
+        return false;
+    }
+
+    discard(backendName, id) {
+        return this.withItemLock(id, () => this.discardItem(backendName, id));
+    }
+
+    async discardItem(backendName, id) {
+        const item = this.db.get(`item:${id}`);
+        if (!item || item.backend !== backendName || item.state === 'restored') return { id, ok: false, reason: 'not-found' };
+        const result = { id, key: item.key, type: item.type, ok: true };
+        if (item.state === 'discarded') return { ...result, alreadyDeleted: true };
+        const backend = this.stored.getBackend(backendName);
+        if (!backend?.canDelete) return { id, ok: false, reason: 'read-only-backend' };
+        // Persist intent before removing bytes. Interrupted/failed deletion can
+        // be retried, but must not race a subsequent attempt to restore it.
+        this.db.putSync(`item:${id}`, { ...item, state: 'discarding' });
+        const finish = () => this.db.putSync(`item:${id}`, { ...item, state: 'discarded', discardedAt: Date.now() });
+        if (item.type === 'directory') { await backend.dropTrashedDirectory(id); finish(); }
+        else await this.stored.discardTrashBytes(item, finish);
+        return result;
     }
 
     async sweep(now) {

@@ -56,6 +56,7 @@ export default class Stored extends EventEmitter2 {
     #pendingMoves = new Map();
     #retention = null;
     #retainedDb = null;
+    #retentionTasks = new Map();
     #trash;
     #sweepTimer = null;
     #directoryMovesDb = null;
@@ -209,8 +210,8 @@ export default class Stored extends EventEmitter2 {
         const backend = this.#backends.get(p.backend);
         if (!backend) return { ok: false, reason: 'unknown-backend' };
         if (!backend.canDelete) return { ok: false, reason: 'read-only-backend' };
-        const retained = await this.#retain(p.backend, p.key, this.#index.get(`${p.backend}:${p.key}`));
-        const trashed = this.#trash.prepare(p.backend, p.key, { retained });
+        const retained = await this.#retain(p.backend, p.key, this.#index.get(`${p.backend}:${p.key}`), 'delete');
+        const trashed = retained?.trashItem;
         const deleted = !!(await backend.delete(p.key));
         if (deleted) this.#trash.finish(trashed);
         if (deleted) this.#dropLocation(p.backend, p.key);
@@ -301,8 +302,8 @@ export default class Stored extends EventEmitter2 {
         const removed = new Set();
         for (const loc of targets) {
             const backend = this.#backends.get(loc.backend);
-            const retained = backend && await this.#retain(loc.backend, loc.key, meta);
-            const trashed = this.#trash.prepare(loc.backend, loc.key, { retained, mtime: loc.mtime });
+            const retained = backend && await this.#retain(loc.backend, loc.key, meta, 'delete');
+            const trashed = retained?.trashItem;
             if (backend && await backend.delete(loc.key)) {
                 this.#trash.finish(trashed);
                 deleted.push(loc.backend);
@@ -501,40 +502,93 @@ export default class Stored extends EventEmitter2 {
         return this.#retainedDb;
     }
 
-    async #retain(backendName, key, meta) {
+    async #retain(backendName, key, meta, reason = 'version') {
         if (!this.#retention || !meta) return null;
         const backend = this.#backends.get(backendName);
         if (!backend || backend.type !== 'local' || typeof backend.retain !== 'function') return null;
         const sha256 = meta.checksums?.sha256 ? String(meta.checksums.sha256).toLowerCase() : null;
         if (!sha256) return null;
-        try {
-            const kept = await backend.retain(key, sha256);
-            if (!kept) return null;
-            const now = Date.now();
-            const prev = this.#retained.get(sha256) || null;
-            const keys = [...new Set([...(prev?.keys || []), `${backendName}:${key}`])];
-            const entry = {
-                sha256,
-                backend: prev?.backend || backendName,
-                size: kept.size ?? prev?.size ?? meta.size ?? null,
-                mimeType: meta.mimeType ?? prev?.mimeType ?? null,
-                id: meta.id ?? prev?.id ?? null,
-                keys,
-                firstAt: prev?.firstAt ?? now,
-                lastAt: now,
-                trashVersion: 1,
-                legacyKeys: prev?.legacyKeys ?? (prev && !prev.trashVersion ? prev.keys : []),
-                legacyAt: prev?.legacyAt ?? prev?.lastAt ?? null,
-            };
-            this.#retained.putSync(sha256, entry);
-            this.#scheduleSweep();
-            return entry;
-        } catch (err) {
-            debug(`retain ${backendName}:${key} failed: ${err.message}`);
-            // A failed backup must never turn a recoverable delete/overwrite
-            // into permanent data loss (for example when the disk is full).
-            throw Object.assign(new Error(`retention failed for ${backendName}:${key}: ${err.message}`, { cause: err }), { code: 'RETAIN_FAILED' });
-        }
+        return this.#withRetainedLock(sha256, async () => {
+            try {
+                const kept = await backend.retain(key, sha256);
+                if (!kept) return null;
+                const now = Date.now();
+                const prev = this.#retained.get(sha256) || null;
+                const keys = [...new Set([...(prev?.keys || []), `${backendName}:${key}`])];
+                const entry = {
+                    sha256,
+                    backend: prev?.backend || backendName,
+                    size: kept.size ?? prev?.size ?? meta.size ?? null,
+                    mimeType: meta.mimeType ?? prev?.mimeType ?? null,
+                    id: meta.id ?? prev?.id ?? null,
+                    keys,
+                    backends: [...new Set([...(prev?.backends || this.#retainedBackendNames(prev)), backendName])],
+                    versionKeys: [...new Set([...(prev?.versionKeys || []), ...(reason === 'version' ? [`${backendName}:${key}`] : [])])],
+                    firstAt: prev?.firstAt ?? now,
+                    lastAt: now,
+                    trashVersion: 1,
+                    legacyKeys: prev?.legacyKeys ?? (prev && !prev.trashVersion ? prev.keys : []),
+                    legacyAt: prev?.legacyAt ?? prev?.lastAt ?? null,
+                };
+                this.#retained.putSync(sha256, entry);
+                this.#scheduleSweep();
+                if (reason === 'delete') {
+                    // Publish the pending deletion while still holding the
+                    // digest lock: discard must see this new reference even
+                    // if the physical unlink has not happened yet.
+                    const mtime = meta.locations?.find(loc => loc.backend === backendName && loc.key === key)?.mtime ?? null;
+                    return { ...entry, trashItem: this.#trash.prepare(backendName, key, { retained: entry, mtime }) };
+                }
+                return entry;
+            } catch (err) {
+                debug(`retain ${backendName}:${key} failed: ${err.message}`);
+                // A failed backup must never turn a recoverable delete/overwrite
+                // into permanent data loss (for example when the disk is full).
+                throw Object.assign(new Error(`retention failed for ${backendName}:${key}: ${err.message}`, { cause: err }), { code: 'RETAIN_FAILED' });
+            }
+        });
+    }
+
+    #withRetainedLock(sha256, fn) {
+        const previous = this.#retentionTasks.get(sha256) || Promise.resolve();
+        const task = previous.catch(() => {}).then(fn);
+        this.#retentionTasks.set(sha256, task);
+        void task.finally(() => {
+            if (this.#retentionTasks.get(sha256) === task) this.#retentionTasks.delete(sha256);
+        }).catch(() => {});
+        return task;
+    }
+
+    #retainedBackendNames(entry) {
+        return [...new Set([...(entry?.backends || []), ...(entry?.backend ? [entry.backend] : []),
+            ...this.#backends.list().filter(name => entry?.keys?.some(key => key.startsWith(`${name}:`)))])];
+    }
+
+    // Called only for a recorded Trash deletion. Other locations and retained
+    // overwrite versions keep their shared bytes. Never touch the original key.
+    async discardTrashBytes(item, finish) {
+        return this.#withRetainedLock(item.sha256, async () => {
+            const entry = this.getRetained(item.sha256);
+            if (!entry) { finish(); return; }
+            const address = `${item.backend}:${item.key}`;
+            const shared = this.#trash.hasReference(item.sha256, item.id, address);
+            const keys = (entry.keys || []).filter(key => key !== address || shared || entry.versionKeys?.includes(key));
+            const backends = this.#retainedBackendNames(entry);
+            if (keys.length || this.#trash.hasReference(item.sha256, item.id)) {
+                this.#retained.putSync(item.sha256, { ...entry, keys, backends });
+                finish();
+                return;
+            }
+            // Leave metadata intact on failure so the user can retry; drops
+            // are idempotent if an earlier attempt removed some copies.
+            for (const name of backends) {
+                const backend = this.#backends.get(name);
+                if (!backend?.dropRetained) throw new Error(`Recovery backend unavailable: ${name}`);
+                await backend.dropRetained(item.sha256);
+            }
+            this.#retained.removeSync(item.sha256);
+            finish();
+        });
     }
 
     #scheduleSweep() {
@@ -608,13 +662,18 @@ export default class Stored extends EventEmitter2 {
         const window = olderThanMs ?? this.#retention.days * 86_400_000;
         let swept = 0;
         let kept = 0;
-        for (const { key: sha, value } of [...this.#retained.getRange()]) {
-            if (!value?.sha256) continue;
-            if ((now - (value.lastAt ?? 0)) < window) { kept += 1; continue; }
-            const backend = this.#backends.get(value.backend);
-            if (backend && typeof backend.dropRetained === 'function') await backend.dropRetained(value.sha256).catch(() => {});
-            this.#retained.removeSync(sha);
-            swept += 1;
+        for (const { key: sha } of [...this.#retained.getRange()]) {
+            await this.#withRetainedLock(sha, async () => {
+                const value = this.#retained.get(sha);
+                if (!value?.sha256) return;
+                if ((now - (value.lastAt ?? 0)) < window) { kept += 1; return; }
+                for (const name of this.#retainedBackendNames(value)) {
+                    const backend = this.#backends.get(name);
+                    if (backend?.dropRetained) await backend.dropRetained(value.sha256);
+                }
+                this.#retained.removeSync(sha);
+                swept += 1;
+            });
         }
         if (swept) debug(`retention sweep: ${swept} dropped, ${kept} kept`);
         return { swept, kept };
@@ -632,6 +691,7 @@ export default class Stored extends EventEmitter2 {
     listTrash(backend, options = {}) { return this.#trash.list(backend, options); }
     getTrashItem(backend, id) { return this.#trash.get(backend, id); }
     restoreTrash(backend, id, options = {}) { return this.#trash.restore(backend, id, options); }
+    discardTrash(backend, id) { return this.#trash.discard(backend, id); }
 
     /** Move the whole directory into private trash in one filesystem rename.
      * This preserves unindexed/hidden files, empty folders and timestamps too.
@@ -684,8 +744,8 @@ export default class Stored extends EventEmitter2 {
             // false = bytes already gone; the location still goes. A remote
             // driver re-evaluates the precondition at the other end (412 →
             // typed error, nothing is unlinked here).
-            const retained = await this.#retain(backendName, destKey, current);
-            const trashed = this.#trash.prepare(backendName, destKey, { retained, mtime: currentLoc?.mtime });
+            const retained = await this.#retain(backendName, destKey, current, 'delete');
+            const trashed = retained?.trashItem;
             await backend.delete(destKey, { ifMatch: options.ifMatch, origin: options.origin });
             this.#trash.finish(trashed);
             this.#processUnlink({ backend: backendName, key: destKey, ...(options.origin ? { origin: options.origin } : {}) });
