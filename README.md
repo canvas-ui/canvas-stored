@@ -4,6 +4,24 @@
 
 # StoreD
 
+## Backend Trash
+
+With `retention: { days: 30 }`, file backend deletions record each original path
+in durable Trash metadata. `listTrash(backend, { cursor, limit })` returns
+`{ items, cursor, retention }`; `restoreTrash(backend, id)` restores the recorded
+path without overwriting an occupied destination. Identical bytes can back
+multiple independent trash items, and overwritten versions are not listed as
+new deletions. Legacy retained entries with missing original paths are imported
+when listing Trash; recovery is limited to the path metadata still available.
+
+`trashDirectory(backend, key)` moves an entire folder to the backend staging
+directory's `trash/<id>`, preserving hidden/unindexed files and empty folders.
+After folder restoration, callers must scan and project that backend into their
+index (canvas-server does this automatically). Retention expiry removes Trash
+records and their recovery data. Retention errors stop destructive mutations.
+
+## Overview
+
 Cache-first blob storage with a content-addressable local cache, LMDB metadata index and pluggable backends. Local backends write immediately; remote backends are fed from the cache by a sync queue (disk copies on a worker thread, network drivers such as Google Drive committed in-process).
 
 Used with canvas-server/synapsd to build virtual context trees over indexed data: checksum-based identity, multi-location replication, and `stored://` URLs as the canonical fetch form.

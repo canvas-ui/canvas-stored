@@ -204,6 +204,50 @@ export default class FileBackend extends StorageBackend {
         return true;
     }
 
+    #trashPath(id) {
+        if (!/^[a-f0-9-]{36}$/.test(id)) throw new Error('Invalid trash item id');
+        return path.join(this.#tempDir, 'trash', id);
+    }
+
+    async #trashTarget(key) {
+        const target = this.#safeResolve(key);
+        // Never traverse a symlink when deleting or restoring an original path.
+        let current = this.#root;
+        for (const part of path.relative(this.#root, target).split(path.sep)) {
+            current = path.join(current, part);
+            const stat = await fs.lstat(current).catch(error => {
+                if (error.code === 'ENOENT') return null;
+                throw error;
+            });
+            if (stat?.isSymbolicLink()) throw new Error('Trash paths cannot traverse symbolic links');
+        }
+        return target;
+    }
+
+    async trashContainer(key, id) {
+        const source = await this.#trashTarget(key);
+        if (!(await fs.lstat(source)).isDirectory()) throw new Error('Trash source is not a directory');
+        const destination = this.#trashPath(id);
+        await fs.ensureDir(path.dirname(destination));
+        // EXDEV fails safely with the source intact (a custom staging directory
+        // on another volume must not trigger copy-and-delete of a live tree).
+        await fs.rename(source, destination);
+    }
+
+    async validateTrashTarget(key) { await this.#trashTarget(key); }
+
+    async hasTrashedDirectory(id) { return fs.pathExists(this.#trashPath(id)); }
+    async dropTrashedDirectory(id) { await fs.remove(this.#trashPath(id)); }
+
+    async restoreTrashedDirectory(id, key) {
+        const destination = await this.#trashTarget(key);
+        if (await fs.pathExists(destination)) return { ok: false, reason: 'target-exists' };
+        if (!await this.hasTrashedDirectory(id)) return { ok: false, reason: 'not-found' };
+        await fs.ensureDir(path.dirname(destination));
+        await fs.move(this.#trashPath(id), destination, { overwrite: false });
+        return { ok: true };
+    }
+
     async renameContainer(fromKey, toKey) {
         const from = this.#safeResolve(fromKey);
         const to = this.#safeResolve(toKey);
