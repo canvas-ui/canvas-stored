@@ -64,11 +64,14 @@ const splitKey = (key) => {
 class DriveError extends Error {
     constructor(message, { code = 'unreachable', status = null, cause = undefined } = {}) {
         const transportCode = cause?.cause?.code || cause?.code;
-        super(transportCode ? `${message} (${transportCode})` : message, { cause });
+        // InvalidArgumentError's message names the rejected option/header.
+        // Keep it visible rather than reducing it to fetch's generic wrapper.
+        const argumentDetail = transportCode === 'UND_ERR_INVALID_ARG' ? cause?.cause?.message : null;
+        super(transportCode ? `${message} (${transportCode}${argumentDetail ? `: ${argumentDetail}` : ''})` : message, { cause });
         this.name = 'DriveError';
         this.code = code;
         this.status = status;
-        this.statusCode = 502;
+        this.statusCode = code === 'invalid-request' ? 500 : 502;
         if (transportCode) this.transportCode = transportCode;
     }
 }
@@ -163,6 +166,9 @@ export default class GdriveBackend extends StorageBackend {
             try {
                 res = await this.#fetch(url, { ...init, headers: { Authorization: `Bearer ${token}`, ...(init.headers || {}) } });
             } catch (err) {
+                if ((err.cause?.code || err.code) === 'UND_ERR_INVALID_ARG') {
+                    throw new DriveError(`gdrive ${init.method || 'GET'} request arguments rejected: ${err.message}`, { code: 'invalid-request', cause: err });
+                }
                 if (attempt < RETRY_DELAYS_MS.length) { await sleep(RETRY_DELAYS_MS[attempt]); continue; }
                 throw new DriveError(`gdrive ${init.method || 'GET'} ${new URL(url).origin}${new URL(url).pathname} request failed: ${err.message}`, { code: 'unreachable', cause: err });
             }
@@ -563,7 +569,9 @@ export default class GdriveBackend extends StorageBackend {
             // Drive uses 308 as an acknowledgement of an incomplete upload,
             // not an instruction to replay this chunk at Location.
             redirect: 'manual',
-            headers: { 'Content-Length': String(buf.length), 'Content-Range': range, 'Content-Type': mimeType },
+            // fetch derives Content-Length from this Buffer. Supplying it
+            // separately is redundant and can conflict with fetch's framing.
+            headers: { 'Content-Range': range, 'Content-Type': mimeType },
             body: buf,
         }, { okStatuses: [308] });
         if (last) {

@@ -34,7 +34,10 @@ test('real fetch treats Drive 308 with Location as a chunk acknowledgement', asy
     const session = `http://127.0.0.1:${server.address().port}/session`;
     t.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }));
     const backend = new GdriveBackend('drive', { ...CREDS, fetch: async (url, init) => {
-        if (url === session) return fetch(url, init);
+        if (url === session) {
+            assert.equal(new Headers(init.headers).has('content-length'), false);
+            return fetch(url, init);
+        }
         const response = await drive.fetch(url, init);
         if (response.headers.has('location')) return new Response(null, { status: 200, headers: { Location: session } });
         return response;
@@ -42,6 +45,26 @@ test('real fetch treats Drive 308 with Location as a chunk acknowledgement', asy
     const result = await backend.put('large.bin', Readable.from([bytes]));
     assert.equal(result.size, bytes.length);
     assert.deepEqual(ranges, ['bytes 0-8388607/*', 'bytes 8388608-8388610/8388611']);
+});
+
+test('invalid fetch arguments identify the rejected header without retrying', async () => {
+    const drive = new FakeDrive();
+    let attempts = 0;
+    const cause = Object.assign(new Error('invalid content-length header'), { code: 'UND_ERR_INVALID_ARG' });
+    const backend = new GdriveBackend('drive', { ...CREDS, fetch: async (url, init) => {
+        if (new URL(url).pathname === '/upload/session') {
+            attempts += 1;
+            throw new TypeError('fetch failed', { cause });
+        }
+        return drive.fetch(url, init);
+    } });
+    await assert.rejects(backend.put('photo.jpg', Buffer.from('photo')), error => {
+        assert.equal(error.code, 'invalid-request');
+        assert.equal(error.statusCode, 500);
+        assert.match(error.message, /UND_ERR_INVALID_ARG: invalid content-length header/);
+        return true;
+    });
+    assert.equal(attempts, 1);
 });
 
 test('upload transport failures preserve their cause and report an upstream failure', async () => {
