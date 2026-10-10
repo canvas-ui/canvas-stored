@@ -377,7 +377,9 @@ export default class Stored extends EventEmitter2 {
         const backend = this.#backends.get(backendName);
         if (!backend) return { ok: false, reason: 'unknown-backend', backend: backendName };
         if (!backend.canWrite) return { ok: false, reason: 'read-only-target', backend: backendName };
-        if (backend.type !== 'local' || typeof backend.commit !== 'function') {
+        const remoteCreate = backend.type === 'remote' && typeof backend.createFrom === 'function'
+            && String(options.ifNoneMatch || '').trim() === '*';
+        if ((!remoteCreate && backend.type !== 'local') || typeof backend.commit !== 'function') {
             return { ok: false, reason: 'unsupported-backend', backend: backendName };
         }
         const destKey = this.#normalizeKey(key, { nfc: true });

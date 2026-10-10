@@ -89,6 +89,7 @@ export default class GdriveBackend extends StorageBackend {
 
     #pollTimer = null;
     #polling = false;
+    #creates = new Map();
     #pageToken = null;
 
     constructor(name, config = {}) {
@@ -509,7 +510,19 @@ export default class GdriveBackend extends StorageBackend {
         const { dir, name, key: clean } = splitKey(key);
         if (!clean) throw new Error('gdrive put: key is required');
         const parentId = await this.#folderId(dir, { create: true });
-        const existing = await this.#lookup(clean);
+        let existing = null;
+        if (options.createOnly) {
+            // Query Drive, including folders and native documents: the local
+            // index and watcher may not have seen this name yet.
+            const found = await this.#json('/files', { query: {
+                q: `'${qEscape(parentId)}' in parents and name = '${qEscape(name)}' and trashed = false`,
+                fields: 'files(id)', pageSize: 1,
+                supportsAllDrives: true, includeItemsFromAllDrives: true,
+            } });
+            if (found?.files?.length) throw Object.assign(new Error(`File already exists: ${clean}`), { code: 'EEXIST' });
+            // Always POST. Drive permits duplicate names, so an external
+            // concurrent creator may produce a sibling, but is never patched.
+        } else existing = await this.#lookup(clean);
         const mimeType = options.mimeType || 'application/octet-stream';
         const source = Buffer.isBuffer(data) ? data : (typeof data === 'string' ? Buffer.from(data) : data);
         const size = Buffer.isBuffer(source) ? source.length : (Number.isFinite(options.size) ? options.size : null);
@@ -585,6 +598,19 @@ export default class GdriveBackend extends StorageBackend {
     async commit(key, srcPath) {
         const { size } = await fsp.stat(srcPath);
         return this.put(key, createReadStream(srcPath), { size });
+    }
+
+    async createFrom(key, srcPath) {
+        const clean = splitKey(key).key;
+        const previous = this.#creates.get(clean) || Promise.resolve();
+        const task = previous.catch(() => {}).then(async () => {
+            const { size } = await fsp.stat(srcPath);
+            await this.put(clean, createReadStream(srcPath), { size, createOnly: true });
+            return this.stat(clean);
+        });
+        this.#creates.set(clean, task);
+        try { return await task; }
+        finally { if (this.#creates.get(clean) === task) this.#creates.delete(clean); }
     }
 
     /**
