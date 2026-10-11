@@ -84,7 +84,8 @@ await stored.stop();
 | `cacache` | local | Content-addressable blob store (managed; opaque keys) |
 | `gdrive` | remote | Google Drive folder subtree over OAuth refresh token — see below |
 | `canvas` | remote | One backend of a workspace on a canvas hub, over the objects/sync protocol — see *Sync engine* below |
-| `s3`, `http` | remote | Skeletons: URL parsing only (`http` has a read-only `get`) |
+| `s3` | remote | S3-compatible bucket/prefix: reads, indexing, polling and conditional create-only uploads |
+| `http` | remote | Read-only `get` / `stat` |
 
 Register additional drivers at runtime with `BackendManager.register(name, Class)` (`import BackendManager from 'canvas-stored/src/backends/BackendManager.js'`).
 
@@ -107,6 +108,76 @@ stored.addBackend('gdrive:work', {
 - Writes go cache → SyncQueue → `commit(key, path)` (resumable upload, 8 MiB chunks, in-place update when the key exists). Reads (`get`, `getRange`) stream from the API.
 - `watch()` emits `file:add|change|unlink` from the changes feed; renames/moves carry `ino = fileId`, so Stored's rename window rewrites the location in place instead of orphaning the document.
 - `verifyRoot()` → `{ ok, reason: 'unauthorized' | 'root-missing' | 'unreachable' }` is the liveness gate (credentials + root folder).
+
+### S3-compatible backend
+
+```js
+stored.addBackend('s3:accounting', {
+  driver: 's3',
+  bucket: 'accounting',                       // existing bucket; never created by the driver
+  prefix: 'Augmentd/Accounting',               // optional scope within the bucket
+  endpoint: 'https://s3.example.com',          // omit for Amazon S3
+  region: 'us-east-1',                        // use the region configured by your provider
+  forcePathStyle: true,                       // default true with a custom endpoint
+  accessKeyId: process.env.S3_ACCESS_KEY_ID,
+  secretAccessKey: process.env.S3_SECRET_ACCESS_KEY,
+  // sessionToken: process.env.S3_SESSION_TOKEN, // optional temporary credentials
+  readOnly: false,
+  watch: false,                              // opt in to full-list polling
+  pollInterval: 60000,                        // milliseconds, minimum 5000
+});
+```
+
+Uses the AWS SDK v3 with Signature V4. Amazon S3 uses its regional endpoint;
+MinIO, Garage, RustFS and Ceph RGW use their HTTP(S) endpoint, configured region
+and usually path-style addressing. The driver requires explicit credentials;
+it never falls back to the server's ambient IAM credentials. Canvas workspace
+settings expose the same connection fields and redact stored secrets. Rotating
+credentials is supported; changing a workspace backend's bucket, prefix or
+endpoint requires a new backend to preserve existing locations and pending plans.
+
+- `get`, streaming/ranged reads, `stat`, paginated `list`, `shape`, `scan`, and
+  optional `watch`/`poll` are implemented. Directory nodes come from object keys;
+  empty directory markers and folder mutations are not supported.
+- `put` and streaming `createFrom`/`commit` use conditional `If-None-Match: *`
+  writes with a content MD5. Existing keys are never overwritten. Single PUT
+  uploads are limited to **5 GiB**; larger uploads fail before publication.
+  Multipart/resumable upload is deferred.
+- Before allowing writes, each new driver instance tests conditional creation
+  on a random key under `<prefix>/.canvas-probe/`, checks the original bytes,
+  and deletes its probe. The key needs ListBucket scoped to the prefix, GetObject
+  and PutObject, plus DeleteObject on the probe prefix (DeleteObjectVersion on
+  versioned buckets). An endpoint that ignores preconditions is rejected before
+  writing user keys. Read-only connections do not probe writes.
+- ETags are observation tokens, **never content checksums or rename identity**.
+  Initial scans download bytes to hash them; subsequent scans reuse only hashes
+  matching the current ETag/version/size/time. Polling lists the prefix and checks
+  metadata, so budget remote requests and downloads. Failed/incomplete scans
+  never infer deletions. Remote renames are not inferred as user move intents.
+- Workspace `kind: "filing"` policies support automated copies with `error` or
+  `rename` conflicts. The existing durable replica executor verifies each exact
+  destination before releasing staging. Full mirrors, overwrite and automated
+  removal are refused. `delete()` is disabled unless `permanentDelete: true` is
+  explicitly configured; this manual opt-in does not enable mirror capabilities.
+
+`tests/s3.test.js` covers collision protection, incompatible endpoints, failed
+enumeration, mid-read changes and replica recovery. Run the live test against an
+isolated service with test credentials and permission to create/delete buckets:
+
+```sh
+CANVAS_S3_TEST_ENDPOINT=http://127.0.0.1:32768 node --test tests/s3-live.test.js
+```
+
+It creates and removes only a uniquely named test bucket. Optional variables are
+`CANVAS_S3_TEST_REGION`, `CANVAS_S3_TEST_ACCESS_KEY`, and
+`CANVAS_S3_TEST_SECRET_KEY`; the default test keys are `canvas-test` and
+`canvas-test-password`. Host port 32768 is an example, not a required port.
+Live validation used RustFS image digest
+`sha256:1803faef57627e2d9c2e7d89d655d712ddded5389040054987163043fecb6a3c`;
+other providers/versions still need qualification. See [TODO.md](TODO.md).
+
+Protocol references: [AWS conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)
+and [SDK checksum behavior](https://docs.aws.amazon.com/sdk-for-javascript/v3/developer-guide/s3-checksums.html).
 
 ### Canvas hub backend
 
@@ -392,7 +463,7 @@ Registered in `BackendManager` via `DRIVERS`:
 | `file` | `local` | complete | CRUD, chokidar `watch`, `scan` |
 | `cacache` | `local` | complete | Content-addressable blob store (cacache); CRUD, no `watch`/`scan` |
 | `http` | `remote` | partial | Read-only `get` / `stat` via `fetch`; `config.baseUrl`, `headers` |
-| `s3` | `remote` | skeleton | Registered for URL parsing; CRUD not implemented |
+| `s3` | `remote` | filing/read support | Conditional creates, streaming reads, scan/poll; mirrors and overwrite disabled |
 
 Each backend implements `StorageBackend`: `put`, `get`, `delete`, `stat`, `list`; optional `commit` (local, for streaming put), `watch`, `scan`, `stop`.
 

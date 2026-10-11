@@ -20,7 +20,7 @@ export default class StorageBackend extends EventEmitter {
      * reference — its bytes cannot be removed by us.
      * `canEnumerate:true` means the backend implements the async-generator
      * `list()` (and usually `scan()`) so callers can mirror its whole tree;
-     * drivers without real enumeration (http, s3 skeleton) leave it false.
+     * drivers without real enumeration (http) leave it false.
      * `remote` mirrors the getter below — carried here so a single capabilities
      * snapshot is enough for consumers deciding how expensive an op will be.
      */

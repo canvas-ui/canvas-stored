@@ -62,7 +62,7 @@ describe('Stored', async () => {
             const http = stored.addBackend('http:cdn', { driver: 'http', baseUrl: 'https://cdn.example/' });
             assert.strictEqual(http.nativeUrl('music/rec.mp3'), 'https://cdn.example/music/rec.mp3');
 
-            const s3 = stored.addBackend('s3:prod', { driver: 's3', bucket: 'blobs' });
+            const s3 = stored.addBackend('s3:prod', { driver: 's3', bucket: 'blobs', accessKeyId: 'test', secretAccessKey: 'test' });
             assert.strictEqual(s3.nativeUrl('ab/cd/rec.mp3'), 's3://blobs/ab/cd/rec.mp3');
         });
     });

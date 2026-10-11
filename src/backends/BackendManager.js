@@ -8,7 +8,7 @@ import CanvasBackend from './canvas/index.js';
 
 const debug = Debug('stored:backends');
 
-// `s3`/`http` are skeletons (see their index.js). `smb`/`webdav` are reserved
+// `http` is a skeleton (see its index.js). S3 supports conditional filing copies. `smb`/`webdav` are reserved
 // scheme names with no driver yet — register a driver class here (or at
 // runtime via BackendManager.register) when implemented. `gdrive` is the first
 // real remote driver; `canvas` mirrors one backend of a workspace on another

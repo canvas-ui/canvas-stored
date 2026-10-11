@@ -2,8 +2,8 @@
 
 ## Roadmap
 
-The current storage-policy gaps below are the follow-up to Stored 1.10.0,
-canvas-server 2.20.0 and canvas-web 2.19.0 (2026-10-11). They supersede the
+The current storage-policy gaps below include Stored 1.11.0,
+canvas-server 2.21.0 and canvas-web 2.20.0 (2026-10-12). They supersede the
 historical delivery notes further down. Existing unrelated backlog is retained.
 
 ## Storage policies — remaining gaps and deployment limits
@@ -43,6 +43,12 @@ See [the physical replication contract](src/sync/REPLICAS.md) and
 - Mirrored file edits and renames preserve the document ID. Legacy successor
   behavior for unmanaged files is unchanged. Notes-as-files and layer metadata
   remain explicitly deferred.
+- **S3-compatible backends now support reads, indexing, polling and create-only
+  filing policies.** Uploads use conditional creation, with an endpoint probe
+  before user writes. S3 mirror policies, overwrite, folder mutation and automated
+  retirement remain rejected. The same exact-target verification/release barrier
+  protects staged bytes. Real driver and workspace scenarios passed against
+  RustFS; this is not certification of every S3-compatible implementation.
 
 ### Pilot qualification and recovery work
 
@@ -119,11 +125,32 @@ See [the physical replication contract](src/sync/REPLICAS.md) and
   lost acknowledgements, trash/restore and remote rename/move propagation.
   Existing driver/transport tests use fixtures or local mock endpoints; live
   multi-backend Drive policy scenarios were not validated in this change.
-- [ ] **Add S3 only after backend conformance is established.** Define version
-  and precondition semantics, recovery/version retention, prefix rather than
-  directory behavior, enumeration and change detection, credential handling and
-  restart-safe transfers. Reuse the exact-target verification/release barrier;
-  a successful enqueue is never a verified destination.
+- [ ] **Qualify each S3 provider and deployment.** Run the opt-in live suite
+  against Amazon S3, MinIO, Garage and Ceph RGW, plus the pilot's RustFS version.
+  Test path/virtual-host addressing, TLS, scoped IAM, temporary credentials,
+  versioned/locked buckets, lost responses, outages and concurrent external
+  writers. The current compatibility probe refuses endpoints that ignore
+  conditional creation; never replace it with HEAD followed by an unconditional
+  write. Current live coverage is RustFS only.
+- [ ] **Add S3 recovery before mirror capabilities.** Implement version-aware,
+  conditional replacement and recoverable retirement, replay receipts and
+  retention/restore semantics across the selected providers. Prefixes are not
+  folders; define folder-intent projection separately. Keep mirrors and
+  automated overwrite/removal disabled until these guarantees are tested.
+- [ ] **Add resumable S3 multipart uploads.** Current streaming single PUTs are
+  capped at 5 GiB. Persist multipart IDs/parts and recover uncertain completion;
+  clean abandoned parts without touching active work. Include retry behavior
+  after a committed write whose response was lost.
+- [ ] **Bound S3 scan cost and probe debris.** Initial scans download content;
+  poll scans enumerate and HEAD objects, and the checksum memo is process-local.
+  Add safe durable observation caching and an explicit rescan strategy for
+  missed changes. A crash during `.canvas-probe/` verification may leave a hidden
+  random probe; provide scoped lifecycle cleanup (including versions). Never
+  sweep user prefixes to clean these up. A probe cleanup permission failure must
+  remain visible and prevent writable connection admission.
+- [ ] **Extend S3 authentication deliberately.** Explicit access/secret keys
+  and session tokens work today. Add scoped role/STS refresh without granting
+  workspace-selected endpoints access to ambient server IAM credentials.
 - [ ] **Keep native Google document export separate.** Google Docs/Sheets/Slides
   have no binary byte representation in the current driver and are skipped.
   Explicit export/import formats remain future work, as do DB-note projections.
@@ -161,7 +188,15 @@ See [the physical replication contract](src/sync/REPLICAS.md) and
 
 ### Verification baseline
 
-The implementation passed 239 Stored tests and 370 workspace/indexing/hook
+The S3/Git-separation increment passed 249 Stored tests (including the live
+RustFS test), 347 workspace/hook tests, focused connector/configuration checks,
+and the Web production build/typecheck. The workspace live S3 test covers add,
+keyed upload, rescan, filing, cache release, unfiling and read-only admission;
+the configuration test also verifies secret-vault storage and token clearing.
+The S3 settings form was built and linted but not browser-verified. The fixture
+used host port 32768; host port 9000 was reserved and left untouched.
+
+The preceding storage-policy implementation passed 239 Stored tests and 370 workspace/indexing/hook
 tests, plus the Web production build/typecheck. Coverage includes abrupt process
 exit/replay, partial failures, exact-target completion, shared ownership,
 independent edits, preserved document IDs, API folder operations, unknown
