@@ -33,6 +33,9 @@ const CACHE_OPTS = { memoize: false };
 export default class CacacheBackend extends StorageBackend {
     #root;
     #algorithms;
+    #mutations = Promise.resolve();
+    #gcTimer = null;
+    #dirty = false;
 
     constructor(name, config = {}) {
         super(name, config);
@@ -41,6 +44,14 @@ export default class CacacheBackend extends StorageBackend {
         this.#algorithms = config.algorithms || ['sha256'];
         this.type = 'local';
         fs.ensureDirSync(this.#root);
+        // Verification must never race a content write before its index entry
+        // is committed. All mutations and collection share this queue.
+        for (const method of ['put', 'commit', 'delete', 'clear']) {
+            const run = this[method].bind(this);
+            this[method] = (...args) => this.#serialize(() => run(...args));
+        }
+        this.#gcTimer = setInterval(() => { if (this.#dirty) this.collectGarbage().catch(error => this.emit('error', error)); }, 60_000);
+        this.#gcTimer.unref?.();
         debug(`CacacheBackend "${name}" initialized at ${this.#root}`);
     }
 
@@ -105,6 +116,7 @@ export default class CacacheBackend extends StorageBackend {
         const info = await cacache.get.info(this.#root, key);
         if (!info) return false;
         await cacache.rm.entry(this.#root, key, { removeFully: true });
+        this.#dirty = true;
         debug(`DELETE ${key}`);
         return true;
     }
@@ -123,6 +135,26 @@ export default class CacacheBackend extends StorageBackend {
             if (prefix && !info.key.startsWith(prefix)) continue;
             yield { key: info.key, size: info.size, modified: info.time, created: info.time };
         }
+    }
+
+    #serialize(fn) {
+        const next = this.#mutations.catch(() => {}).then(fn);
+        this.#mutations = next;
+        return next;
+    }
+
+    collectGarbage() {
+        return this.#serialize(async () => {
+            const result = await cacache.verify(this.#root);
+            this.#dirty = false;
+            return result;
+        });
+    }
+
+    async stop() {
+        clearInterval(this.#gcTimer);
+        await this.#mutations;
+        if (this.#dirty) await this.collectGarbage();
     }
 
     // Drop the whole content store (index + content). Used by Destroy/reset paths.

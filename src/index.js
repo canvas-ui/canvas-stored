@@ -1,6 +1,7 @@
 import EventEmitter2 from 'eventemitter2';
 import path from 'path';
 import crypto from 'crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createReadStream, createWriteStream, promises as fsp } from 'fs';
 import { once } from 'events';
 import { Readable } from 'stream';
@@ -14,8 +15,9 @@ import JobQueue from './sync/JobQueue.js';
 import Ledger from './sync/Ledger.js';
 import Mirror from './sync/Mirror.js';
 import BackendTrash from './trash.js';
+import ReplicaService from './sync/ReplicaService.js';
 import { isBuffer, isFile, isStream, resolveStoredPaths } from './utils/common.js';
-import { checksumBuffer, formatId } from './utils/checksum.js';
+import { checksumBuffer, checksumStream, formatId } from './utils/checksum.js';
 import { detectMimeType, detectMimeFromHead } from './utils/mime.js';
 
 const debug = Debug('stored');
@@ -37,6 +39,22 @@ const RENAME_WINDOW_MS = 1000;
 const MOVE_SUPPRESS_MS = 3000;
 
 export default class Stored extends EventEmitter2 {
+    #mutationContext = new AsyncLocalStorage();
+    #mutations = Promise.resolve();
+    #closing = false;
+    #stopPromise = null;
+
+    withStorageMutation(action) {
+        if (this.#mutationContext.getStore()?.active) return action();
+        if (this.#closing) return Promise.reject(Object.assign(new Error('Stored is stopping'), { code: 'STOPPED' }));
+        const next = this.#mutations.catch(() => {}).then(() => {
+            const scope = { active: true };
+            return this.#mutationContext.run(scope, async () => { try { return await action(); } finally { scope.active = false; } });
+        });
+        this.#mutations = next;
+        return next;
+    }
+    detachedStorageWork(action) { return this.#mutationContext.exit(action); }
     #cache;
     #backends;
     #index;
@@ -61,10 +79,18 @@ export default class Stored extends EventEmitter2 {
     #sweepTimer = null;
     #directoryMovesDb = null;
     #directoryMoveTasks = new Map();
+    #replicas;
 
     constructor(config = {}) {
         // Wildcards (':' delimiter) let consumers bind `object:*` across backends.
         super({ wildcard: true, delimiter: ':', maxListeners: 100, verboseMemoryLeak: false });
+        // API/FUSE mutations and replication share one physical executor.
+        // Reentrant calls (rename -> move, replica -> write) keep the lock.
+        for (const name of ['put', 'copy', 'move', 'writeObject', 'removeObject', 'renameObject', 'renameDirectory', 'trashDirectory',
+            'ensureDirectory', 'removeEmptyDirectory', 'restoreTrash', 'discardTrash', 'restoreRetained', 'deleteByUrl', 'delete']) {
+            const method = this[name].bind(this);
+            this[name] = (...args) => this.withStorageMutation(() => method(...args));
+        }
         this.#paths = resolveStoredPaths(config);
         this.#config = {
             checksums: config.checksums || ['sha256'],
@@ -84,18 +110,19 @@ export default class Stored extends EventEmitter2 {
         // entry, after the transaction that produced them committed).
         this.#index = new Index(this.#paths.index, {
             changes: config.changes,
-            onChange: (entries) => { for (const entry of entries) this.emit('change', entry); },
+            onChange: (entries) => this.detachedStorageWork(() => { for (const entry of entries) this.emit('change', entry); }),
         });
 
         this.#trash = new BackendTrash(this);
 
-        // Background sync queue for remote backends: file targets are copied by
-        // a worker thread, network drivers (gdrive, …) are committed in-process
-        // through their live backend (async I/O — nothing to offload, and the
-        // driver's credentials/path cache stay on the main thread).
-        this.#syncQueue = new SyncQueue({ resolveBackend: (name) => this.#backends.get(name) });
+        try { this.#replicas = new ReplicaService(this, config.replication || {}); }
+        catch (error) { this.#index.close(); void this.#cache.stop(); throw error; }
+        this.#replicas.on('changed', operation => this.detachedStorageWork(() => this.emit('replica:changed', operation)));
+        this.#replicas.on('fault', error => this.emit('error', error));
+        this.#syncQueue = new SyncQueue({ service: this.#replicas });
         this.#syncQueue.on('synced', ({ id, results }) => this.#handleSyncResult(id, results));
-        this.#syncQueue.on('error', (err) => this.emit('error', err));
+        this.#syncQueue.on('error', error => this.emit('error', error));
+        this.#pendingMoves = this.#index.openDB('pending-moves.v1');
 
         debug('Stored initialized');
     }
@@ -110,6 +137,36 @@ export default class Stored extends EventEmitter2 {
     get cache() { return this.#cache; }
     get index() { return this.#index; }
     get backends() { return this.#backends; }
+    get replicas() { return this.#replicas; }
+
+    // Called only after the executor has verified the exact target bytes.
+    async acknowledgeReplica(backendName, key, id, origin) {
+        const meta = this.#index.get(id);
+        if (!meta) throw new Error('Replica content is not indexed');
+        const backend = this.#backends.get(backendName);
+        const stat = await backend.stat(key);
+        if (!stat) throw new Error('Verified replica disappeared');
+        const location = this.#buildLocation(backendName, key, true, {
+            size: stat.size, mtime: stat.modified,
+            ...(stat.ino != null ? { ino: stat.ino, dev: stat.dev } : {}),
+        });
+        const saved = this.#index.put(id, { ...meta, locations: this.#mergeLocations(meta, [location]) }, { origin });
+        this.#emitLocationEvent('location:add', saved, location, { origin });
+    }
+
+    async ensureDirectory(backendName, key) {
+        const backend = this.#backends.get(backendName);
+        if (!this.#replicas.capabilities(backendName).directories || !this.#isSafeKey(key)) throw new Error('Safe directory creation is unsupported');
+        if (!(await this.#verifyBackendRoot(backend)).ok) throw Object.assign(new Error('Backend is offline'), { code: 'BACKEND_UNAVAILABLE', retryable: true });
+        return backend.createContainer(key);
+    }
+
+    async removeEmptyDirectory(backendName, key) {
+        const backend = this.#backends.get(backendName);
+        if (!this.#replicas.capabilities(backendName).directories || !this.#isSafeKey(key) || typeof backend.removeEmptyContainer !== 'function') throw new Error('Safe directory removal is unsupported');
+        if (!(await this.#verifyBackendRoot(backend)).ok) throw Object.assign(new Error('Backend is offline'), { code: 'BACKEND_UNAVAILABLE', retryable: true });
+        return backend.removeEmptyContainer(key);
+    }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Backend Management
@@ -131,6 +188,8 @@ export default class Stored extends EventEmitter2 {
         backend.on('scan:complete', e => this.emit('scan:complete', e));
         backend.on('error', e => this.emit('error', e));
 
+        backend.isDirectoryProtected = key => this.#replicas.owners().some(owner => owner.replicas.some(r =>
+            r.kind === 'directory' && r.backend === name && (r.key === key || r.key.startsWith(`${key}/`))));
         if (config.watch) backend.watch();
         return backend;
     }
@@ -264,17 +323,21 @@ export default class Stored extends EventEmitter2 {
         // Caller-supplied metadata + inline-extracted (EXIF/GPS/dimensions/media)
         // → persisted under `custom`, returned to caller + on the 'put' event.
         const extracted = ingest.extracted && Object.keys(ingest.extracted).length ? ingest.extracted : null;
-        const meta = this.#index.put(ingest.id, {
+        let meta;
+        this.#index.transaction(() => {
+        meta = this.#index.put(ingest.id, {
             checksums: ingest.checksums,
             size: ingest.size,
             mimeType: ingest.mimeType,
-            locations: ingest.locations,
+            locations: this.#mergeLocations(this.#index.get(ingest.id) || {}, ingest.locations),
             custom: extracted ? { ...metadata, ...extracted } : metadata,
         }, { origin: options.origin });
 
         if (ingest.remoteTargets.length) {
             this.#syncQueue.enqueue({ id: ingest.id, cacheRoot: this.#cache.root, cacheKey: ingest.id, targets: ingest.remoteTargets });
         }
+
+        });
 
         this.emit('put', { id: ingest.id, key: ingest.finalKey, metadata: meta });
         debug(`PUT ${ingest.id.slice(0, 19)}... → ${targets.map(t => t.name).join(', ')}`);
@@ -391,6 +454,8 @@ export default class Stored extends EventEmitter2 {
         const tempDir = backend.tempDir || path.join(this.#paths.cache, '.tmp');
         const tempPath = path.join(tempDir, `${Date.now()}-${crypto.randomUUID()}`);
         await fsp.mkdir(tempDir, { recursive: true });
+        let ingress = null;
+        let accepted = false;
 
         try {
             const stream = isBuffer(source) ? Readable.from([source])
@@ -403,7 +468,19 @@ export default class Stored extends EventEmitter2 {
                 return { ok: false, reason: 'checksum-mismatch', expected: String(options.sha256).toLowerCase(), actual: sha256 };
             }
 
-            const current = this.#index.get(pathKey);
+            const indexed = this.#index.get(pathKey);
+            const physical = await backend.stat(destKey);
+            let current = physical && indexed?.locations?.some(l => l.backend === backendName && l.key === destKey && l.synced !== false) ? indexed : null;
+            if (physical && backend.config.driver === 'file') {
+                // A watcher/index can lag behind an external writer. Check
+                // actual bytes before preconditions or the unchanged shortcut,
+                // and index previously unknown files so overwrites retain them.
+                const input = await backend.get(destKey, { stream: true });
+                const actual = await checksumStream(Buffer.isBuffer(input) ? Readable.from([input]) : input);
+                const after = await backend.stat(destKey);
+                if (!after || ['size', 'modified', 'ino', 'dev'].some(k => physical[k] !== after[k])) return { ok: false, reason: 'source-changed' };
+                if (!current || current.checksums?.sha256 !== actual.sha256) current = await this.refreshObject(backendName, destKey);
+            }
             const currentLoc = current?.locations?.find(l => l.backend === backendName && l.key === destKey) || null;
             const failed = this.#checkPrecondition(current, currentLoc, options);
             if (failed) return failed;
@@ -426,11 +503,30 @@ export default class Stored extends EventEmitter2 {
             }
 
             const mimeType = options.mimeType || await detectMimeFromHead(head, destKey);
+            if (!String(options.origin || '').startsWith('replica:')) ingress = await this.#replicas.captureIngress(backendName, destKey, id, tempPath);
             const release = this.#holdKeys([pathKey]);
             try {
-                if (current) await this.#retain(backendName, destKey, current);
+                const retained = current ? await this.#retain(backendName, destKey, current) : null;
                 let placed = null;
-                if (String(options.ifNoneMatch || '').trim() === '*') {
+                if (current && retained && typeof backend.trashFile === 'function') {
+                    // Capture the actual inode before publishing. A writer
+                    // outside Stored can race a precondition/retention read;
+                    // its bytes must survive even if it keeps the inode open.
+                    const captured = this.#trash.prepare(backendName, destKey, { retained, reason: 'overwrite' });
+                    this.#trash.quarantine(captured);
+                    const moved = await backend.trashFile(destKey, captured.id);
+                    this.#trash.finish(captured);
+                    if (moved.checksums.sha256 !== current.checksums?.sha256) {
+                        await this.#trash.restore(backendName, captured.id).catch(() => {});
+                        return { ok: false, reason: 'source-changed', trashId: captured.id };
+                    }
+                    try { placed = await backend.createFrom(destKey, tempPath); }
+                    catch (error) {
+                        await this.#trash.restore(backendName, captured.id).catch(() => {});
+                        if (error.code === 'EEXIST') return { ok: false, reason: 'precondition-failed', trashId: captured.id };
+                        throw error;
+                    }
+                } else if (String(options.ifNoneMatch || '').trim() === '*') {
                     if (typeof backend.createFrom !== 'function') return { ok: false, reason: 'unsupported-backend' };
                     try { placed = await backend.createFrom(destKey, tempPath); }
                     catch (error) {
@@ -466,6 +562,8 @@ export default class Stored extends EventEmitter2 {
                 const saved = this.#index.get(id);
                 const loc = saved?.locations?.find(l => l.backend === backendName && l.key === destKey) || null;
                 debug(`WRITE ${pathKey} ← ${id.slice(0, 19)}...${current ? ` (replaces ${current.id.slice(0, 19)}...)` : ''}`);
+                this.#replicas.commitIngress(ingress);
+                accepted = true;
                 return {
                     ok: true,
                     id,
@@ -481,6 +579,7 @@ export default class Stored extends EventEmitter2 {
                 release();
             }
         } finally {
+            if (!accepted) await this.#replicas.discardIngress(ingress);
             await fsp.rm(tempPath, { force: true }).catch(() => {});
         }
     }
@@ -704,6 +803,7 @@ export default class Stored extends EventEmitter2 {
         if (!backend?.canDelete || typeof backend.trashContainer !== 'function') throw new Error('Backend does not support recoverable folder deletion');
         const normalized = this.#normalizeKey(key, { nfc: true });
         if (!normalized || !this.#isSafeKey(normalized)) throw new Error('Invalid trash folder key');
+        this.#replicas.assertIdleEndpoint(backendName, normalized, { directory: true });
         if (!this.#retention) throw new Error('Enable backend retention before moving folders to Trash');
         const keys = [];
         for (const [, meta] of this.#index.entries()) {
@@ -718,6 +818,7 @@ export default class Stored extends EventEmitter2 {
             this.#trash.finish(item);
             this.#scheduleSweep();
             for (const key of keys) this.#processUnlink({ backend: backendName, key });
+            await this.#replicas.abandonUnownedIngress(backendName, normalized, { directory: true });
             return { ok: true, id: item.id, key: normalized, type: 'directory' };
         } finally { release(); }
     }
@@ -733,6 +834,7 @@ export default class Stored extends EventEmitter2 {
         if (!backend.canDelete) return { ok: false, reason: 'read-only-backend', backend: backendName };
         const destKey = this.#normalizeKey(key, { nfc: true });
         if (!destKey || !this.#isSafeKey(destKey)) return { ok: false, reason: 'invalid-key', key };
+        this.#replicas.assertIdleEndpoint(backendName, destKey, { except: String(options.origin || '').startsWith('replica:') ? options.origin.slice(8) : null });
 
         const pathKey = `${backendName}:${destKey}`;
         const current = this.#index.get(pathKey);
@@ -748,14 +850,38 @@ export default class Stored extends EventEmitter2 {
             // typed error, nothing is unlinked here).
             const retained = await this.#retain(backendName, destKey, current, 'delete');
             const trashed = retained?.trashItem;
-            await backend.delete(destKey, { ifMatch: options.ifMatch, origin: options.origin });
+            if (trashed && typeof backend.trashFile === 'function') {
+                this.#trash.quarantine(trashed);
+                const moved = await backend.trashFile(destKey, trashed.id);
+                this.#trash.finish(trashed);
+                if (moved.checksums.sha256 !== current.checksums?.sha256) {
+                    // A filesystem writer won the race. The captured inode is
+                    // recoverable even if it is still open in that process.
+                    await this.#trash.restore(backendName, trashed.id).catch(() => {});
+                    return { ok: false, reason: 'source-changed', trashId: trashed.id };
+                }
+            } else await backend.delete(destKey, { ifMatch: options.ifMatch, origin: options.origin });
             this.#trash.finish(trashed);
             this.#processUnlink({ backend: backendName, key: destKey, ...(options.origin ? { origin: options.origin } : {}) });
+            await this.#replicas.abandonUnownedIngress(backendName, destKey);
             debug(`REMOVE ${pathKey}`);
             return { ok: true, id: current.id, sha256: current.checksums?.sha256 ?? null, seq: this.#index.head() };
         } finally {
             release();
         }
+    }
+
+    async refreshObject(backendName, key, origin = null) {
+        const backend = this.#backends.get(backendName);
+        const before = await backend.stat(key);
+        if (!before) return null;
+        const input = await backend.get(key, { stream: true });
+        const checksums = await checksumStream(Buffer.isBuffer(input) ? Readable.from([input]) : input);
+        const after = await backend.stat(key);
+        if (!after || ['size', 'modified', 'ino', 'dev'].some(k => before[k] !== after[k])) throw new Error('File changed during refresh');
+        this.#handleFileEvent('file:add', { backend: backendName, key, checksums, ...after, origin,
+            path: backend.resolveKeyPath?.(key), mimeType: await detectMimeType(backend.resolveKeyPath(key)) }, { force: true });
+        return this.#index.get(`${backendName}:${key}`);
     }
 
     /**
@@ -772,6 +898,8 @@ export default class Stored extends EventEmitter2 {
         if (!fromKey || !this.#isSafeKey(fromKey)) return { ok: false, reason: 'invalid-key', key: from };
         if (!toKey || !this.#isSafeKey(toKey)) return { ok: false, reason: 'invalid-key', key: to };
         if (fromKey === toKey) return { ok: false, reason: 'same-key', key: fromKey };
+        this.#replicas.assertIdleEndpoint(backendName, fromKey);
+        this.#replicas.assertIdleEndpoint(backendName, toKey);
 
         const current = this.#index.get(`${backendName}:${fromKey}`);
         const currentLoc = current?.locations?.find(l => l.backend === backendName && l.key === fromKey) || null;
@@ -820,6 +948,8 @@ export default class Stored extends EventEmitter2 {
             return { ok: false, reason: 'invalid-key' };
         }
         const receiptKey = `${backendName}:${operationId}`;
+        this.#replicas.assertIdleEndpoint(backendName, fromKey, { directory: true });
+        this.#replicas.assertIdleEndpoint(backendName, toKey, { directory: true });
         const prior = this.#directoryMoveTasks.get(backendName) || Promise.resolve();
         const task = prior.catch(() => {}).then(async () => {
             const db = this.#directoryMovesDb ||= this.#index.openDB('directory-moves');
@@ -881,6 +1011,7 @@ export default class Stored extends EventEmitter2 {
                             locations: saved.locations.map(l => this.#describeLocation(l)), origin });
                     }
                     db.putSync(receiptKey, { from: fromKey, to: toKey, done: true });
+                    this.#replicas.moveIngress(backendName, fromKey, backendName, toKey, { directory: true });
                 });
                 for (const event of events) this.#emitObject('move', event);
                 return result();
@@ -981,11 +1112,9 @@ export default class Stored extends EventEmitter2 {
                 const previous = this.#displaceTargets(targets, destKey, meta.id, options);
                 const current = this.#index.get(meta.id) || meta;
                 const saved = this.#index.put(meta.id, { ...current, locations: this.#mergeLocations(current, transferred.locations) }, { origin: options.origin });
+                if (transferred.remoteTargets.length) this.#syncQueue.enqueue({ id: meta.id, cacheRoot: this.#cache.root, cacheKey: meta.id, targets: transferred.remoteTargets });
                 return { saved, previous };
             });
-            if (transferred.remoteTargets.length) {
-                this.#syncQueue.enqueue({ id: meta.id, cacheRoot: this.#cache.root, cacheKey: meta.id, targets: transferred.remoteTargets });
-            }
 
             for (const loc of transferred.locations) {
                 this.#emitLocationEvent('location:add', saved, loc, previous ? { previous } : {});
@@ -1026,6 +1155,8 @@ export default class Stored extends EventEmitter2 {
         if (!plan.ok) return plan;
 
         const { meta, sourceLocation, sourceBackend, targets, destKey } = plan;
+        this.#replicas.assertIdleEndpoint(sourceLocation.backend, sourceLocation.key);
+        for (const target of targets) this.#replicas.assertIdleEndpoint(target.name, destKey);
         if (!targets.length) {
             return { ok: true, id: meta.id, state: 'complete', unchanged: true, locations: await this.locations(meta.id) };
         }
@@ -1081,15 +1212,17 @@ export default class Stored extends EventEmitter2 {
                 const previous = this.#displaceTargets(targets, destKey, meta.id, options);
                 const current = this.#index.get(meta.id) || meta;
                 const saved = this.#index.put(meta.id, { ...current, locations: this.#mergeLocations(current, transferred.locations) }, { origin: options.origin });
+                if (transferred.remoteTargets.length) {
+                    const pending = this.#pendingMoves.get(meta.id) || [];
+                    pending.push({ sourceLocation, target: target.name, destKey: targetKey });
+                    this.#pendingMoves.putSync(meta.id, pending);
+                    this.#syncQueue.enqueue({ id: meta.id, cacheRoot: this.#cache.root, cacheKey: meta.id, targets: transferred.remoteTargets });
+                }
                 return { saved, previous };
             });
             this.#emitLocationEvent('location:add', saved, location, previous ? { previous } : {});
 
             if (transferred.remoteTargets.length) {
-                const pending = this.#pendingMoves.get(meta.id) || [];
-                pending.push({ sourceLocation, target: target.name, destKey: targetKey });
-                this.#pendingMoves.set(meta.id, pending);
-                this.#syncQueue.enqueue({ id: meta.id, cacheRoot: this.#cache.root, cacheKey: meta.id, targets: transferred.remoteTargets });
                 debug(`MOVE (pending sync) ${sourceLocation.backend}:${sourceLocation.key} → ${target.name}:${targetKey}`);
                 return {
                     ok: true,
@@ -1270,8 +1403,14 @@ export default class Stored extends EventEmitter2 {
     // Lifecycle
     // ─────────────────────────────────────────────────────────────────────────
 
-    async stop() {
+    stop() {
+        if (!this.#stopPromise) { this.#closing = true; this.#stopPromise = this.#stop(); }
+        return this.#stopPromise;
+    }
+    async #stop() {
         if (this.#sweepTimer) { clearInterval(this.#sweepTimer); this.#sweepTimer = null; }
+        await this.#replicas.stop();
+        await this.#mutations.catch(() => {});
         await this.#syncQueue.stop();
         await this.#backends.stopAll();
         // Flush held unlinks (watchers are stopped — no add can claim them now)
@@ -1281,6 +1420,10 @@ export default class Stored extends EventEmitter2 {
             this.#pendingUnlinks.delete(pendingKey);
             this.#processUnlink(data);
         }
+        // No stream writers remain at shutdown. Verify reclaims content whose
+        // staging keys were released without racing an ingress stream.
+        await this.#cache.stop();
+        this.#replicas.releaseExecutor();
         this.#index.close();
         debug('Stopped');
     }
@@ -1295,13 +1438,14 @@ export default class Stored extends EventEmitter2 {
 
         for (const r of results) {
             if (!r.success) continue;
-            const loc = meta.locations.find(l => l.backend === r.backend);
+            const loc = meta.locations.find(l => l.backend === r.backend && l.key === r.key);
             if (loc) loc.synced = true;
         }
 
         this.#index.put(meta.id, meta);
         this.emit('synced', { id, results });
-        this.#resolvePendingMoves(id, results);
+        // Source retirement is replayed by resumePendingMoves, under the same
+        // executor lock, after the durable destination receipt commits.
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1594,16 +1738,21 @@ export default class Stored extends EventEmitter2 {
         try {
             if (removeSourceBytes) {
                 const sourceBackend = this.#backends.get(sourceLocation.backend);
-                const deleted = await sourceBackend.delete(sourceLocation.key).catch(() => false);
-                if (!deleted) {
-                    return {
-                        ok: false,
-                        reason: 'source-delete-failed',
-                        degradedToCopy: true,
-                        id,
-                        from: this.#endpoint(sourceLocation),
-                        to: this.#endpoint(newLocation),
-                    };
+                const targetBackend = this.#backends.get(newLocation.backend);
+                if (!sourceBackend || !targetBackend) return { ok: false, reason: 'backend-offline' };
+                const bytes = await targetBackend.get(newLocation.key, { stream: true });
+                if (!bytes || `sha256:${(await checksumStream(Buffer.isBuffer(bytes) ? Readable.from([bytes]) : bytes)).sha256}` !== id) return { ok: false, reason: 'target-changed' };
+                const sourceStat = await sourceBackend.stat(sourceLocation.key);
+                if (sourceStat) {
+                    const source = await sourceBackend.get(sourceLocation.key, { stream: true });
+                    if (!source || `sha256:${(await checksumStream(Buffer.isBuffer(source) ? Readable.from([source]) : source)).sha256}` !== id) return { ok: false, reason: 'source-changed' };
+                    this.#replicas.moveIngress(sourceLocation.backend, sourceLocation.key, newLocation.backend, newLocation.key);
+                    const result = sourceBackend.config.driver === 'cacache'
+                        ? await this.deleteByUrl(`stored://${sourceLocation.backend}/${sourceLocation.key}`)
+                        : (this.#retention && sourceBackend.config.driver === 'file')
+                            ? await this.removeObject(sourceLocation.backend, sourceLocation.key, { ifMatch: id.slice(7), origin })
+                            : { ok: false, reason: 'recovery-unavailable' };
+                    if (!result.ok) return { ...result, degradedToCopy: true };
                 }
             }
 
@@ -1619,6 +1768,7 @@ export default class Stored extends EventEmitter2 {
                 ? { backend: newLocation.backend, from: sourceLocation.key, to: newLocation.key }
                 : null;
             const saved = this.#index.put(id, { ...current, locations }, { origin, rename });
+            this.#replicas.moveIngress(sourceLocation.backend, sourceLocation.key, newLocation.backend, newLocation.key);
 
             this.#emitObject('move', {
                 id,
@@ -1645,36 +1795,23 @@ export default class Stored extends EventEmitter2 {
     }
 
     /** Finish moves that were waiting on a remote destination write. */
-    #resolvePendingMoves(id, results = []) {
-        const pending = this.#pendingMoves.get(id);
-        if (!pending) return;
-
-        const succeeded = new Set(results.filter(r => r.success).map(r => r.backend));
-        const failed = new Set(results.filter(r => !r.success).map(r => r.backend));
-        const remaining = [];
-
-        for (const entry of pending) {
-            if (succeeded.has(entry.target)) {
-                const meta = this.#index.get(id);
-                const location = (meta?.locations || []).find(l => l.backend === entry.target && l.key === entry.destKey);
-                if (location) {
-                    this.#finalizeMove(id, entry.sourceLocation, location, { removeSourceBytes: true })
-                        .catch(err => this.emit('error', err));
+    async resumePendingMoves() {
+        return this.withStorageMutation(async () => {
+            for (const { key: id, value: pending } of [...this.#pendingMoves.getRange()]) {
+                const remaining = [];
+                for (const entry of pending) {
+                    try {
+                        const meta = this.#index.get(id);
+                        const location = meta?.locations?.find(l => l.backend === entry.target && l.key === entry.destKey && l.synced !== false);
+                        if (!location) { remaining.push(entry); continue; }
+                        const result = await this.#finalizeMove(id, entry.sourceLocation, location, { removeSourceBytes: true });
+                        if (!result.ok) remaining.push({ ...entry, error: result.reason });
+                    } catch (error) { remaining.push({ ...entry, error: error.message }); }
                 }
-            } else if (failed.has(entry.target)) {
-                // Destination write failed — the source stays exactly where it
-                // is. The object is unharmed; the move simply did not happen.
-                this.emit('error', Object.assign(
-                    new Error(`Move to ${entry.target} failed; source retained at ${entry.sourceLocation.backend}:${entry.sourceLocation.key}`),
-                    { id, code: 'MOVE_SYNC_FAILED' },
-                ));
-            } else {
-                remaining.push(entry);
+                if (remaining.length) this.#pendingMoves.putSync(id, remaining);
+                else this.#pendingMoves.removeSync(id);
             }
-        }
-
-        if (remaining.length) this.#pendingMoves.set(id, remaining);
-        else this.#pendingMoves.delete(id);
+        });
     }
 
     /**
@@ -1897,6 +2034,8 @@ export default class Stored extends EventEmitter2 {
             }
             ws.end();
             await once(ws, 'finish');
+            const handle = await fsp.open(tempPath, 'r');
+            try { await handle.sync(); } finally { await handle.close(); }
         } catch (err) {
             ws.destroy();
             throw err;
@@ -2070,8 +2209,10 @@ export default class Stored extends EventEmitter2 {
     // Emit a file event under both its typed name (`file:<suffix>`) and the
     // generic `object:<suffix>` (kind:'file') so consumers can bind either.
     #emitObject(suffix, payload) {
-        this.emit(`file:${suffix}`, payload);
-        this.emit(`object:${suffix}`, { kind: 'file', ...payload });
+        this.detachedStorageWork(() => {
+            this.emit(`file:${suffix}`, payload);
+            this.emit(`object:${suffix}`, { kind: 'file', ...payload });
+        });
     }
 
     // `options.force` bypasses the echo suppression — used when stored itself

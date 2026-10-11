@@ -1,5 +1,6 @@
 import cacache from 'cacache';
 import Debug from 'debug';
+import { Writable } from 'node:stream';
 
 const debug = Debug('stored:cache');
 
@@ -11,11 +12,16 @@ const CACHE_OPTS = { memoize: false };
 export default class Cache {
     #root;
     #algorithms;
+    #mutations = Promise.resolve();
+    #dirty = false;
+    #timer;
 
     constructor(config) {
         if (!config?.path) throw new Error('Cache path required');
         this.#root = config.path;
         this.#algorithms = config.algorithms || ['sha256'];
+        this.#timer = setInterval(() => { if (this.#dirty) this.verify().catch(error => debug(`Cache collection failed: ${error.message}`)); }, 60_000);
+        this.#timer.unref?.();
         debug(`Cache initialized at "${this.#root}"`);
     }
 
@@ -32,11 +38,27 @@ export default class Cache {
     has(key) { return cacache.get.info(this.#root, key); }
 
     put(key, data, metadata = {}) {
-        return cacache.put(this.#root, key, data, { algorithms: this.#algorithms, metadata, ...CACHE_OPTS });
+        return this.#serialize(() => cacache.put(this.#root, key, data, { algorithms: this.#algorithms, metadata, ...CACHE_OPTS }));
     }
 
     putStream(key, metadata = {}) {
-        return cacache.put.stream(this.#root, key, { algorithms: this.#algorithms, metadata, ...CACHE_OPTS });
+        let sink, release;
+        const self = this;
+        return new Writable({
+            construct(done) {
+                const output = this;
+                self.#serialize(() => new Promise(resolve => {
+                    release = resolve;
+                    sink = cacache.put.stream(self.#root, key, { algorithms: self.#algorithms, metadata, ...CACHE_OPTS });
+                    sink.on('error', error => output.destroy(error));
+                    sink.on('integrity', value => output.emit('integrity', value));
+                    done();
+                })).catch(error => output.destroy(error));
+            },
+            write(chunk, encoding, done) { sink.write(chunk, encoding, done); },
+            final(done) { sink.once('finish', () => { release(); done(); }); sink.end(); },
+            destroy(error, done) { sink?.destroy(); release?.(); done(error); },
+        });
     }
 
     get(key) { return cacache.get(this.#root, key, CACHE_OPTS); }
@@ -45,11 +67,13 @@ export default class Cache {
 
     getInfo(key) { return cacache.get.info(this.#root, key); }
 
-    delete(key) { return cacache.rm.entry(this.#root, key, { removeFully: true }); }
+    delete(key) { return this.#serialize(async () => { await cacache.rm.entry(this.#root, key, { removeFully: true }); this.#dirty = true; }); }
 
-    clear() { return cacache.rm.all(this.#root); }
+    clear() { return this.#serialize(() => cacache.rm.all(this.#root)); }
 
-    verify() { return cacache.verify(this.#root); }
+    #serialize(action) { const next = this.#mutations.catch(() => {}).then(action); this.#mutations = next; return next; }
+    verify() { return this.#serialize(async () => { const result = await cacache.verify(this.#root); this.#dirty = false; return result; }); }
+    async stop() { clearInterval(this.#timer); await this.verify(); }
 
     // Stream the index so a 1M+ entry store is tallied without ever holding the
     // full key set in memory.

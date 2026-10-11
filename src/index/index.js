@@ -38,7 +38,9 @@ export default class Index {
     #appendsSinceTrim = 0;
 
     constructor(path = './.stored/index', options = {}) {
-        this.#db = open({ path, name: 'metadata', compression: true });
+        // Object indexes, edge replicas, operation receipts, ingress and Trash
+        // share this environment. LMDB's default named-DB limit is too small.
+        this.#db = open({ path, name: 'metadata', compression: true, maxDbs: 64 });
         this.#pathDb = this.#db.openDB('paths');
         this.#changesDb = this.#db.openDB('changes');
         this.#metaDb = this.#db.openDB('index-meta');

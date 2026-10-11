@@ -204,6 +204,23 @@ export default class FileBackend extends StorageBackend {
         return true;
     }
 
+    async removeEmptyContainer(key) {
+        const dir = await this.#trashTarget(key);
+        try { await fs.rmdir(dir); return { removed: true }; }
+        catch (error) {
+            if (error.code === 'ENOENT') return { removed: false };
+            // Preserve unindexed and independently owned children.
+            if (error.code === 'ENOTEMPTY' || error.code === 'EEXIST') return { removed: false, reason: 'not-empty' };
+            throw error;
+        }
+    }
+
+    async statContainer(key) {
+        const target = await this.#trashTarget(key);
+        try { const stat = await fs.lstat(target); return stat.isDirectory() ? { kind: 'directory', dev: stat.dev, ino: stat.ino } : null; }
+        catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+    }
+
     #trashPath(id) {
         if (!/^[a-f0-9-]{36}$/.test(id)) throw new Error('Invalid trash item id');
         return path.join(this.#tempDir, 'trash', id);
@@ -232,6 +249,19 @@ export default class FileBackend extends StorageBackend {
         // EXDEV fails safely with the source intact (a custom staging directory
         // on another volume must not trigger copy-and-delete of a live tree).
         await fs.rename(source, destination);
+        await this.#syncDirectory(path.dirname(source));
+        await this.#syncDirectory(path.dirname(destination));
+    }
+
+    async trashFile(key, id) {
+        const source = await this.#trashTarget(key);
+        if (!(await fs.lstat(source)).isFile()) throw new Error('Trash source is not a regular file');
+        const destination = this.#trashPath(id);
+        await fs.ensureDir(path.dirname(destination));
+        await fs.rename(source, destination);
+        await this.#syncDirectory(path.dirname(source));
+        await this.#syncDirectory(path.dirname(destination));
+        return { checksums: await checksumFile(destination, ['sha256']) };
     }
 
     async validateTrashTarget(key) { await this.#trashTarget(key); }
@@ -265,11 +295,18 @@ export default class FileBackend extends StorageBackend {
         return path.join(this.#tempDir, `${Date.now()}-${process.pid}-${Math.random().toString(16).slice(2)}`);
     }
 
+    async #syncDirectory(directory) {
+        for (let current = directory;; current = path.dirname(current)) {
+            const handle = await fsp.open(current, 'r');
+            try { await handle.sync(); } finally { await handle.close(); }
+            if (current === this.#root || !current.startsWith(`${this.#root}${path.sep}`)) break;
+        }
+    }
+
     // Every placement ends with rename(2) over the destination: a reader sees
     // either the previous bytes or the complete new ones, never a partial
-    // file, and a crash mid-write leaves only a staging file behind. This is
-    // also what makes hardlink-based retention safe (see retain()): the old
-    // inode is never written to in place, it is displaced.
+    // file. Retention uses independent inodes because external writers may
+    // keep modifying a displaced inode through an open handle.
     //
     // The staging dir normally shares the destination's filesystem, but a
     // configured `tempDir` can sit on another mount (a container's /state next
@@ -278,8 +315,11 @@ export default class FileBackend extends StorageBackend {
     // destination — same directory, same mount by construction — and the
     // rename from there. Siblings are ignored by the watcher/scan like the dir.
     async #finish(tmp, dest) {
+        const handle = await fsp.open(tmp, 'r');
+        try { await handle.sync(); } finally { await handle.close(); }
         try {
             await fs.rename(tmp, dest);
+            await this.#syncDirectory(path.dirname(dest));
             return;
         } catch (err) {
             if (err.code !== 'EXDEV') throw err;
@@ -287,7 +327,10 @@ export default class FileBackend extends StorageBackend {
         const sibling = path.join(path.dirname(dest), `${TMP_DIR}-${process.pid}-${Math.random().toString(16).slice(2)}`);
         try {
             await fs.copyFile(tmp, sibling);
+            const handle = await fsp.open(sibling, 'r');
+            try { await handle.sync(); } finally { await handle.close(); }
             await fs.rename(sibling, dest);
+            await this.#syncDirectory(path.dirname(dest));
         } finally {
             await fs.remove(sibling).catch(() => {});
         }
@@ -309,20 +352,14 @@ export default class FileBackend extends StorageBackend {
         return { key, size: stats.size };
     }
 
-    // Place an already-written file (e.g. a streamed temp) at `key`: hardlink
-    // it to a staging name (zero copy on the same filesystem; a byte copy
-    // across filesystems), then rename over the destination.
+    // Clone to a separate inode before publishing. The input may be an
+    // immutable cache pin; writable files must never share its inode.
     async commit(key, srcPath) {
         const dest = this.#resolvePath(key);
         await fs.ensureDir(path.dirname(dest));
         const tmp = await this.#stagingPath();
         try {
-            try {
-                await fs.link(srcPath, tmp);
-            } catch (err) {
-                if (!['EXDEV', 'EPERM', 'EMLINK', 'ENOTSUP', 'EOPNOTSUPP'].includes(err.code)) throw err;
-                await fs.copyFile(srcPath, tmp);
-            }
+            await fs.copyFile(srcPath, tmp, fs.constants.COPYFILE_FICLONE);
             await this.#finish(tmp, dest);
         } finally {
             await fs.remove(tmp).catch(() => {});
@@ -337,18 +374,15 @@ export default class FileBackend extends StorageBackend {
     async createFrom(key, srcPath) {
         const dest = this.#resolvePath(key);
         await fs.ensureDir(path.dirname(dest));
+        const sibling = path.join(path.dirname(dest), `${TMP_DIR}-${process.pid}-${Math.random().toString(16).slice(2)}`);
         try {
-            await fs.link(srcPath, dest);
-        } catch (error) {
-            if (error.code !== 'EXDEV') throw error;
-            // Stage on the destination filesystem, then publish atomically.
-            const sibling = path.join(path.dirname(dest), `${TMP_DIR}-${process.pid}-${Math.random().toString(16).slice(2)}`);
-            try {
-                await fs.copyFile(srcPath, sibling);
-                await fs.link(sibling, dest);
-            } finally {
-                await fs.remove(sibling).catch(() => {});
-            }
+            await fs.copyFile(srcPath, sibling, fs.constants.COPYFILE_FICLONE);
+            const handle = await fsp.open(sibling, 'r');
+            try { await handle.sync(); } finally { await handle.close(); }
+            await fs.link(sibling, dest);
+            await this.#syncDirectory(path.dirname(dest));
+        } finally {
+            await fs.remove(sibling).catch(() => {});
         }
         const stat = await this.stat(key);
         if (!stat) throw new Error(`Upload destination disappeared: ${key}`);
@@ -359,10 +393,7 @@ export default class FileBackend extends StorageBackend {
     //
     // Bytes an overwrite or delete is about to displace are kept for a while
     // under `<tempDir>/retained/<sha256>` (Stored decides when; the window is
-    // its config). A hardlink shares the inode with the visible file only
-    // until the placement above renames a new inode over it — placements are
-    // never in-place writes, so the retained copy stays what it was. On
-    // filesystems without hardlinks the bytes are copied.
+    // its config). Reflink or copy gives each version an independent inode.
 
     get retainDir() { return path.join(this.#tempDir, 'retained'); }
     retainedPath(sha256) { return path.join(this.retainDir, String(sha256).toLowerCase()); }
@@ -372,16 +403,23 @@ export default class FileBackend extends StorageBackend {
         if (!sha256 || !await fs.pathExists(src)) return null;
         const dest = this.retainedPath(sha256);
         const existing = await fs.stat(dest).catch(() => null);
-        if (existing) return { path: dest, size: existing.size, existing: true };
-        await fs.ensureDir(this.retainDir);
-        try {
-            await fs.link(src, dest);
-        } catch (err) {
-            if (!['EXDEV', 'EPERM', 'EMLINK', 'ENOTSUP', 'EOPNOTSUPP'].includes(err.code)) throw err;
-            const tmp = await this.#stagingPath();
-            try { await fs.copyFile(src, tmp); await fs.rename(tmp, dest); }
-            finally { await fs.remove(tmp).catch(() => {}); }
+        if (existing) {
+            if ((await checksumFile(dest, ['sha256'])).sha256 !== sha256) throw new Error('Retained content failed verification');
+            return { path: dest, size: existing.size, existing: true };
         }
+        await fs.ensureDir(this.retainDir);
+        // A network-share writer can keep an inode open and modify it in
+        // place. A hardlink is therefore not a recoverable version.
+        const tmp = await this.#stagingPath();
+        try {
+            await fs.copyFile(src, tmp, fs.constants.COPYFILE_FICLONE);
+            const checksums = await checksumFile(tmp, ['sha256']);
+            if (checksums.sha256 !== sha256) throw Object.assign(new Error('File changed before retention'), { code: 'SOURCE_CHANGED' });
+            const handle = await fsp.open(tmp, 'r');
+            try { await handle.sync(); } finally { await handle.close(); }
+            await fs.rename(tmp, dest);
+            await this.#syncDirectory(path.dirname(dest));
+        } finally { await fs.remove(tmp).catch(() => {}); }
         const stats = await fs.stat(dest);
         debug(`RETAIN ${key} → ${sha256.slice(0, 12)} (${stats.size} bytes)`);
         return { path: dest, size: stats.size, existing: false };
@@ -442,6 +480,7 @@ export default class FileBackend extends StorageBackend {
     async pruneEmptyParents(key) {
         let rel = path.posix.dirname(String(key).split(path.sep).join('/'));
         while (rel && rel !== '.' && rel !== '/') {
+            if (this.isDirectoryProtected?.(rel)) return;
             if (this.#isTempPath(rel) || (this.#tempRel && this.#tempRel.startsWith(`${rel}/`))) return;
             const dir = this.#resolvePath(rel);
             if (dir === this.#root) return;

@@ -99,9 +99,9 @@ test('pagination visits every item once and failed deletes do not appear as succ
     assert.equal(ids.length, 7); assert.equal(new Set(ids).size, 7);
     await put('denied.txt', 'keep');
     const backend = stored.getBackend('a');
-    const original = backend.delete; backend.delete = async () => { throw new Error('permission denied'); };
+    const original = backend.trashFile; backend.trashFile = async () => { throw new Error('permission denied'); };
     await assert.rejects(stored.removeObject('a', 'denied.txt'), /permission denied/);
-    backend.delete = original;
+    backend.trashFile = original;
     assert.equal((await stored.listTrash('a')).items.length, 7);
 });
 

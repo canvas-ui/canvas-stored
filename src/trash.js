@@ -8,12 +8,12 @@ export default class BackendTrash {
     get db() { return this._db ??= this.stored.index.openDB('backend-trash-v1'); }
     get days() { return this.stored.retention?.days || 0; }
 
-    prepare(backend, key, { retained = null, directory = false, mtime = null } = {}) {
+    prepare(backend, key, { retained = null, directory = false, mtime = null, reason = 'delete' } = {}) {
         if (!this.days || (!directory && !retained)) return null;
         const item = {
             id: crypto.randomUUID(), backend, key, type: directory ? 'directory' : 'file',
             sha256: retained?.sha256 ?? null, size: retained?.size ?? null,
-            mimeType: retained?.mimeType ?? null, mtime, deletedAt: Date.now(), state: 'pending',
+            mimeType: retained?.mimeType ?? null, mtime, reason, deletedAt: Date.now(), state: 'pending',
         };
         this.db.putSync(`item:${item.id}`, item);
         return item;
@@ -21,6 +21,10 @@ export default class BackendTrash {
 
     finish(item) {
         if (item) this.db.putSync(`item:${item.id}`, { ...item, state: 'active' });
+    }
+    quarantine(item) {
+        item.quarantined = true;
+        this.db.putSync(`item:${item.id}`, item);
     }
 
     async importLegacy(backendName) {
@@ -53,7 +57,7 @@ export default class BackendTrash {
             || Date.now() - item.deletedAt >= this.days * 86400000) return null;
         if (item.state === 'pending') {
             const backend = this.stored.getBackend(backendName);
-            const deleted = item.type === 'directory'
+            const deleted = item.type === 'directory' || item.quarantined
                 ? await backend.hasTrashedDirectory(item.id)
                 : !await backend.stat(item.key);
             if (!deleted) return null;
@@ -71,7 +75,8 @@ export default class BackendTrash {
             if (!key.startsWith('item:') || value.backend !== backendName
                 || (cursor && value.id.localeCompare(cursor) <= 0)) continue;
             const item = await this.get(backendName, value.id);
-            if (item) items.push(item);
+            // Overwrite captures back retained versions, not user deletions.
+            if (item && item.reason !== 'overwrite') items.push(item);
         }
         items.sort((a, b) => a.id.localeCompare(b.id));
         const page = items.slice(0, limit);
@@ -95,11 +100,13 @@ export default class BackendTrash {
         if (!item) return { ok: false, reason: 'not-found', id };
         if (item.state === 'discarding') return { ok: false, reason: 'deletion-pending', id };
         await this.stored.getBackend(backendName).validateTrashTarget?.(item.key);
-        const result = item.type === 'directory'
+        const result = item.type === 'directory' || item.quarantined
             ? await this.stored.getBackend(backendName).restoreTrashedDirectory(id, item.key)
             : await this.stored.restoreRetained(item.sha256, {
                 backend: backendName, key: item.key, ifNoneMatch: '*', mtime: item.mtime, origin,
             });
+        if (item.quarantined && result.reason === 'target-exists') result.reason = 'precondition-failed';
+        if (result?.ok && item.quarantined) await this.stored.refreshObject(backendName, item.key, origin);
         if (result?.ok) this.db.putSync(`item:${id}`, { ...item, state: 'restored', restoredAt: Date.now() });
         return { ...result, id, key: item.key, type: item.type };
     }
@@ -129,6 +136,7 @@ export default class BackendTrash {
         this.db.putSync(`item:${id}`, { ...item, state: 'discarding' });
         const finish = () => this.db.putSync(`item:${id}`, { ...item, state: 'discarded', discardedAt: Date.now() });
         if (item.type === 'directory') { await backend.dropTrashedDirectory(id); finish(); }
+        else if (item.quarantined) { await backend.dropTrashedDirectory(id); await this.stored.discardTrashBytes(item, finish); }
         else await this.stored.discardTrashBytes(item, finish);
         return result;
     }
@@ -136,7 +144,7 @@ export default class BackendTrash {
     async sweep(now) {
         for (const { key, value } of [...this.db.getRange()]) {
             if (!key.startsWith('item:') || now - value.deletedAt < this.days * 86400000) continue;
-            if (value.type === 'directory') {
+            if (value.type === 'directory' || value.quarantined) {
                 const backend = this.stored.getBackend(value.backend);
                 if (!backend) continue;
                 await backend.dropTrashedDirectory(value.id);

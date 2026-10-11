@@ -21,7 +21,7 @@ describe('Stored ↔ remote (gdrive) backend', () => {
     before(async () => {
         await fs.ensureDir(LOCAL);
         drive = new FakeDrive();
-        stored = new Stored({ root: path.join(base, 'stored'), checksums: ['sha256'] });
+        stored = new Stored({ root: path.join(base, 'stored'), checksums: ['sha256'], retention: { days: 30 } });
         stored.addBackend('local', { driver: 'file', root: LOCAL });
         stored.addBackend('gdrive:acc', { driver: 'gdrive', ...CREDS, fetch: drive.fetch });
     });

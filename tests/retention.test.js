@@ -148,7 +148,7 @@ describe('retention window + atomic placement', async () => {
         await backend.commit('atomic/p.txt', staged);
         assert.strictEqual(await fs.readFile(path.join(A, 'atomic/p.txt'), 'utf8'), 'committed bytes');
         assert.strictEqual(await fs.pathExists(staged), true, 'commit() does not consume its source');
-        const leftovers = (await fs.readdir(path.join(A, '.stored-tmp'))).filter((f) => f !== 'retained');
+        const leftovers = (await fs.readdir(path.join(A, '.stored-tmp'))).filter((f) => !['retained', 'trash'].includes(f));
         assert.deepStrictEqual(leftovers, []);
     });
 });

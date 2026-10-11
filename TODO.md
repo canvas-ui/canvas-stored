@@ -2,8 +2,173 @@
 
 ## Roadmap
 
-Ordered by what unblocks what. P0/P1 are the MVP gap; everything below is
-already-known work kept for context.
+The current storage-policy gaps below are the follow-up to Stored 1.10.0,
+canvas-server 2.20.0 and canvas-web 2.19.0 (2026-10-11). They supersede the
+historical delivery notes further down. Existing unrelated backlog is retained.
+
+## Storage policies — remaining gaps and deployment limits
+
+The implemented boundary is: Stored owns physical bytes, exact replica
+ownership, staging, the durable journal, verification, retries and recoverable
+removal. Workspace owns policy configuration, document identity and virtual-tree
+projection. Future work must preserve that boundary; the items mentioning
+Workspace, FUSE or Web require changes or validation in those repos.
+
+See [the physical replication contract](src/sync/REPLICAS.md) and
+[the workspace policy contract](../canvas-server/src/core/workspace/services/storage-policies/README.md).
+
+### Current supported behavior
+
+- The pilot mutation path is the Canvas API, including canvas-fuse and Canvas
+  UI/API clients. For predictable mirrored renames, moves and deletes, use those
+  paths rather than modifying the server's backing directories through Samba
+  or SSH. Using canvas-fuse is sufficient to express intent, but does not remove
+  the unsupported-operation limits below.
+- Recoverable mirror policies currently require writable **file backends with
+  retention enabled**. Targets are asynchronous: a partial failure can leave
+  some destinations updated and others pending. Staging remains until all
+  required exact destinations verify; this is not an atomic transaction across
+  backends. Conflicts stop the affected operation rather than undoing another
+  writer's changes.
+- **Google Drive is not a write-only driver.** It can read, enumerate/index
+  binary files and poll changes. Automated `kind: "filing"` policies can create
+  copies there, with `onConflict: "error"` or `"rename"`. Existing filing
+  copies survive unfiling. Changed content at the same key errors or creates a
+  new name according to that setting; it is not updated as a mirror.
+- Google Drive **mirror policies, automated overwrite/removal and proactive
+  empty-folder mirroring are rejected**. Uploads can create their needed parent
+  folders. Existing low-level/manual Drive operations are separate from the
+  new replica executor's recovery guarantees. Reading/indexing Drive changes
+  does not enable bidirectional policy mirroring.
+- Mirrored file edits and renames preserve the document ID. Legacy successor
+  behavior for unmanaged files is unchanged. Notes-as-files and layer metadata
+  remain explicitly deferred.
+
+### Pilot qualification and recovery work
+
+- [ ] **Exercise actual canvas-fuse mounts against the updated server.** Cover
+  editor atomic-save patterns, open handles, folder and file moves, deletion,
+  offline/reconnect, lost responses, server restarts and conflicts. Workspace
+  API scenario tests passed; an actual kernel FUSE mount was not exercised in
+  this change. Verify unsupported operations surface useful errors to clients.
+- [ ] **Complete deployment and durability qualification.** Build/run the
+  production image (including `util-linux`/`flock`), test with representative
+  ZFS datasets, quotas/disk-full conditions and interrupted writes. Abrupt
+  process-exit tests cover placement, release and retirement; they do not prove
+  power-loss durability or SMB/NFS mount behavior. Rehearse restoration of both
+  journal/index state and bytes from snapshots/backups.
+- [ ] **Browser-verify the policy editor and recovery UI.** Build/typecheck
+  passed; browser workflows, stale edits, capability restrictions, failed
+  transfers and retries were not exercised interactively.
+- [ ] **Provide explicit resolution for blocked state.** Retry reuses the
+  accepted immutable plan. New content can supersede old work, but a policy
+  change alone does not rewrite unfinished work. Add a safe, reviewable
+  cancel/replan or recovery workflow that accounts for partial ownership and
+  pinned bytes; never discard a journal row or pin to make an error disappear.
+- [ ] **Handle drift and observation gaps through deliberate repair.** Audits
+  detect drift but do not blindly restore/delete changed replicas. An unpaired
+  disappearance, expired change-feed cursor, missing document row, conflicting
+  byte edit or ambiguous mapping blocks automatic propagation. Provide a
+  rescan/rebaseline workflow with explicit preservation of independent changes.
+  Currently a planning/observation error can block the whole workspace pass,
+  even though the physical executor isolates blocked owners. Isolate unrelated
+  planning failures only where a complete, safe plan can still be established.
+- [ ] **Resolve content-identity collisions without losing curation.** If an
+  edited mirrored document's new checksum already belongs to another document,
+  projection blocks rather than merging IDs. Define and test an explicit
+  resolution preserving both documents' relations and placements.
+
+### Namespace operations and Samba
+
+- [ ] **Infer raw filesystem folder moves before permitting unrestricted Samba
+  writes.** Directory rename/move outside the API is not represented as one
+  complete intent today. Preserve empty descendants, nested document identities
+  and exact ownership; survive watcher reordering, missed events and restart.
+  A confidently paired same-inode file rename can already propagate, but that
+  is not a guarantee for arbitrary Samba/SSH moves, cross-filesystem moves or
+  copy-then-delete sequences. Unpaired removal must never cascade by guesswork.
+- [ ] **Define supported root and flat-mapping moves.** API folder moves within
+  an unambiguous recursive mirror are supported. Renaming the mirror root,
+  crossing that root or reconstructing a move from a flat target is refused or
+  blocks projection. Policy paths are literal paths, not stable folder IDs;
+  implement an explicit coordinated policy/placement migration before exposing
+  root moves as transparent operations.
+- [ ] **Qualify network filesystem semantics separately.** Exporting local
+  workspace files over Samba allows writes outside Canvas's operation queue.
+  Consuming an OS-mounted CIFS/NFS share as a file backend is a different case:
+  root liveness, remote change detection, inode stability, exclusive create,
+  rename, fsync and recoverable quarantine need deployment-specific tests.
+  `driver: "file"` capability admission alone is not that qualification.
+
+### Stored process boundary and backend parity
+
+- [ ] **Extract the worker into standalone syncd.** The journal and executor
+  are Stored-owned but currently run in the owning process. Add an IPC adapter,
+  lifecycle supervision, durable status delivery and restart tests. Keep a
+  single mutation authority: do not start a second executor beside server
+  writes against the same state. Virtual-tree semantics stay in Workspace.
+- [ ] **Keep the locking support boundary explicit.** Linux uses an OS-held
+  lock and requires `flock` on the local state volume. Non-Linux PID-lease
+  fallback and distributed/network-state locking are not pilot-qualified.
+  Cluster/multi-writer execution remains outside scope.
+- [ ] **Bring Google Drive up to the replica recovery contract before enabling
+  mirrors.** Add conditional updates against recorded remote versions,
+  recoverable overwrite and retirement, durable remote-ID/path ownership,
+  folder-operation receipts and replay-safe conflict handling. Verify concurrent
+  external writers, duplicate names, expired credentials, partial uploads,
+  lost acknowledgements, trash/restore and remote rename/move propagation.
+  Existing driver/transport tests use fixtures or local mock endpoints; live
+  multi-backend Drive policy scenarios were not validated in this change.
+- [ ] **Add S3 only after backend conformance is established.** Define version
+  and precondition semantics, recovery/version retention, prefix rather than
+  directory behavior, enumeration and change detection, credential handling and
+  restart-safe transfers. Reuse the exact-target verification/release barrier;
+  a successful enqueue is never a verified destination.
+- [ ] **Keep native Google document export separate.** Google Docs/Sheets/Slides
+  have no binary byte representation in the current driver and are skipped.
+  Explicit export/import formats remain future work, as do DB-note projections.
+
+### Space, history and throughput
+
+- [ ] **Finish crash-spool cleanup.** Cache GC and completed replica/ingress-pin
+  cleanup now exist, but abandoned plain upload spools and temporary publication
+  files are separate. Implement the detailed staging-cleanup item below,
+  including the cache `.tmp` fallback, configured temp directories and protection
+  for active uploads, retained versions, Trash and journal-referenced files.
+- [ ] **Compact journal metadata safely.** Completed receipts are retained for
+  idempotency; operation/ownership history has no compaction policy. Bound
+  metadata while preserving retries, pending references, replay cursors and
+  recovery evidence. Blob GC does not solve receipt growth.
+- [ ] **Add capacity accounting and admission controls.** Pending/blocked
+  operations intentionally pin bytes and can fill a workspace during a long
+  outage. Report pinned/staged/retained space, expose actionable low-space
+  status, and apply quotas/backpressure without evicting the last verified or
+  recovery copy. General cache size/LRU policy remains in the backlog below.
+- [ ] **Measure and bound large-workspace reconciliation.** The current pass
+  gathers all documents/plans; physical mutations serialize through one Stored
+  executor. A slow backend transfer can delay unrelated work. Benchmark large
+  trees and slow targets, then introduce bounded scans and safe concurrency
+  without weakening endpoint ownership, ordering or the all-target barrier.
+- [ ] **Budget audit IO.** Completed replicas are fully read on initial audit
+  and at most once per 15 minutes per completed operation; placement and staging
+  release always verify bytes. Make background audit scheduling/bandwidth
+  configurable and measure remote read cost. Keep release verification strict.
+- [ ] **Complete operational visibility at scale.** Workspace status exposes
+  at most 1,000 active operations and the Web view does not paginate them.
+  Add complete pagination, per-policy/backend summaries, queue age/byte counts
+  and actionable failure notifications. The tree badge currently indicates
+  policy membership, not a verified "in sync" state.
+
+### Verification baseline
+
+The implementation passed 239 Stored tests and 370 workspace/indexing/hook
+tests, plus the Web production build/typecheck. Coverage includes abrupt process
+exit/replay, partial failures, exact-target completion, shared ownership,
+independent edits, preserved document IDs, API folder operations, unknown
+children and cache cleanup. This is a regression baseline, not proof of all
+edge cases or approval for unrestricted Samba/remote-backend mirroring.
+
+## Earlier deliveries and continuing backlog
 
 ---
 
@@ -161,7 +326,7 @@ remote targets. canvas-server exposes it as
 `Workspace.transferBackendObject`; both endpoints must be enabled backends
 (a transient registration would be pruned afterwards and undo the transfer).
 
-Storage policies landed too, as the hook-rule action `store` (canvas-server):
+The earlier storage action landed as the hook-rule action `store` (canvas-server):
 declarative move/copy of a document's bytes between backends with
 `{{YYYY}}/{{MM}}/{{ext}}`-style key templating (EXIF capture time first) and
 `onConflict` handling — the "images always live in workspace:home/Upload/Images"
@@ -169,6 +334,10 @@ use case this roadmap predicted would be Workspace-hook material, plus a
 `store` row in the web rule builder. stored gained `onConflict`
 (`error`|`rename`|`overwrite`, per-target keys) and destination-key
 normalization to support it.
+
+The first-class storage policies in 1.10.0 no longer compile into independent
+hook copy/delete actions. Workspace resolves the full target set and submits
+it to Stored's replica executor; see the current contract and gaps above.
 
 The web UI ships as `BackendActionCard` (apps/web) — the backend twin of
 `LinkToCard`: one card with Copy to / Move to / Delete from modes over a
@@ -189,10 +358,11 @@ now drops the location (emitting `object:location:remove`), `#planTransfer`
 stats a recorded target before skipping it, and a genuine no-op is reported as
 `state: 'unchanged'` rather than `complete` all the way up to the toast.
 
-The missing primitive. **Not** backend-to-backend sync — that stays out of MVP.
-MIME-routing rules ("images → `workspace:home/Upload/Images`", "pdfs →
-`…/Papers`") are Workspace-hook material: `put()` already takes `backends: []`,
-and that array *is* the extension point. A hook picks it; stored stays dumb.
+The original delivery covered individual transfers. The MVP scope now also
+includes policy-driven replication across supported backends. MIME-routing
+decisions ("images → `workspace:home/Upload/Images`", "pdfs → `…/Papers`")
+belong to Workspace; Stored receives physical destinations and owns their
+execution without interpreting MIME rules or virtual paths.
 
 `stored.copy(idOrKey, { to: [backends], key? })` / `stored.move(...)`:
 
@@ -226,33 +396,35 @@ pull-through cache below.
 ## P1 — staging cleanup for crashed uploads (priority)
 
 Found 2026-10-07 while pushing a 1.1 GB video through canvas-fuse. An
-object `PUT` (`Stored.writeObject`, `src/index.js:~365`) spools the body
+object `PUT` (`Stored.writeObject`, `src/index.js`) spools the body
 into a plain temp file, `<backend root>/.stored-tmp/<ts>-<uuid>` (not
-cacache — that is only `workspace:data`), hashes it in one pass, then
-`rename(2)`s it into place. Every failure path (client disconnect, sha256
+cacache), hashes it in one pass, then publishes it through the backend.
+The new replica workflow also pins immutable bytes in cacache; those pins
+have their own lifecycle and do not replace plain spool cleanup.
+Every handled failure path (client disconnect, sha256
 mismatch, `If-Match` failure, disk/driver error) removes the temp in a
 `finally`, so a failed upload leaves nothing behind. **A process crash,
 kill or power loss mid-upload does**, and nothing ever sweeps
-`.stored-tmp/`: the hourly `sweepRetained` only prunes `retained/<sha>`,
-`Cache.verify()` targets cacache and has no caller. Stale spools pile up
-with no bound on age or size — at 1 GB a piece that is a disk-full waiting
-to happen.
+`.stored-tmp/`: `sweepRetained` handles retained versions and Trash, not plain
+spools. `Cache.verify()` now runs periodically after cache-key removal and on
+shutdown, but does not collect these separate temp files. Stale spools still
+have no age/size bound.
 
 - [ ] **Sweep `.stored-tmp/` on backend open and on the `sweepRetained`
-      timer.** Delete spool files (`<ts>-<uuid>`, never `retained/`) older
-      than a grace window (default 24 h, `config.tempMaxAgeMs`; a legitimately
-      running upload is a file whose mtime keeps moving, so age by mtime).
-      Same for the driver's `.stored-tmp-<rand>` siblings from the EXDEV
-      copy path (`backends/file/index.js:236-250`). Log a count, emit
+      timer.** Delete only recognized abandoned spool files older than a grace
+      window (default 24 h, `config.tempMaxAgeMs`). Mtime alone cannot prove
+      abandonment: protect slow/paused active uploads and journal-referenced
+      files, retained versions and Trash. Include the driver's temporary
+      publication siblings and the cache `.tmp` fallback. Log a count, emit
       nothing — this is housekeeping, not an object event.
 - [ ] Honour `backend.tempDir` overrides (the sweep must look where the
       spool actually goes) and skip the dir entirely when it is not ours
       (not under the backend root and not configured).
 - [ ] Check preconditions **before** spooling where possible: `If-Match` /
       `If-None-Match: *` can be evaluated against the current stat up front
-      (`#resolveVersionPrecondition` already has it); only the sha256
-      verification genuinely needs the full body. Today a doomed 1 GB PUT
-      writes all of it to disk before the 412.
+      and reject obvious conflicts early, then recheck against actual bytes
+      at publication. The final check must remain to catch concurrent edits.
+      Today a doomed 1 GB PUT writes all of it to disk before the 412.
 
 ### Optional — resumable object uploads
 
@@ -323,7 +495,7 @@ Directly relevant to the 128GB NAS PoC — pairs with the P0 remote work.
 
 ---
 
-## Architecture (unchanged)
+## Other architecture backlog
 
 ### Backend Drivers
 
@@ -343,7 +515,10 @@ reserved scheme names with no driver — remote shares are OS mounts.
 - S3 should not pretend to watch; use polling or disable entirely
 - Remote fs mounts (`remote: true`) likewise — inotify is not reliable there
 
-#### SyncD ✅ DONE (1.6.0 — `src/sync/JobQueue.js`, `Mirror.js`, `Ledger.js`)
+#### Device sync primitives ✅ DONE (1.6.0 — `src/sync/JobQueue.js`, `Mirror.js`, `Ledger.js`)
+
+This completion refers to the device mirror library, not a standalone syncd
+process. The separate-process gap remains open above.
 
 - Retries, exponential backoff (`min(60s·2^n, 1h)`), observability (`counters()`, `status()`, `job:*` events) ✅
 
@@ -358,8 +533,9 @@ reserved scheme names with no driver — remote shares are OS mounts.
 
 Sync policies ✅: the device mirror (`Mirror`) implements the protocol's
 three-way table with `deletes: propagate|keep`, `conflictMode: prompt|rename`,
-`prefixes`/`ignore`. The in-process `SyncQueue` (cache → remote `commit`) stays
-for gdrive-style targets; `canvas` targets stream directly (`putStream`).
-Still open: the hub-side mirror to gdrive/NAS (08-31 §5) reusing the same
-engine with a non-canvas remote.
+`prefixes`/`ignore`. As of 1.10.0, `SyncQueue` is a compatibility adapter over
+the durable `ReplicaService` for remote copy transfers; `canvas` targets stream
+directly (`putStream`). Hub-side file replication now uses that replica service.
+Google Drive destructive mirror support and NAS deployment qualification remain
+open as described above; they are not implied by the device mirror's completion.
 Not needed: cluster mode, pub/sub, cron expressions, priorities

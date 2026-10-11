@@ -25,7 +25,7 @@ describe('Transfer (copy / move)', async () => {
         await fs.remove(ROOT);
         await fs.ensureDir(A);
         await fs.ensureDir(B);
-        stored = new Stored({ root: STORED_ROOT });
+        stored = new Stored({ root: STORED_ROOT, retention: { days: 30 } });
         stored.addBackend('fs:a', { driver: 'file', root: A });
         stored.addBackend('fs:b', { driver: 'file', root: B });
         // Not a filesystem — forces the streaming transfer path even though a
