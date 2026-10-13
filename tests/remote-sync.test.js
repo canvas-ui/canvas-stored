@@ -84,17 +84,24 @@ describe('Stored ↔ remote (gdrive) backend', () => {
         assert.deepStrictEqual(locs.map((l) => [l.backend, l.synced]).sort(), [['gdrive:acc', true], ['local', true]]);
     });
 
-    test('move() local → remote keeps the source until Drive confirms, then drops it', async () => {
+    test('move() local → remote keeps the source until Drive confirms, then drops it', async t => {
         const local = await stored.put(Buffer.from('moving'), { key: 'move-me.txt', backends: ['local'] });
+        await stored.put(Buffer.from('moving'), { key: 'Other/move-me.txt', backends: ['local'] });
+        const unlinks = [];
+        const onUnlink = event => unlinks.push(event);
+        stored.on('object:unlink', onUnlink);
+        t.after(() => stored.off('object:unlink', onUnlink));
         const moved = once(stored, 'object:move').then(([e]) => e);
-        const res = await stored.move(local.id, { to: 'gdrive:acc', key: 'Moved/move-me.txt' });
+        const res = await stored.move(local.id, { from: 'stored://local/move-me.txt', to: 'gdrive:acc', key: 'Moved/move-me.txt' });
         assert.strictEqual(res.state, 'pending');
         assert.ok(await fs.pathExists(path.join(LOCAL, 'move-me.txt')), 'source survives until the sync confirms');
         const event = await moved;
         assert.strictEqual(event.id, local.id);
         assert.strictEqual(await fs.pathExists(path.join(LOCAL, 'move-me.txt')), false);
+        assert.strictEqual(await fs.readFile(path.join(LOCAL, 'Other/move-me.txt'), 'utf8'), 'moving');
+        assert.deepStrictEqual(unlinks, [], 'remote move completion must not trigger deletion propagation');
         const locs = await stored.locations(local.id);
-        assert.deepStrictEqual(locs.map((l) => l.backend), ['gdrive:acc']);
+        assert.deepStrictEqual(locs.map((l) => l.backend).sort(), ['gdrive:acc', 'local']);
     });
 
     test('deleteByUrl() trashes the Drive file and drops the location', async () => {

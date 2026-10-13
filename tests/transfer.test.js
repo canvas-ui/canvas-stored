@@ -196,6 +196,25 @@ describe('Transfer (copy / move)', async () => {
             assert.strictEqual((await stored.get(meta.id)).toString(), 'cross driver');
         });
 
+        test('streamed move preserves other paths and never emits a source-loss unlink', async () => {
+            const bytes = Buffer.from('photo with two physical copies');
+            const meta = await stored.put(bytes, { key: 'Fotos/2021/11/photo.jpg', backends: ['fs:a'] });
+            await stored.put(bytes, { key: 'Architecture/Projects/House123/photo.jpg', backends: ['fs:a'] });
+            const unlinks = [];
+            const listener = event => unlinks.push(event);
+            stored.on('object:unlink', listener);
+            try {
+                const result = await stored.move(meta.id, { from: 'stored://fs:a/Architecture/Projects/House123/photo.jpg', to: 'blob:store' });
+                assert.strictEqual(result.ok, true);
+                assert.deepStrictEqual(unlinks, [], 'source retirement is part of a move, not a deletion to propagate');
+                assert.strictEqual(await fs.pathExists(path.join(A, 'Architecture/Projects/House123/photo.jpg')), false);
+                assert.deepStrictEqual(await fs.readFile(path.join(A, 'Fotos/2021/11/photo.jpg')), bytes);
+                const locations = (await stored.stat(meta.id)).locations;
+                assert.ok(locations.some(l => l.backend === 'fs:a' && l.key === 'Fotos/2021/11/photo.jpg'));
+                assert.ok(locations.some(l => l.backend === 'blob:store'));
+            } finally { stored.off('object:unlink', listener); }
+        });
+
         test('refuses a multi-target move', async () => {
             const meta = await stored.put(Buffer.from('fan out'), { key: 'fan.txt', backends: ['fs:a'] });
             const result = await stored.move(meta.id, { to: ['fs:b', 'blob:store'] });

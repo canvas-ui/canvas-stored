@@ -21,6 +21,8 @@ import { checksumBuffer, checksumStream, formatId } from './utils/checksum.js';
 import { detectMimeType, detectMimeFromHead } from './utils/mime.js';
 
 const debug = Debug('stored');
+// Source retirement belongs to the final move event, never a source-loss unlink.
+const MOVE_SOURCE = Symbol('move-source');
 
 const HEAD_BYTES = 4096;
 
@@ -864,7 +866,7 @@ export default class Stored extends EventEmitter2 {
                 }
             } else await backend.delete(destKey, { ifMatch: options.ifMatch, origin: options.origin });
             this.#trash.finish(trashed);
-            this.#processUnlink({ backend: backendName, key: destKey, ...(options.origin ? { origin: options.origin } : {}) });
+            if (!options[MOVE_SOURCE]) this.#processUnlink({ backend: backendName, key: destKey, ...(options.origin ? { origin: options.origin } : {}) });
             await this.#replicas.abandonUnownedIngress(backendName, destKey);
             debug(`REMOVE ${pathKey}`);
             return { ok: true, id: current.id, sha256: current.checksums?.sha256 ?? null, seq: this.#index.head() };
@@ -1752,7 +1754,7 @@ export default class Stored extends EventEmitter2 {
                     const result = sourceBackend.config.driver === 'cacache'
                         ? await this.deleteByUrl(`stored://${sourceLocation.backend}/${sourceLocation.key}`)
                         : (this.#retention && sourceBackend.config.driver === 'file')
-                            ? await this.removeObject(sourceLocation.backend, sourceLocation.key, { ifMatch: id.slice(7), origin })
+                            ? await this.removeObject(sourceLocation.backend, sourceLocation.key, { ifMatch: id.slice(7), origin, [MOVE_SOURCE]: true })
                             : { ok: false, reason: 'recovery-unavailable' };
                     if (!result.ok) return { ...result, degradedToCopy: true };
                 }
