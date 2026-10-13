@@ -80,7 +80,10 @@ export default class CacacheBackend extends StorageBackend {
     // Commit an already-written file (the Stored streaming-ingest temp) at `key`
     // by streaming it into the content store.
     async commit(key, srcPath) {
-        await pipeline(createReadStream(srcPath), cacache.put.stream(this.#root, key, { algorithms: this.#algorithms, ...CACHE_OPTS }));
+        const output = cacache.put.stream(this.#root, key, { algorithms: this.#algorithms, ...CACHE_OPTS });
+        // An empty file emits no chunks; initialize cacache's content writer.
+        output.write(Buffer.alloc(0));
+        await pipeline(createReadStream(srcPath), output);
         const info = await cacache.get.info(this.#root, key);
         const size = info?.size ?? 0;
         debug(`COMMIT ${key} (${size} bytes)`);

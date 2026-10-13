@@ -52,6 +52,9 @@ export default class Cache {
                     sink = cacache.put.stream(self.#root, key, { algorithms: self.#algorithms, metadata, ...CACHE_OPTS });
                     sink.on('error', error => output.destroy(error));
                     sink.on('integrity', value => output.emit('integrity', value));
+                    // cacache initializes content on the first write. An empty
+                    // HTTP/file stream can reach EOF without emitting any chunk.
+                    sink.write(Buffer.alloc(0));
                     done();
                 })).catch(error => output.destroy(error));
             },

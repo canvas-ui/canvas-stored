@@ -35,6 +35,17 @@ test('all exact targets verify before staging is released, including two folders
     assert.equal(c.stored.replicas.owner('document-1').replicas.length, 2);
 });
 
+test('zero-byte content replicates through staging to every destination', async t => {
+    const c = await setup(t);
+    const file = await c.put('');
+    const op = await c.run(c.plan(file, [{ backend: 'a', key: 'empty.txt' }, { backend: 'b', key: 'empty.txt' }]));
+    assert.equal(op.state, 'complete', JSON.stringify(op.error));
+    for (const backend of ['a', 'b']) {
+        assert.deepEqual(await fs.readFile(path.join(c.root, backend, 'empty.txt')), Buffer.alloc(0));
+    }
+    assert.equal(await c.stored.getBackend('data').stat(file.key), null);
+});
+
 test('partial failure keeps staging and resumes without duplicating a completed target after restart', async t => {
     const c = await setup(t);
     const file = await c.put('invoice');
