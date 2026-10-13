@@ -295,3 +295,20 @@ test('garbage collection preserves other keys sharing bytes and removes content 
     assert.ok(result.reclaimedCount > 0);
     assert.equal(await backend.stat('second'), null);
 });
+
+test('workspace removal holds pause queued replica work and retired owner IDs can be reused safely', async t => {
+    const c = await setup(t); const file = await c.put('review me');
+    c.stored.replicas.setOwnerGuard(() => false);
+    const input = c.plan(file, [{ backend: 'a', key: 'held.txt' }]);
+    const paused = await c.run(input);
+    assert.equal(paused.error.code, 'OWNER_HELD');
+    await assert.rejects(fs.stat(path.join(c.root, 'a/held.txt')), { code: 'ENOENT' });
+    assert.ok(await c.stored.getBackend('data').stat(file.key));
+    await assert.rejects(c.stored.replicas.retireOwner(input.owner), { code: 'OWNER_BUSY' });
+    c.stored.replicas.setOwnerGuard(() => true);
+    assert.equal((await c.stored.replicas.retry(input.id)).state, 'complete');
+    await c.stored.replicas.retireOwner(input.owner);
+    assert.equal(c.stored.replicas.owner(input.owner), null);
+    assert.equal(c.stored.replicas.list({ owner: input.owner }).operations.length, 0);
+    assert.equal(await fs.readFile(path.join(c.root, 'a/held.txt'), 'utf8'), 'review me', 'retiring metadata never removes backend bytes');
+});

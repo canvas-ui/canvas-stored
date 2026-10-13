@@ -287,3 +287,63 @@ test('discard cannot free a blob being retained for another deletion of the same
     assert.notEqual(latest.id, old.id);
     assert.equal((await stored.restoreTrash('a', latest.id)).ok, true);
 });
+
+test('propagated deletions require opt-in and remain recoverable past retention expiry', async t => {
+    const { stored, put, root } = await setup(t);
+    const sha = crypto.createHash('sha256').update('keep forever').digest('hex');
+    await put('manual.txt', 'keep forever');
+    const options = { operationId: 'operation-1', sha256: sha };
+    assert.equal((await stored.removeToTrash('a', 'manual.txt', options)).reason, 'protected-backend');
+    stored.getBackend('a').config.removalPolicy = { acceptPropagatedDeletions: true };
+    const removed = await stored.removeToTrash('a', 'manual.txt', options);
+    assert.equal(removed.ok, true); assert.ok(removed.trashId);
+    assert.equal((await stored.removeToTrash('a', 'manual.txt', options)).trashId, removed.trashId);
+    await stored.sweepRetained({ now: Date.now() + 40 * 86400000 });
+    assert.ok(await stored.getTrashItem('a', removed.trashId));
+    assert.equal((await stored.restoreTrash('a', removed.trashId)).ok, true);
+    assert.equal(await fs.readFile(path.join(root, 'a/manual.txt'), 'utf8'), 'keep forever');
+});
+
+test('a changed copy blocks propagated deletion and restore never overwrites a replacement', async t => {
+    const { stored, put, root } = await setup(t);
+    stored.getBackend('a').config.removalPolicy = { acceptPropagatedDeletions: true };
+    const sha = crypto.createHash('sha256').update('original').digest('hex');
+    await put('item.txt', 'original');
+    await fs.writeFile(path.join(root, 'a/item.txt'), 'changed externally');
+    assert.equal((await stored.removeToTrash('a', 'item.txt', { operationId: 'changed', sha256: sha })).reason, 'source-changed');
+    assert.equal(await fs.readFile(path.join(root, 'a/item.txt'), 'utf8'), 'changed externally');
+    await put('other.txt', 'original');
+    const removed = await stored.removeToTrash('a', 'other.txt', { operationId: 'safe', sha256: sha });
+    await put('other.txt', 'replacement');
+    assert.equal((await stored.restoreTrash('a', removed.trashId)).reason, 'precondition-failed');
+    assert.equal(await fs.readFile(path.join(root, 'a/other.txt'), 'utf8'), 'replacement');
+});
+
+test('manual recovery and removal receipt survive restart without deleting a replacement', async t => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'stored-manual-restart-'));
+    let stored;
+    const open = () => {
+        stored = new Stored({ root: path.join(root, 'db'), retention: { days: 30 } });
+        stored.on('error', () => {});
+        stored.addBackend('archive', { driver: 'file', root: path.join(root, 'archive'), removalPolicy: { acceptPropagatedDeletions: true } });
+    };
+    t.after(async () => { await stored.stop(); await fs.remove(root); });
+    open();
+    await stored.writeObject('archive', 'item.txt', Buffer.from('original'));
+    const options = { operationId: 'durable-receipt', sha256: crypto.createHash('sha256').update('original').digest('hex') };
+    const remove = stored.removeObject;
+    const interrupted = t.mock.method(stored, 'removeObject', async (...args) => {
+        await remove(...args); throw new Error('reply lost after physical removal');
+    });
+    await assert.rejects(stored.removeToTrash('archive', 'item.txt', options), /reply lost/);
+    interrupted.mock.restore();
+    await stored.stop(); open();
+    const result = await stored.removeToTrash('archive', 'item.txt', options);
+    assert.equal(result.ok, true);
+    await stored.sweepRetained({ now: Date.now() + 40 * 86400000 });
+    assert.equal((await stored.restoreTrash('archive', result.trashId)).ok, true);
+    assert.equal(await fs.readFile(path.join(root, 'archive/item.txt'), 'utf8'), 'original');
+    await stored.writeObject('archive', 'item.txt', Buffer.from('replacement'));
+    assert.equal((await stored.removeToTrash('archive', 'item.txt', options)).trashId, result.trashId);
+    assert.equal(await fs.readFile(path.join(root, 'archive/item.txt'), 'utf8'), 'replacement');
+});

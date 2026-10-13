@@ -86,7 +86,7 @@ export default class Stored extends EventEmitter2 {
         super({ wildcard: true, delimiter: ':', maxListeners: 100, verboseMemoryLeak: false });
         // API/FUSE mutations and replication share one physical executor.
         // Reentrant calls (rename -> move, replica -> write) keep the lock.
-        for (const name of ['put', 'copy', 'move', 'writeObject', 'removeObject', 'renameObject', 'renameDirectory', 'trashDirectory',
+        for (const name of ['put', 'copy', 'move', 'writeObject', 'removeObject', 'removeToTrash', 'renameObject', 'renameDirectory', 'trashDirectory',
             'ensureDirectory', 'removeEmptyDirectory', 'restoreTrash', 'discardTrash', 'restoreRetained', 'deleteByUrl', 'delete']) {
             const method = this[name].bind(this);
             this[name] = (...args) => this.withStorageMutation(() => method(...args));
@@ -790,6 +790,7 @@ export default class Stored extends EventEmitter2 {
     }
 
     listTrash(backend, options = {}) { return this.#trash.list(backend, options); }
+    removeToTrash(backend, key, options = {}) { return this.#trash.remove(backend, key, options); }
     getTrashItem(backend, id) { return this.#trash.get(backend, id); }
     restoreTrash(backend, id, options = {}) { return this.#trash.restore(backend, id, options); }
     discardTrash(backend, id) { return this.#trash.discard(backend, id); }
@@ -848,8 +849,8 @@ export default class Stored extends EventEmitter2 {
             // false = bytes already gone; the location still goes. A remote
             // driver re-evaluates the precondition at the other end (412 →
             // typed error, nothing is unlinked here).
-            const retained = await this.#retain(backendName, destKey, current, 'delete');
-            const trashed = retained?.trashItem;
+            const retained = await this.#retain(backendName, destKey, current, options.trashItem ? 'version' : 'delete');
+            const trashed = options.trashItem || retained?.trashItem;
             if (trashed && typeof backend.trashFile === 'function') {
                 this.#trash.quarantine(trashed);
                 const moved = await backend.trashFile(destKey, trashed.id);

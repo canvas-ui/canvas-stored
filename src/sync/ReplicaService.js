@@ -32,10 +32,29 @@ export default class ReplicaService extends EventEmitter {
     #lockFd = null;
     #ingress;
     #captureAll;
-    constructor(stored, { retryIntervalMs = 1000, autoStart = true, captureAllWrites = false } = {}) {
+    #ownerGuard = null;
+    setOwnerGuard(guard) { this.#ownerGuard = guard; }
+    #assertOwnerActive(op) {
+        if (this.#ownerGuard?.(op.owner) === false) throw failure('OWNER_HELD', 'The owner is awaiting a removal decision', true);
+    }
+    // Retire metadata only after the workspace explicitly purges a locationless
+    // document. History keeps its receipts under a non-reusable owner identity.
+    async retireOwner(owner) {
+        return this.#stored.withStorageMutation(() => {
+            const rows = [...this.#ops.getRange()].map(r => r.value).filter(op => op.owner === owner);
+            if (rows.some(op => !terminal(op.state))) throw failure('OWNER_BUSY', 'Finish or resolve pending storage operations before purging this item');
+            const archived = `retired:${owner}:${randomUUID()}`;
+            this.#stored.index.transaction(() => {
+                for (const op of rows) this.#ops.putSync(op.id, { ...op, owner: archived });
+                this.#owners.removeSync(owner);
+            });
+        });
+    }
+    constructor(stored, { retryIntervalMs = 1000, autoStart = true, captureAllWrites = false, ownerGuard = null } = {}) {
         super();
         this.#stored = stored;
         this.#captureAll = captureAllWrites;
+        this.#ownerGuard = ownerGuard;
         this.#ops = stored.index.openDB('replica.operations.v1');
         this.#owners = stored.index.openDB('replica.owners.v1');
         this.#meta = stored.index.openDB('replica.meta.v1');
@@ -436,12 +455,14 @@ export default class ReplicaService extends EventEmitter {
         return false;
     }
     async #apply(op) {
+        this.#assertOwnerActive(op);
         if (!op.base) this.#save(op, { base: this.owner(op.owner) || { owner: op.owner, replicas: [] } });
         const files = op.plan.replicas.some(r => r.kind !== 'directory');
         // An immutable staging pin is retained for the entire operation, even
         // when workspace:data is released or the original is moved externally.
         const info = (files || op.base.replicas.some(r => r.kind !== 'directory')) ? await this.#stage(op) : null;
         for (let i = 0; i < op.plan.replicas.length; i++) {
+            this.#assertOwnerActive(op);
             const target = op.plan.replicas[i];
             let outcome = op.outcomes[i];
             const backend = this.#backend(target.backend);
@@ -472,6 +493,7 @@ export default class ReplicaService extends EventEmitter {
                 this.#save(op, { outcomes: op.outcomes });
             }
             if (target.kind === 'directory') {
+                this.#assertOwnerActive(op);
                 await this.#stored.ensureDirectory(target.backend, outcome.key);
             } else {
                 const found = await this.#inspect(outcome);
@@ -480,6 +502,7 @@ export default class ReplicaService extends EventEmitter {
                     if (found && this.#otherClaims(op, outcome) && found.id !== op.plan.contentId) throw failure('SHARED_REPLICA', 'Another owner or pending operation still needs this byte version');
                     if (found && found.id !== outcome.expected) throw failure('TARGET_CHANGED', 'Destination changed after the plan was accepted');
                     if (!found && outcome.expected && outcome.state !== 'pending') throw failure('TARGET_CHANGED', 'A previously completed destination disappeared');
+                    this.#assertOwnerActive(op);
                     const res = backend.config.driver === 'cacache'
                         ? await this.#stored.put(info.path, { backends: [outcome.backend], key: outcome.key, origin: `replica:${op.id}` })
                         : await this.#stored.writeObject(outcome.backend, outcome.key, info.path, {
@@ -498,6 +521,7 @@ export default class ReplicaService extends EventEmitter {
         }
         this.#save(op, { phase: 'retire' });
         for (const old of op.base.replicas) {
+            this.#assertOwnerActive(op);
             if (op.outcomes.some(r => address(r) === address(old)) || (op.plan.preserve || []).some(r => address(r) === address(old)) || old.mirror === false || !old.managed || this.#otherClaims(op, old)) continue;
             if (old.kind === 'directory') {
                 // Only empty owned directories may be retired. Unknown children
@@ -519,6 +543,7 @@ export default class ReplicaService extends EventEmitter {
             if ((await this.#inspect(target))?.id !== op.plan.contentId) throw failure('VERIFY_FAILED', 'A destination changed before completion');
         }
         if (fileOutcomes.length) for (const loc of op.plan.release || []) {
+            this.#assertOwnerActive(op);
             if (this.#otherClaims(op, loc)) continue;
             const current = await this.#stored.stat(`${loc.backend}:${loc.key}`);
             if (current && current.id !== (loc.contentId || op.plan.contentId)) throw failure('SOURCE_CHANGED', 'Staging identity changed');
