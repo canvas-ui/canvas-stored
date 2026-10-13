@@ -347,3 +347,18 @@ test('manual recovery and removal receipt survive restart without deleting a rep
     assert.equal((await stored.removeToTrash('archive', 'item.txt', options)).trashId, result.trashId);
     assert.equal(await fs.readFile(path.join(root, 'archive/item.txt'), 'utf8'), 'replacement');
 });
+
+
+test('folder deletion carries its explicit origin into every unlink and durable change', async t => {
+    const { stored, put } = await setup(t);
+    await put('Folder/a.txt', 'one'); await put('Folder/Child/b.txt', 'two');
+    const unlinks = [];
+    stored.on('object:unlink', event => unlinks.push(event));
+    const since = stored.changes({ since: 0 }).head;
+    await stored.trashDirectory('a', 'Folder', { origin: 'backend-delete:manual' });
+    assert.equal(unlinks.length, 2);
+    assert.ok(unlinks.every(event => event.origin === 'backend-delete:manual'));
+    const changes = stored.changes({ since }).changes.filter(change => change.op === 'delete');
+    assert.equal(changes.length, 2);
+    assert.ok(changes.every(change => change.origin === 'backend-delete:manual'));
+});

@@ -39,6 +39,7 @@ const RENAME_WINDOW_MS = 1000;
 const MOVE_SUPPRESS_MS = 3000;
 
 export default class Stored extends EventEmitter2 {
+    supportsScopedFolderDeletion = true;
     #mutationContext = new AsyncLocalStorage();
     #mutations = Promise.resolve();
     #closing = false;
@@ -799,7 +800,7 @@ export default class Stored extends EventEmitter2 {
      * This preserves unindexed/hidden files, empty folders and timestamps too.
      * No recursive rm is permitted when recoverable deletion is enabled.
      */
-    async trashDirectory(backendName, key) {
+    async trashDirectory(backendName, key, { origin = null } = {}) {
         const backend = this.#backends.get(backendName);
         if (!backend?.canDelete || typeof backend.trashContainer !== 'function') throw new Error('Backend does not support recoverable folder deletion');
         const normalized = this.#normalizeKey(key, { nfc: true });
@@ -818,7 +819,7 @@ export default class Stored extends EventEmitter2 {
             await backend.trashContainer(normalized, item.id);
             this.#trash.finish(item);
             this.#scheduleSweep();
-            for (const key of keys) this.#processUnlink({ backend: backendName, key });
+            for (const key of keys) this.#processUnlink({ backend: backendName, key, ...(origin ? { origin } : {}) });
             await this.#replicas.abandonUnownedIngress(backendName, normalized, { directory: true });
             return { ok: true, id: item.id, key: normalized, type: 'directory' };
         } finally { release(); }
