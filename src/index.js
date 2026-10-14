@@ -6,6 +6,8 @@ import { createReadStream, createWriteStream, promises as fsp } from 'fs';
 import { once } from 'events';
 import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
+import { setImmediate as yieldToIO } from 'node:timers/promises';
+import { isDeepStrictEqual } from 'node:util';
 import Debug from 'debug';
 import Cache from './cache/index.js';
 import BackendManager from './backends/BackendManager.js';
@@ -1800,8 +1802,16 @@ export default class Stored extends EventEmitter2 {
 
     /** Finish moves that were waiting on a remote destination write. */
     async resumePendingMoves() {
-        return this.withStorageMutation(async () => {
-            for (const { key: id, value: pending } of [...this.#pendingMoves.getRange()]) {
+        // Snapshot keys only; each record is re-read under the mutation lock.
+        // Holding the lock over the whole backlog delayed interactive byte
+        // operations behind every remote verification. Awaiting resolved
+        // promises also never lets HTTP/timer callbacks run.
+        let processed = 0;
+        for (const id of [...this.#pendingMoves.getKeys()]) {
+            if (this.#closing) break;
+            await this.withStorageMutation(async () => {
+                const pending = this.#pendingMoves.get(id);
+                if (!pending) return;
                 const remaining = [];
                 for (const entry of pending) {
                     try {
@@ -1812,10 +1822,14 @@ export default class Stored extends EventEmitter2 {
                         if (!result.ok) remaining.push({ ...entry, error: result.reason });
                     } catch (error) { remaining.push({ ...entry, error: error.message }); }
                 }
-                if (remaining.length) this.#pendingMoves.putSync(id, remaining);
-                else this.#pendingMoves.removeSync(id);
-            }
-        });
+                // Disabled/offline destinations can leave thousands of moves
+                // pending. Rewriting identical records on every retry caused
+                // one synchronous LMDB commit per item, twice each queue tick.
+                if (!remaining.length) this.#pendingMoves.removeSync(id);
+                else if (!isDeepStrictEqual(pending, remaining)) this.#pendingMoves.putSync(id, remaining);
+            });
+            if (++processed % 32 === 0) await yieldToIO();
+        }
     }
 
     /**
