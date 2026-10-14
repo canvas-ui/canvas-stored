@@ -4,6 +4,20 @@
 
 # StoreD
 
+## File backend readiness
+
+`addBackend()` returns the backend immediately. Since 1.13, managed file roots
+are prepared asynchronously so a slow NAS `mkdir`/`stat` cannot block Node's
+event loop. Backend operations await this preparation. Code that accesses a
+new root directly through `fs` must first `await backend.ready()`. Initialization
+errors reject that promise. `createRoot: false` never creates a missing mount.
+
+`mutationDiagnostics` reports the active physical operation and queue length.
+An optional `onStall(report)` callback receives reports while an operation is
+still pending; it never releases a lock or abandons a write. Cancellation of
+`scan(name, { isCancelled })` throws `RESYNC_CANCELLED` before absence cleanup,
+including scans that return no files.
+
 ## Backend Trash
 
 With `retention: { days: 30 }`, file backend deletions record each original path

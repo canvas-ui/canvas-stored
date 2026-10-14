@@ -35,6 +35,7 @@ describe('rename matching', async () => {
 
     test('scan reuses checksums for a renamed file (no rehash)', async () => {
         stored.addBackend('fs:ren', { driver: 'file', root: path.join(TEST_DIR, 'scan') });
+        await stored.getBackend('fs:ren').ready(); // direct filesystem writes below bypass the backend API
         const root = path.join(TEST_DIR, 'scan');
         const oldPath = path.join(root, 'a.txt');
         const newPath = path.join(root, 'b.txt');

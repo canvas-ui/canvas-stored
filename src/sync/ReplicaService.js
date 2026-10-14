@@ -5,6 +5,7 @@ import { Readable, Transform } from 'node:stream';
 import { openSync, closeSync, createReadStream } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
+import { setImmediate as yieldToIO } from 'node:timers/promises';
 import { backoffMs } from './JobQueue.js';
 
 const clone = value => structuredClone(value);
@@ -33,6 +34,45 @@ export default class ReplicaService extends EventEmitter {
     #ingress;
     #captureAll;
     #ownerGuard = null;
+    #ownerEndpoints = null;
+    #latestOperations = null;
+
+    // Derived, process-local lookups. The durable ledgers remain authoritative.
+    // Invalidate on BOTH sides of an owner transaction, including rollback;
+    // callbacks inside the transaction must not leave a speculative cache.
+    #updateOwners(action, { operationsChanged = false } = {}) {
+        this.#ownerEndpoints = null;
+        if (operationsChanged) this.#latestOperations = null;
+        try { return this.#stored.index.transaction(action); }
+        finally {
+            this.#ownerEndpoints = null;
+            if (operationsChanged) this.#latestOperations = null;
+        }
+    }
+    ownersAt(backend, key, prefix = '') {
+        if (!this.#ownerEndpoints) {
+            const endpoints = new Map();
+            for (const { value } of this.#owners.getRange()) for (const replica of value.replicas) {
+                const endpoint = address(replica);
+                if (!endpoints.has(endpoint)) endpoints.set(endpoint, new Set());
+                endpoints.get(endpoint).add(value.owner);
+            }
+            this.#ownerEndpoints = endpoints;
+        }
+        return [...(this.#ownerEndpoints.get(address({ backend, key })) || [])]
+            .filter(owner => owner.startsWith(prefix)).map(owner => this.owner(owner)).filter(Boolean);
+    }
+    latest(owner) {
+        if (!this.#latestOperations) {
+            const latest = new Map();
+            for (const { value } of this.#ops.getRange()) {
+                if ((latest.get(value.owner)?.seq ?? -1) < value.seq) latest.set(value.owner, { id: value.id, seq: value.seq });
+            }
+            this.#latestOperations = latest;
+        }
+        const id = this.#latestOperations.get(owner)?.id;
+        return id ? this.get(id) : null;
+    }
     setOwnerGuard(guard) { this.#ownerGuard = guard; }
     #assertOwnerActive(op) {
         if (this.#ownerGuard?.(op.owner) === false) throw failure('OWNER_HELD', 'The owner is awaiting a removal decision', true);
@@ -44,10 +84,10 @@ export default class ReplicaService extends EventEmitter {
             const rows = [...this.#ops.getRange()].map(r => r.value).filter(op => op.owner === owner);
             if (rows.some(op => !terminal(op.state))) throw failure('OWNER_BUSY', 'Finish or resolve pending storage operations before purging this item');
             const archived = `retired:${owner}:${randomUUID()}`;
-            this.#stored.index.transaction(() => {
+            this.#updateOwners(() => {
                 for (const op of rows) this.#ops.putSync(op.id, { ...op, owner: archived });
                 this.#owners.removeSync(owner);
-            });
+            }, { operationsChanged: true });
         });
     }
     constructor(stored, { retryIntervalMs = 1000, autoStart = true, captureAllWrites = false, ownerGuard = null } = {}) {
@@ -146,15 +186,27 @@ export default class ReplicaService extends EventEmitter {
             return clone(prior);
         }
         const plan = this.validate(input);
-        const op = this.#stored.index.transaction(() => {
-            const seq = Number(this.#meta.get('head') || 0) + 1;
-            const entry = { id: plan.id, owner: plan.owner, seq, requestHash: digest(input), plan,
-                state: 'pending', phase: 'prepare', attempts: 0, nextAt: 0,
-                createdAt: Date.now(), updatedAt: Date.now(), outcomes: [] };
-            this.#ops.putSync(entry.id, entry);
-            this.#meta.putSync('head', seq);
-            return entry;
-        });
+        let op;
+        try {
+            op = this.#stored.index.transaction(() => {
+                const seq = Number(this.#meta.get('head') || 0) + 1;
+                const entry = { id: plan.id, owner: plan.owner, seq, requestHash: digest(input), plan,
+                    state: 'pending', phase: 'prepare', attempts: 0, nextAt: 0,
+                    createdAt: Date.now(), updatedAt: Date.now(), outcomes: [] };
+                this.#ops.putSync(entry.id, entry);
+                this.#meta.putSync('head', seq);
+                return entry;
+            });
+        } catch (error) {
+            // A callback inside the transaction may have warmed a speculative
+            // lookup. Never retain it when the transaction rolls back.
+            this.#latestOperations = null;
+            throw error;
+        }
+        // Receipt state is always read from LMDB. Only membership/order lives
+        // in this lookup: completing an operation or adding one new receipt
+        // must not force another full-ledger decode during reconciliation.
+        this.#latestOperations?.set(op.owner, { id: op.id, seq: op.seq });
         this.emit('changed', clone(op));
         this.#requested = true;
         queueMicrotask(() => this.#stored.detachedStorageWork(() => { if (!this.#stopped) this.drain().catch(error => this.emit('fault', error)); }));
@@ -164,7 +216,7 @@ export default class ReplicaService extends EventEmitter {
     get(id) { const op = this.#ops.get(id); return op ? clone(op) : null; }
     owner(id) { const owner = this.#owners.get(id); return owner ? clone(owner) : null; }
     async captureIngress(backend, key, contentId, file) {
-        const owners = this.owners().filter(o => o.replicas.some(r => r.mirror !== false && r.kind !== 'directory' && r.backend === backend && r.key === key));
+        const owners = this.ownersAt(backend, key).filter(o => o.replicas.some(r => r.mirror !== false && r.kind !== 'directory' && r.backend === backend && r.key === key));
         if (!owners.length && !this.#captureAll) return null;
         if (owners.length > 1) throw failure('SHARED_REPLICA', 'An edit cannot choose between multiple logical owners of this file');
         const entry = this.#stored.index.transaction(() => {
@@ -237,11 +289,11 @@ export default class ReplicaService extends EventEmitter {
                 if (actual && (outcome.kind === 'directory' || actual.id === outcome.contentId)) replicas.set(address(outcome), { ...outcome, state: 'verified' });
             }
             let accepted;
-            this.#stored.index.transaction(() => {
+            this.#updateOwners(() => {
                 this.#owners.putSync(plan.owner, { ...base, replicas: [...replicas.values()] });
                 this.#save(previous, { state: 'cancelled', supersededBy: plan.id });
                 accepted = this.submit(plan);
-            });
+            }, { operationsChanged: true });
             return accepted;
         });
     }
@@ -251,7 +303,7 @@ export default class ReplicaService extends EventEmitter {
             const replica = owner?.replicas.find(r => address(r) === address(endpoint));
             if (!replica || (await this.#inspect(replica))?.id !== replica.contentId) throw failure('TARGET_CHANGED', 'Cannot adopt an unknown or changed replica');
             replica.managed = true;
-            this.#owners.putSync(ownerId, owner);
+            this.#updateOwners(() => this.#owners.putSync(ownerId, owner));
         });
     }
     async audit(id) {
@@ -284,7 +336,7 @@ export default class ReplicaService extends EventEmitter {
                 }
                 updates.push(owner);
             }
-            this.#stored.index.transaction(() => { for (const owner of updates) this.#owners.putSync(owner.owner, owner); });
+            this.#updateOwners(() => { for (const owner of updates) this.#owners.putSync(owner.owner, owner); });
             this.moveIngress(backend, from, backend, to, { directory });
         });
     }
@@ -336,7 +388,11 @@ export default class ReplicaService extends EventEmitter {
         if (!this.#stopped) await this.#stored.resumePendingMoves();
         const blockedOwners = new Set();
         const rows = [...this.#ops.getRange()].map(r => r.value).sort((a, b) => a.seq - b.seq);
+        let visited = 0;
         for (const row of rows) {
+            // Awaiting an already-resolved promise only drains microtasks. A
+            // large receipt/backoff backlog must still let sockets and timers run.
+            if (++visited % 32 === 0) await yieldToIO();
             if (this.#stopped) break;
             const op = this.get(row.id);
             if (terminal(op.state)) { await this.#cleanup(op); continue; }
@@ -445,7 +501,7 @@ export default class ReplicaService extends EventEmitter {
     }
     #otherClaims(op, endpoint) {
         const wanted = address(endpoint);
-        for (const { value } of this.#owners.getRange()) {
+        for (const value of this.ownersAt(endpoint.backend, endpoint.key)) {
             if (value.owner !== op.owner && value.replicas.some(r => address(r) === wanted)) return true;
         }
         for (const { value } of this.#ops.getRange()) {
@@ -475,7 +531,7 @@ export default class ReplicaService extends EventEmitter {
                 }
                 outcome = { ...resolved, requestedKey: target.key, contentId: op.plan.contentId || null, state: 'pending',
                     managed: Boolean(previous?.managed || !current || target.adopt === true
-                        || this.owners().some(owner => owner.replicas.some(r => r.managed && address(r) === address(target)))),
+                        || this.ownersAt(target.backend, target.key).some(owner => owner.replicas.some(r => r.managed && address(r) === address(target)))),
                     expected: current?.id || null,
                     // An owned, verified old version is an update, not a name
                     // collision. Persist its version before any replacement.
@@ -556,7 +612,7 @@ export default class ReplicaService extends EventEmitter {
             && !op.outcomes.some(n => address(n) === address(r)) && !(op.plan.release || []).some(n => address(n) === address(r))).map(r => ({ ...r, mirror: false }));
         const owner = { owner: op.owner, operationId: op.id, contentId: op.plan.contentId || op.base.contentId,
             replicas: [...preserved, ...op.outcomes], updatedAt: Date.now() };
-        this.#stored.index.transaction(() => {
+        this.#updateOwners(() => {
             this.#owners.putSync(op.owner, owner);
             Object.assign(op, { state: 'complete', phase: 'complete', updatedAt: Date.now() });
             this.#ops.putSync(op.id, op);

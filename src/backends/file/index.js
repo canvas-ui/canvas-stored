@@ -27,6 +27,8 @@ export default class FileBackend extends StorageBackend {
     #tempDir;
     #tempRel = null;
     #watcher = null;
+    #watchEpoch = 0;
+    #rootReady;
     #watchEnabled;
     #ignored;
     #ignoreMatcher = null;
@@ -52,7 +54,12 @@ export default class FileBackend extends StorageBackend {
         // creating an empty dir at an unmounted mountpoint makes an absent
         // drive indistinguishable from an empty one — verifyRoot() + the
         // resync liveness gate rely on the root being genuinely missing.
-        if (config.createRoot !== false) fs.ensureDirSync(this.#root);
+        // A stat/mkdir on an unresponsive NAS can block the whole Node thread.
+        // Registration stays synchronous; filesystem users await readiness.
+        this.#rootReady = config.createRoot !== false ? fs.ensureDir(this.#root) : Promise.resolve();
+        // Keep registration fire-and-forget safe. ready()/operations still
+        // observe and propagate the original failure.
+        this.#rootReady.catch(() => {});
 
         // Network mount detection. A CIFS/NFS share reached through a POSIX path
         // is indistinguishable from local disk to every fs call we make, so the
@@ -73,6 +80,7 @@ export default class FileBackend extends StorageBackend {
     get remote() { return this.#remote; }
     get transport() { return this.#transport; }
     get mountSource() { return this.#mountSource; }
+    ready() { return this.#rootReady; }
 
     /**
      * Absolute on-disk path for `key`. Public because cross-backend copy/move
@@ -152,6 +160,7 @@ export default class FileBackend extends StorageBackend {
         const snapshot = expected || this.config.fsid || null;
         let stats;
         try {
+            await this.ready();
             stats = await fs.stat(this.#root);
         } catch {
             return { ok: false, reason: 'root-missing', fsid: null };
@@ -190,6 +199,7 @@ export default class FileBackend extends StorageBackend {
     // backends reflect the byte changes; empty directories are surfaced by the
     // caller (Workspace) inserting a tree node.
     async createContainer(key) {
+        await this.ready();
         const dir = this.#safeResolve(key);
         await fs.ensureDir(dir);
         debug(`MKDIR ${key}`);
@@ -197,6 +207,7 @@ export default class FileBackend extends StorageBackend {
     }
 
     async deleteContainer(key) {
+        await this.ready();
         const dir = this.#safeResolve(key);
         if (!await fs.pathExists(dir)) return false;
         await fs.remove(dir);
@@ -205,6 +216,7 @@ export default class FileBackend extends StorageBackend {
     }
 
     async removeEmptyContainer(key) {
+        await this.ready();
         const dir = await this.#trashTarget(key);
         try { await fs.rmdir(dir); return { removed: true }; }
         catch (error) {
@@ -216,6 +228,7 @@ export default class FileBackend extends StorageBackend {
     }
 
     async statContainer(key) {
+        await this.ready();
         const target = await this.#trashTarget(key);
         try { const stat = await fs.lstat(target); return stat.isDirectory() ? { kind: 'directory', dev: stat.dev, ino: stat.ino } : null; }
         catch (error) { if (error.code === 'ENOENT') return null; throw error; }
@@ -242,6 +255,7 @@ export default class FileBackend extends StorageBackend {
     }
 
     async trashContainer(key, id) {
+        await this.ready();
         const source = await this.#trashTarget(key);
         if (!(await fs.lstat(source)).isDirectory()) throw new Error('Trash source is not a directory');
         const destination = this.#trashPath(id);
@@ -254,6 +268,7 @@ export default class FileBackend extends StorageBackend {
     }
 
     async trashFile(key, id) {
+        await this.ready();
         const source = await this.#trashTarget(key);
         if (!(await fs.lstat(source)).isFile()) throw new Error('Trash source is not a regular file');
         const destination = this.#trashPath(id);
@@ -270,6 +285,7 @@ export default class FileBackend extends StorageBackend {
     async dropTrashedDirectory(id) { await fs.remove(this.#trashPath(id)); }
 
     async restoreTrashedDirectory(id, key) {
+        await this.ready();
         const destination = await this.#trashTarget(key);
         if (await fs.pathExists(destination)) return { ok: false, reason: 'target-exists' };
         if (!await this.hasTrashedDirectory(id)) return { ok: false, reason: 'not-found' };
@@ -279,6 +295,7 @@ export default class FileBackend extends StorageBackend {
     }
 
     async renameContainer(fromKey, toKey) {
+        await this.ready();
         const from = this.#safeResolve(fromKey);
         const to = this.#safeResolve(toKey);
         if (!await fs.pathExists(from)) throw new Error(`Container not found: ${fromKey}`);
@@ -337,6 +354,7 @@ export default class FileBackend extends StorageBackend {
     }
 
     async put(key, data) {
+        await this.ready();
         const filePath = this.#resolvePath(key);
         await fs.ensureDir(path.dirname(filePath));
         const tmp = await this.#stagingPath();
@@ -355,6 +373,7 @@ export default class FileBackend extends StorageBackend {
     // Clone to a separate inode before publishing. The input may be an
     // immutable cache pin; writable files must never share its inode.
     async commit(key, srcPath) {
+        await this.ready();
         const dest = this.#resolvePath(key);
         await fs.ensureDir(path.dirname(dest));
         const tmp = await this.#stagingPath();
@@ -372,6 +391,7 @@ export default class FileBackend extends StorageBackend {
     // Create-only placement: link(2) fails with EEXIST even for an unindexed
     // file, directory or dangling symlink. Never use rename-over for this path.
     async createFrom(key, srcPath) {
+        await this.ready();
         const dest = this.#resolvePath(key);
         await fs.ensureDir(path.dirname(dest));
         const sibling = path.join(path.dirname(dest), `${TMP_DIR}-${process.pid}-${Math.random().toString(16).slice(2)}`);
@@ -439,6 +459,7 @@ export default class FileBackend extends StorageBackend {
      * EXDEV otherwise, which callers treat as "fall back to a stream copy".
      */
     async renameFrom(key, srcPath) {
+        await this.ready();
         const dest = this.#resolvePath(key);
         await fs.ensureDir(path.dirname(dest));
         await fs.rename(srcPath, dest);
@@ -448,6 +469,7 @@ export default class FileBackend extends StorageBackend {
     }
 
     async get(key, options = {}) {
+        await this.ready();
         const filePath = this.#resolvePath(key);
         if (!await fs.pathExists(filePath)) return null;
         return options.stream ? fs.createReadStream(filePath) : fs.readFile(filePath);
@@ -456,12 +478,14 @@ export default class FileBackend extends StorageBackend {
     // Ranged read for HTTP Range/streaming. `end` is inclusive (matches HTTP
     // Range and createReadStream). Null on miss → caller falls back to full read.
     async getRange(key, { start, end }) {
+        await this.ready();
         const filePath = this.#resolvePath(key);
         if (!await fs.pathExists(filePath)) return null;
         return fs.createReadStream(filePath, { start, end });
     }
 
     async delete(key) {
+        await this.ready();
         const filePath = this.#resolvePath(key);
         if (!await fs.pathExists(filePath)) return false;
         await fs.remove(filePath);
@@ -496,6 +520,7 @@ export default class FileBackend extends StorageBackend {
      * on "when" without a second hash.
      */
     async utimes(key, mtime) {
+        await this.ready();
         const filePath = this.#resolvePath(key);
         const when = mtime instanceof Date ? mtime : new Date(typeof mtime === 'string' ? Date.parse(mtime) : Number(mtime));
         if (Number.isNaN(when.getTime())) throw new Error(`Invalid mtime: ${mtime}`);
@@ -504,6 +529,7 @@ export default class FileBackend extends StorageBackend {
     }
 
     async stat(key) {
+        await this.ready();
         const filePath = this.#resolvePath(key);
         let stats;
         try { stats = await fs.stat(filePath); } catch (error) {
@@ -520,6 +546,7 @@ export default class FileBackend extends StorageBackend {
     // is reported and skipped instead of aborting the walk — one denied subtree
     // must not kill (or worse, truncate) a whole-mount enumeration.
     async *list(options = {}) {
+        await this.ready();
         const { prefix = '', recursive = true, onError = null } = options;
         const searchPath = this.#resolvePath(prefix);
 
@@ -570,6 +597,11 @@ export default class FileBackend extends StorageBackend {
             });
             return false;
         }
+
+        const epoch = this.#watchEpoch;
+        await this.ready();
+        if (epoch !== this.#watchEpoch) return false;
+        if (this.#watcher) return true;
 
         // `stabilityThreshold`: how long a file must stop growing before it is
         // hashed (a mirror bumps it — a multi-GB copy from a USB stick must
@@ -743,6 +775,7 @@ export default class FileBackend extends StorageBackend {
      * folder skeleton (and size a progress bar) before the expensive scan.
      */
     async shape(prefix = '') {
+        await this.ready();
         const dirs = [];
         let files = 0;
         const walk = async (rel) => {
@@ -763,6 +796,7 @@ export default class FileBackend extends StorageBackend {
     }
 
     async stop() {
+        this.#watchEpoch++;
         if (this.#watcher) {
             await this.#watcher.close();
             this.#watcher = null;

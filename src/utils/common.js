@@ -28,6 +28,13 @@ export function isFile(input) {
     catch { return false; }
 }
 
+/** Ingestion must not synchronously stat paths that may live on a NAS. */
+export async function isFileAsync(input) {
+    if (typeof input !== 'string') return false;
+    try { return (await fs.promises.stat(input)).isFile(); }
+    catch { return false; }
+}
+
 export function isBuffer(input) {
     return Buffer.isBuffer(input);
 }

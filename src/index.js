@@ -1,7 +1,7 @@
 import EventEmitter2 from 'eventemitter2';
 import path from 'path';
 import crypto from 'crypto';
-import { AsyncLocalStorage } from 'node:async_hooks';
+import MutationQueue from './runtime/MutationQueue.js';
 import { createReadStream, createWriteStream, promises as fsp } from 'fs';
 import { once } from 'events';
 import { Readable } from 'stream';
@@ -18,7 +18,7 @@ import Ledger from './sync/Ledger.js';
 import Mirror from './sync/Mirror.js';
 import BackendTrash from './trash.js';
 import ReplicaService from './sync/ReplicaService.js';
-import { isBuffer, isFile, isStream, resolveStoredPaths } from './utils/common.js';
+import { isBuffer, isFileAsync, isStream, resolveStoredPaths } from './utils/common.js';
 import { checksumBuffer, checksumStream, formatId } from './utils/checksum.js';
 import { detectMimeType, detectMimeFromHead } from './utils/mime.js';
 
@@ -44,22 +44,13 @@ const MOVE_SUPPRESS_MS = 3000;
 
 export default class Stored extends EventEmitter2 {
     supportsScopedFolderDeletion = true;
-    #mutationContext = new AsyncLocalStorage();
-    #mutations = Promise.resolve();
+    #mutations;
     #closing = false;
     #stopPromise = null;
 
-    withStorageMutation(action) {
-        if (this.#mutationContext.getStore()?.active) return action();
-        if (this.#closing) return Promise.reject(Object.assign(new Error('Stored is stopping'), { code: 'STOPPED' }));
-        const next = this.#mutations.catch(() => {}).then(() => {
-            const scope = { active: true };
-            return this.#mutationContext.run(scope, async () => { try { return await action(); } finally { scope.active = false; } });
-        });
-        this.#mutations = next;
-        return next;
-    }
-    detachedStorageWork(action) { return this.#mutationContext.exit(action); }
+    withStorageMutation(action, operation) { return this.#mutations.run(action, operation); }
+    detachedStorageWork(action) { return this.#mutations.detach(action); }
+    get mutationDiagnostics() { return this.#mutations.diagnostics; }
     #cache;
     #backends;
     #index;
@@ -89,12 +80,13 @@ export default class Stored extends EventEmitter2 {
     constructor(config = {}) {
         // Wildcards (':' delimiter) let consumers bind `object:*` across backends.
         super({ wildcard: true, delimiter: ':', maxListeners: 100, verboseMemoryLeak: false });
+        this.#mutations = new MutationQueue({ onStall: config.onStall || (state => debug('Mutation still pending: %o', state)) });
         // API/FUSE mutations and replication share one physical executor.
         // Reentrant calls (rename -> move, replica -> write) keep the lock.
         for (const name of ['put', 'copy', 'move', 'writeObject', 'removeObject', 'removeToTrash', 'renameObject', 'renameDirectory', 'trashDirectory',
             'ensureDirectory', 'removeEmptyDirectory', 'restoreTrash', 'discardTrash', 'restoreRetained', 'deleteByUrl', 'delete']) {
             const method = this[name].bind(this);
-            this[name] = (...args) => this.withStorageMutation(() => method(...args));
+            this[name] = (...args) => this.withStorageMutation(() => method(...args), name);
         }
         this.#paths = resolveStoredPaths(config);
         this.#config = {
@@ -195,7 +187,11 @@ export default class Stored extends EventEmitter2 {
 
         backend.isDirectoryProtected = key => this.#replicas.owners().some(owner => owner.replicas.some(r =>
             r.kind === 'directory' && r.backend === name && (r.key === key || r.key.startsWith(`${key}/`))));
-        if (config.watch) backend.watch();
+        if (config.watch) backend.watch().catch(error => {
+            debug('Backend %s watcher startup failed: %s', name, error.message);
+            this.emit('backend:state', { backend: name, watching: false, error: error.message });
+            if (this.listenerCount('error')) this.emit('error', error);
+        });
         return backend;
     }
 
@@ -321,7 +317,7 @@ export default class Stored extends EventEmitter2 {
         if (!targets.length) return { ok: false, reason: 'unknown-backend' };
 
         const ingestOptions = { mtime: options.mtime ?? null };
-        const ingest = (isBuffer(blob) || (typeof blob === 'string' && !isFile(blob)))
+        const ingest = (isBuffer(blob) || (typeof blob === 'string' && !await isFileAsync(blob)))
             ? await this.#ingestMemory(blob, targets, key, options.mimeType, ingestOptions)
             : await this.#ingestStream(blob, targets, key, options.mimeType, ingestOptions);
 
@@ -464,7 +460,7 @@ export default class Stored extends EventEmitter2 {
 
         try {
             const stream = isBuffer(source) ? Readable.from([source])
-                : (typeof source === 'string' && !isFile(source)) ? Readable.from([Buffer.from(source)])
+                : (typeof source === 'string' && !await isFileAsync(source)) ? Readable.from([Buffer.from(source)])
                     : (isStream(source) ? source : createReadStream(source));
             const { checksums, size, head } = await this.#hashToFile(stream, tempPath);
             const id = formatId(checksums, this.#config.primaryChecksum);
@@ -1299,7 +1295,10 @@ export default class Stored extends EventEmitter2 {
      * re-hashed. Returns { ok:true, backend, count, files } | { ok:false, reason }.
      */
     async scan(backendName, options = {}) {
-        const { onFile, ...backendOptions } = options;
+        const { onFile, isCancelled, ...backendOptions } = options;
+        const checkCancelled = () => {
+            if (isCancelled?.()) throw Object.assign(new Error('Scan cancelled'), { code: 'RESYNC_CANCELLED' });
+        };
         const list = backendName
             ? [this.#backends.get(backendName)].filter(Boolean)
             : this.#backends.all();
@@ -1309,6 +1308,7 @@ export default class Stored extends EventEmitter2 {
         let complete = true;
         let errors = null;
         for (const backend of list) {
+            checkCancelled();
             // Per-file ingest into the stored index — idempotent, guarded so the
             // streaming path (backend onFile) and the returned-rows path don't
             // double-process a key.
@@ -1346,7 +1346,8 @@ export default class Stored extends EventEmitter2 {
             // NEW path with unchanged size+mtime is a move — reuse the indexed
             // checksums instead of rehashing, so a folder rename (thousands of
             // "moves") collapses into cheap URL rewrites.
-            const inodeMap = this.#buildInodeMap(backend.name);
+            const inodeMap = await this.#buildInodeMap(backend.name);
+            checkCancelled();
 
             const result = await backend.scan({
                 algorithms: this.#config.checksums,
@@ -1356,10 +1357,13 @@ export default class Stored extends EventEmitter2 {
                 // Stream-through: index the file, then hand it to the caller so
                 // consumers (workspace doc upserts) see results as the walk runs.
                 onFile: async (file) => {
+                    checkCancelled();
                     ingest(file);
                     if (typeof onFile === 'function') await onFile(file);
+                    if (processed.size % 32 === 0) await yieldToIO();
                 },
             });
+            checkCancelled();
             // Snapshot shape { files, complete, errors } (file driver) or a bare
             // rows array (legacy/simple drivers — treated as a complete walk).
             // Backends whose scan() reports via events instead (non-array, no
@@ -1377,7 +1381,14 @@ export default class Stored extends EventEmitter2 {
             if (snapshot.errors) errors = { ...(errors || {}), [backend.name]: snapshot.errors };
 
             // Backends that ignore onFile still get their rows indexed here.
-            for (const file of snapshot.files) ingest(file);
+            let visited = 0;
+            for (const file of snapshot.files) {
+                if (++visited % 128 === 0) { await yieldToIO(); checkCancelled(); }
+                ingest(file);
+            }
+            // Index change listeners may request cancellation synchronously on
+            // the last ingested row, without another file callback or I/O turn.
+            checkCancelled();
 
             // Removal only ever runs against a usable snapshot: a dead/absent
             // root (errors.root) means the backend is offline — nothing is
@@ -1410,13 +1421,13 @@ export default class Stored extends EventEmitter2 {
     // ─────────────────────────────────────────────────────────────────────────
 
     stop() {
-        if (!this.#stopPromise) { this.#closing = true; this.#stopPromise = this.#stop(); }
+        if (!this.#stopPromise) { this.#closing = true; this.#mutations.close(); this.#stopPromise = this.#stop(); }
         return this.#stopPromise;
     }
     async #stop() {
         if (this.#sweepTimer) { clearInterval(this.#sweepTimer); this.#sweepTimer = null; }
         await this.#replicas.stop();
-        await this.#mutations.catch(() => {});
+        await this.#mutations.drain();
         await this.#syncQueue.stop();
         await this.#backends.stopAll();
         // Flush held unlinks (watchers are stopped — no add can claim them now)
@@ -2119,9 +2130,11 @@ export default class Stored extends EventEmitter2 {
     // One-shot snapshot of a backend's indexed locations keyed by inode
     // identity, built per scan (the index is LMDB — a per-file reverse lookup
     // would be O(N²)).
-    #buildInodeMap(backendName) {
+    async #buildInodeMap(backendName) {
         const map = new Map();
+        let visited = 0;
         for (const [, meta] of this.#index.entries()) {
+            if (++visited % 128 === 0) await yieldToIO();
             for (const loc of meta.locations || []) {
                 if (loc.backend !== backendName || loc.ino == null) continue;
                 map.set(`${loc.dev}:${loc.ino}`, {

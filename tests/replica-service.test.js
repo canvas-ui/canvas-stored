@@ -312,3 +312,92 @@ test('workspace removal holds pause queued replica work and retired owner IDs ca
     assert.equal(c.stored.replicas.list({ owner: input.owner }).operations.length, 0);
     assert.equal(await fs.readFile(path.join(c.root, 'a/held.txt'), 'utf8'), 'review me', 'retiring metadata never removes backend bytes');
 });
+
+test('replica endpoint and latest receipt lookups do not rescan history per file', async t => {
+    const c = await setup(t); const file = await c.put('lookup');
+    await c.run(c.plan(file, [{ backend: 'a', key: 'lookup.txt' }]));
+    const opsDb = c.stored.index.openDB('replica.operations.v1');
+    const range = opsDb.getRange;
+    let ownerReads = 0, opReads = 0;
+    // openDB returns a separate handle; instrument the shared environment's
+    // prototype so reads through ReplicaService's private handles count too.
+    t.mock.method(Object.getPrototypeOf(opsDb), 'getRange', function (...args) {
+        if (this.name === 'replica.owners.v1') ownerReads++;
+        if (this.name === 'replica.operations.v1') opReads++;
+        return range.apply(this, args);
+    });
+    for (let i = 0; i < 100; i++) {
+        const [owner] = c.stored.replicas.ownersAt('a', 'lookup.txt');
+        assert.equal(owner.owner, 'document-1');
+        owner.replicas.length = 0; // returned records must not mutate the ledger/cache
+        assert.equal(c.stored.replicas.latest('document-1').id, 'op-1');
+    }
+    assert.ok(ownerReads <= 1); assert.equal(opReads, 1);
+    await fs.rename(path.join(c.root, 'a/lookup.txt'), path.join(c.root, 'a/moved.txt'));
+    await c.stored.replicas.recordRelocation('a', 'lookup.txt', 'moved.txt');
+    assert.deepEqual(c.stored.replicas.ownersAt('a', 'lookup.txt'), []);
+    assert.equal(c.stored.replicas.ownersAt('a', 'moved.txt')[0].replicas[0].key, 'moved.txt');
+    await c.reopen();
+    assert.equal(c.stored.replicas.ownersAt('a', 'moved.txt')[0].owner, 'document-1');
+    assert.equal(c.stored.replicas.latest('document-1').state, 'complete');
+    await c.stored.replicas.retireOwner('document-1');
+    assert.deepEqual(c.stored.replicas.ownersAt('a', 'moved.txt'), []);
+    assert.equal(c.stored.replicas.latest('document-1'), null);
+});
+
+test('rolled-back owner changes cannot poison replica lookups', async t => {
+    const c = await setup(t); const file = await c.put('rollback');
+    await c.run(c.plan(file, [{ backend: 'a', key: 'safe.txt' }]));
+    assert.equal(c.stored.replicas.ownersAt('a', 'safe.txt').length, 1);
+    assert.equal(c.stored.replicas.latest('document-1').id, 'op-1');
+    const transaction = c.stored.index.transaction.bind(c.stored.index);
+    const mock = t.mock.method(c.stored.index, 'transaction', action => transaction(() => {
+        action();
+        c.stored.replicas.ownersAt('a', 'safe.txt'); c.stored.replicas.latest('document-1');
+        throw new Error('rollback');
+    }));
+    await assert.rejects(c.stored.replicas.retireOwner('document-1'), /rollback/);
+    mock.mock.restore();
+    assert.equal(c.stored.replicas.ownersAt('a', 'safe.txt').length, 1);
+    assert.equal(c.stored.replicas.latest('document-1').id, 'op-1');
+    assert.equal(await fs.readFile(path.join(c.root, 'a/safe.txt'), 'utf8'), 'rollback');
+});
+
+test('latest receipt stays indexed across submission and completion during ingestion', async t => {
+    const c = await setup(t); const file = await c.put('concurrent reconciliation');
+    await c.run(c.plan(file, [{ backend: 'a', key: 'version-1.txt' }], { release: [] }));
+    const ops = c.stored.index.openDB('replica.operations.v1');
+    const range = ops.getRange;
+    let scans = 0;
+    t.mock.method(Object.getPrototypeOf(ops), 'getRange', function (...args) {
+        if (this.name === 'replica.operations.v1') scans++;
+        return range.apply(this, args);
+    });
+    assert.equal(c.stored.replicas.latest('document-1').id, 'op-1');
+    assert.equal(scans, 1);
+    for (let i = 2; i <= 4; i++) {
+        c.stored.replicas.submit(c.plan(file, [{ backend: 'a', key: `version-${i}.txt` }], { id: `op-${i}`, release: [] }));
+        const afterSubmit = scans;
+        assert.equal(c.stored.replicas.latest('document-1').id, `op-${i}`);
+        assert.equal(scans, afterSubmit, 'submission updates the lookup without decoding old receipts again');
+        await c.stored.replicas.drain();
+        const afterExecution = scans;
+        assert.equal(c.stored.replicas.latest('document-1').state, 'complete');
+        assert.equal(scans, afterExecution, 'ownership commit must not invalidate receipt identity lookup');
+    }
+});
+
+test('a failed submission discards lookups warmed inside its rolled-back transaction', async t => {
+    const c = await setup(t); const file = await c.put('not accepted');
+    const transaction = c.stored.index.transaction.bind(c.stored.index);
+    const mock = t.mock.method(c.stored.index, 'transaction', action => transaction(() => {
+        action();
+        assert.equal(c.stored.replicas.latest('document-1').id, 'op-1');
+        throw new Error('submission rollback');
+    }));
+    assert.throws(() => c.stored.replicas.submit(c.plan(file, [{ backend: 'a', key: 'rejected.txt' }])), /submission rollback/);
+    mock.mock.restore();
+    assert.equal(c.stored.replicas.latest('document-1'), null);
+    assert.equal(c.stored.replicas.get('op-1'), null);
+    assert.equal((await fs.readdir(path.join(c.root, 'a'))).length, 0);
+});
