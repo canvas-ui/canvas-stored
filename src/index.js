@@ -83,7 +83,7 @@ export default class Stored extends EventEmitter2 {
         this.#mutations = new MutationQueue({ onStall: config.onStall || (state => debug('Mutation still pending: %o', state)) });
         // API/FUSE mutations and replication share one physical executor.
         // Reentrant calls (rename -> move, replica -> write) keep the lock.
-        for (const name of ['put', 'copy', 'move', 'writeObject', 'removeObject', 'removeToTrash', 'renameObject', 'renameDirectory', 'trashDirectory',
+        for (const name of ['put', 'copy', 'move', 'writeObject', 'removeObject', 'removeToTrash', 'renameObject', 'renameDirectory', 'trashDirectory', 'removeDirectory',
             'ensureDirectory', 'removeEmptyDirectory', 'restoreTrash', 'discardTrash', 'restoreRetained', 'deleteByUrl', 'delete']) {
             const method = this[name].bind(this);
             this[name] = (...args) => this.withStorageMutation(() => method(...args), name);
@@ -795,6 +795,35 @@ export default class Stored extends EventEmitter2 {
     getTrashItem(backend, id) { return this.#trash.get(backend, id); }
     restoreTrash(backend, id, options = {}) { return this.#trash.restore(backend, id, options); }
     discardTrash(backend, id) { return this.#trash.discard(backend, id); }
+
+    /** Delete a native remote folder and unlink only its indexed descendants.
+     * Local folders retain the recoverable, whole-directory Trash operation.
+     * The driver owns remote deletion policy (Drive uses its native Trash).
+     */
+    async removeDirectory(backendName, key, { origin = null } = {}) {
+        const backend = this.#backends.get(backendName);
+        if (!backend?.canDelete || backend.config.readOnly === true) throw new Error('Backend is read-only or unavailable');
+        if (typeof backend.trashContainer === 'function') return this.trashDirectory(backendName, key, { origin });
+        if (backend.transport !== 'gdrive') throw new Error('Backend does not support native folder deletion');
+        const normalized = this.#normalizeKey(key, { nfc: true });
+        if (!normalized || !this.#isSafeKey(normalized)) throw new Error('Invalid folder key');
+        this.#replicas.assertIdleEndpoint(backendName, normalized, { directory: true });
+        const keys = new Set();
+        for (const [, meta] of this.#index.entries()) {
+            for (const location of meta.locations || []) {
+                if (location.backend === backendName && location.key.startsWith(`${normalized}/`)) keys.add(location.key);
+            }
+        }
+        const release = this.#holdKeys([...keys].map(k => `${backendName}:${k}`));
+        try {
+            // A missing folder is an idempotent success; a failed remote write
+            // must leave every local location intact for retry.
+            await backend.deleteContainer(normalized);
+            for (const key of keys) this.#processUnlink({ backend: backendName, key, ...(origin ? { origin } : {}) });
+            await this.#replicas.abandonUnownedIngress(backendName, normalized, { directory: true });
+            return { ok: true, key: normalized, type: 'directory' };
+        } finally { release(); }
+    }
 
     /** Move the whole directory into private trash in one filesystem rename.
      * This preserves unindexed/hidden files, empty folders and timestamps too.
