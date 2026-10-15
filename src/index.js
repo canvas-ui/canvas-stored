@@ -1318,12 +1318,19 @@ export default class Stored extends EventEmitter2 {
                 processed.add(file.key);
                 if (!file.checksums) return;
                 const id = formatId(file.checksums, this.#config.primaryChecksum);
+                const occupant = this.#index.get(`${file.backend}:${file.key}`);
+                // Scans must report the same edit provenance as watcher/API
+                // writes. Otherwise consumers see new content as a new file,
+                // lose the document ID, and later mistake the old row for a
+                // deletion. Keep the hint on both streamed and returned rows.
+                const previous = occupant && occupant.id !== id ? occupant : null;
+                if (previous) file.previous = { id: previous.id, checksums: previous.checksums };
                 const existing = this.#index.get(id);
                 const locations = existing?.locations || [];
                 const match = locations.find(l => l.backend === file.backend && l.key === file.key);
                 // Avoid LMDB/index/change-feed churn on warm scans. Still emit
                 // the row to consumers: their document index may need repair.
-                if (match && match.synced === true && match.size === file.size && match.mtime === file.modified
+                if (!previous && match && match.synced === true && match.size === file.size && match.mtime === file.modified
                     && (file.ino == null || (match.ino === file.ino && match.dev === file.dev))
                     && existing.size === file.size && existing.mimeType === file.mimeType) return;
                 if (match) {
@@ -1339,7 +1346,14 @@ export default class Stored extends EventEmitter2 {
                         ...(file.ino != null ? { ino: file.ino, dev: file.dev } : {}),
                     }));
                 }
-                this.#index.put(id, { checksums: file.checksums, size: file.size, mimeType: file.mimeType, locations });
+                this.#index.transaction(() => {
+                    if (previous) {
+                        const remaining = previous.locations.filter(l => !(l.backend === file.backend && l.key === file.key));
+                        if (remaining.length) this.#index.put(previous.id, { ...previous, locations: remaining });
+                        else this.#index.delete(previous.id);
+                    }
+                    this.#index.put(id, { checksums: file.checksums, size: file.size, mimeType: file.mimeType, locations });
+                });
             };
 
             // Inode identity snapshot for rename matching: same (dev, ino) at a

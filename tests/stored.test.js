@@ -310,6 +310,26 @@ describe('Stored', async () => {
                 });
             }
         });
+
+        test('a scan reports edits with their predecessor and replaces the old path mapping', async () => {
+            const key = 'scan-edit-provenance.txt';
+            await fs.writeFile(path.join(TEST_DIR, key), 'initial scan version');
+            const first = (await stored.scan('fs:test')).files.find(f => f.key === key);
+            let checksum = first.checksums.sha256;
+            for (let n = 1; n <= 3; n++) {
+                await fs.writeFile(path.join(TEST_DIR, key), `scan version ${n}`);
+                const streamed = [];
+                const scan = await stored.scan('fs:test', { onFile: file => { if (file.key === key) streamed.push(file); } });
+                const edited = scan.files.find(f => f.key === key);
+                assert.strictEqual(edited.previous.id, `sha256:${checksum}`);
+                assert.strictEqual(streamed[0].previous.checksums.sha256, checksum);
+                assert.strictEqual(stored.index.get(`sha256:${checksum}`), null);
+                assert.strictEqual(stored.index.get(`fs:test:${key}`).checksums.sha256, edited.checksums.sha256);
+                checksum = edited.checksums.sha256;
+            }
+            const warm = (await stored.scan('fs:test')).files.find(f => f.key === key);
+            assert.strictEqual(warm.previous, undefined, 'an unchanged rescan is not another edit');
+        });
     });
 
     // ─────────────────────────────────────────────────────────────────────────
