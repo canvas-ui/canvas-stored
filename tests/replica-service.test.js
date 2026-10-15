@@ -2,11 +2,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import os from 'node:os';
 import Stored from '../src/index.js';
 import { spawn } from 'node:child_process';
 
 async function setup(t) {
-    const root = await fs.mkdtemp('/tmp/stored-replicas-');
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'stored-replicas-'));
     const open = () => {
         const s = new Stored({ root: path.join(root, 'state'), retention: { days: 30 }, replication: { autoStart: false } });
         s.on('error', () => {});

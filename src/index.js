@@ -2060,6 +2060,10 @@ export default class Stored extends EventEmitter2 {
     // local backend's filesystem, then commit (hardlink/rename) to targets.
     async #ingestStream(blob, targets, key, mimeHint, options = {}) {
         const source = isStream(blob) ? blob : createReadStream(blob);
+        const blobTarget = targets.find(t => typeof t.backend.ingestStream === 'function');
+        if (blobTarget || targets.every(t => t.backend.type !== 'local')) {
+            return this.#ingestBlobStream(source, targets, blobTarget, key, mimeHint, options);
+        }
         const firstLocal = targets.find(t => t.backend.type === 'local')?.backend;
         const tempDir = firstLocal ? firstLocal.tempDir : path.join(this.#paths.cache, '.tmp');
         const tempPath = path.join(tempDir, `${Date.now()}-${crypto.randomUUID()}`);
@@ -2081,6 +2085,46 @@ export default class Stored extends EventEmitter2 {
             await fsp.rm(tempPath, { force: true }).catch(() => {});
         }
         return result;
+    }
+
+    // Upload directly to the managed blob store. Hash and sniff in-flight;
+    // extraction and additional destinations read the completed immutable blob.
+    // Cacache owns the only temporary payload and atomically publishes it.
+    async #ingestBlobStream(source, targets, target, key, mimeHint, options) {
+        const hashes = this.#config.checksums.map(algo => ({ algo, hash: crypto.createHash(algo) }));
+        const checksums = {};
+        const headChunks = [];
+        let headLen = 0;
+        async function* measured() {
+            for await (const chunk of source) {
+                const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+                for (const { hash } of hashes) hash.update(buf);
+                if (headLen < HEAD_BYTES) {
+                    const slice = buf.subarray(0, HEAD_BYTES - headLen);
+                    headChunks.push(Buffer.from(slice));
+                    headLen += slice.length;
+                }
+                yield buf;
+            }
+            for (const { algo, hash } of hashes) checksums[algo] = hash.digest('hex');
+        }
+        let id, finalKey, mimeType, extracted;
+        const sink = target?.backend || this.#cache;
+        const { file, size } = await sink.ingestStream(measured(), async content => {
+            id = formatId(checksums, this.#config.primaryChecksum);
+            finalKey = key || this.#generateKey(checksums);
+            mimeType = mimeHint || await detectMimeFromHead(Buffer.concat(headChunks), finalKey);
+            extracted = await this.#maybeExtract({ file: content.file }, mimeType, finalKey);
+            return target ? finalKey : { key: id, metadata: { key: finalKey, checksums, size: content.size, mimeType } };
+        });
+        const rest = targets.filter(t => t !== target);
+        const { locations, remoteTargets } = await this.#commit(rest, finalKey, id, { file, cached: !target }, { checksums, size, mimeType }, options);
+        if (target) {
+            const stat = await target.backend.stat(finalKey);
+            const location = this.#buildLocation(target.name, finalKey, true, { size, mtime: stat.modified });
+            locations.splice(targets.indexOf(target), 0, location);
+        }
+        return { id, finalKey, checksums, size, mimeType, locations, remoteTargets, extracted };
     }
 
     // Single streaming pass: hash (all algorithms), measure size, peek the head
@@ -2152,7 +2196,7 @@ export default class Stored extends EventEmitter2 {
             }
         }
 
-        if (remoteTargets.length) {
+        if (remoteTargets.length && !source.cached) {
             const cacheMeta = { key: finalKey, checksums: meta.checksums, size: meta.size, mimeType: meta.mimeType };
             if (source.data) await this.#cache.put(id, source.data, cacheMeta);
             else await pipeline(createReadStream(source.file), this.#cache.putStream(id, cacheMeta));

@@ -1,6 +1,9 @@
 import cacache from 'cacache';
 import Debug from 'debug';
 import { Writable } from 'node:stream';
+import collectGarbage from './collect-garbage.js';
+import ingestStream from './ingest-stream.js';
+import compactIndex from './compact-index.js';
 
 const debug = Debug('stored:cache');
 
@@ -13,19 +16,19 @@ export default class Cache {
     #root;
     #algorithms;
     #mutations = Promise.resolve();
-    #dirty = false;
-    #timer;
 
     constructor(config) {
         if (!config?.path) throw new Error('Cache path required');
         this.#root = config.path;
         this.#algorithms = config.algorithms || ['sha256'];
-        this.#timer = setInterval(() => { if (this.#dirty) this.verify().catch(error => debug(`Cache collection failed: ${error.message}`)); }, 60_000);
-        this.#timer.unref?.();
         debug(`Cache initialized at "${this.#root}"`);
     }
 
     get root() { return this.#root; }
+
+    ingestStream(source, resolveEntry) {
+        return this.#serialize(() => ingestStream(this.#root, source, resolveEntry, this.#algorithms));
+    }
 
     // Materializes the entire index into one object — fine for small stores, but
     // prefer listStream() at scale (1M+ entries) to avoid the in-RAM map.
@@ -70,13 +73,17 @@ export default class Cache {
 
     getInfo(key) { return cacache.get.info(this.#root, key); }
 
-    delete(key) { return this.#serialize(async () => { await cacache.rm.entry(this.#root, key, { removeFully: true }); this.#dirty = true; }); }
+    delete(key) { return this.#serialize(() => cacache.rm.entry(this.#root, key, { removeFully: true })); }
 
     clear() { return this.#serialize(() => cacache.rm.all(this.#root)); }
 
     #serialize(action) { const next = this.#mutations.catch(() => {}).then(action); this.#mutations = next; return next; }
-    verify() { return this.#serialize(async () => { const result = await cacache.verify(this.#root); this.#dirty = false; return result; }); }
-    async stop() { clearInterval(this.#timer); await this.verify(); }
+    // Explicit maintenance only. verify() reads all bytes and can discard
+    // corrupt content; collection only reclaims blobs without a key reference.
+    verify() { return this.#serialize(() => cacache.verify(this.#root)); }
+    collectGarbage() { return this.#serialize(() => collectGarbage(this.#root)); }
+    compact() { return this.#serialize(() => compactIndex(this.#root)); }
+    async stop() { await this.#mutations; }
 
     // Stream the index so a 1M+ entry store is tallied without ever holding the
     // full key set in memory.

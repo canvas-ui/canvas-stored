@@ -4,6 +4,32 @@
 
 # StoreD
 
+## Managed blob uploads and maintenance
+
+Stream/path uploads through `put()` with a cacache destination (or only remote
+destinations, using the transient cache) write directly through cacache's atomic
+content writer. Checksums and MIME sniffing run during
+that stream; extraction reads the completed blob. There is no separate Stored
+staging copy. Cacache still uses its own temporary file until the digest is
+known, then publishes it under the content hash. Additional destinations require
+their own copies; keyed filesystem edits and transfers retain their staging and
+precondition checks.
+
+Deleting a cache key releases its reference; unused bytes remain until explicit
+maintenance. Neither the managed backend nor the transient cache scans on a
+timer or during shutdown. `collectGarbage()` on either object walks the index
+and removes unreferenced blobs without reading payloads, rewriting the index,
+or clearing temporary files. It still holds live digest paths in memory and
+excludes writes for that root: schedule it as maintenance, not per deletion.
+Only one writer/maintenance owner may operate on a cache root at a time.
+
+`compact()` trims obsolete index history for each live key, preserving its newest
+digest and metadata. It neither reads blob contents nor reclaims unused blobs.
+
+`stored.cache.verify()` remains an explicitly requested, expensive integrity
+scrub. It reads all retained bytes and can discard corrupted content; it is
+not routine garbage collection. Preserve recovery copies before scrubbing.
+
 ## File backend readiness
 
 `addBackend()` returns the backend immediately. Since 1.13, managed file roots
@@ -300,7 +326,7 @@ The constructor extends **eventemitter2** with `wildcard: true` and `delimiter: 
 | `index` | `Index` | LMDB metadata store |
 | `backends` | `BackendManager` | Registered backend instances |
 
-The `cache` wrapper exposes cacache maintenance helpers directly: `stats()` (entry count + total size, streamed so large stores are never held in memory), `clear()`, `verify()`, and `list()` / `listStream()`.
+The `cache` wrapper exposes cacache maintenance helpers directly: `stats()` (entry count + total size, streamed so large stores are never held in memory), `clear()`, `collectGarbage()`, `compact()`, `verify()`, and `list()` / `listStream()`.
 
 ---
 

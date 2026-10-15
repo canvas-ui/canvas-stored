@@ -4,6 +4,9 @@ import { createReadStream } from 'fs';
 import { pipeline } from 'stream/promises';
 import cacache from 'cacache';
 import contentPath from 'cacache/lib/content/path.js';
+import collectGarbage from '../../cache/collect-garbage.js';
+import ingestStream from '../../cache/ingest-stream.js';
+import compactIndex from '../../cache/compact-index.js';
 import Debug from 'debug';
 import StorageBackend from '../StorageBackend.js';
 
@@ -34,8 +37,6 @@ export default class CacacheBackend extends StorageBackend {
     #root;
     #algorithms;
     #mutations = Promise.resolve();
-    #gcTimer = null;
-    #dirty = false;
 
     constructor(name, config = {}) {
         super(name, config);
@@ -44,14 +45,12 @@ export default class CacacheBackend extends StorageBackend {
         this.#algorithms = config.algorithms || ['sha256'];
         this.type = 'local';
         fs.ensureDirSync(this.#root);
-        // Verification must never race a content write before its index entry
-        // is committed. All mutations and collection share this queue.
-        for (const method of ['put', 'commit', 'delete', 'clear']) {
+        // Explicit collection must never race an unpublished content write.
+        // All mutations and maintenance share this queue.
+        for (const method of ['put', 'commit', 'ingestStream', 'delete', 'clear']) {
             const run = this[method].bind(this);
             this[method] = (...args) => this.#serialize(() => run(...args));
         }
-        this.#gcTimer = setInterval(() => { if (this.#dirty) this.collectGarbage().catch(error => this.emit('error', error)); }, 60_000);
-        this.#gcTimer.unref?.();
         debug(`CacacheBackend "${name}" initialized at ${this.#root}`);
     }
 
@@ -59,9 +58,9 @@ export default class CacacheBackend extends StorageBackend {
     // list() streams the cacache index, so full-key enumeration works even
     // though the store is opaque byte-wise.
     get capabilities() { return { ...super.capabilities, canEnumerate: true }; }
-    // Staging dir for the Stored streaming-ingest hash pass (shares a filesystem
-    // with the store so the temp file is cheap to read back on commit).
-    get tempDir() { return path.join(this.#root, 'tmp'); }
+    // Legacy keyed writes/transfers still stage before checking preconditions.
+    // Keep these outside cacache's tmp, which explicit verify() can remove.
+    get tempDir() { return path.join(this.#root, '.stored-tmp'); }
 
     // Internal blob store: no protocol-native URL to surface.
     nativeUrl(key) { return null; }
@@ -88,6 +87,13 @@ export default class CacacheBackend extends StorageBackend {
         const size = info?.size ?? 0;
         debug(`COMMIT ${key} (${size} bytes)`);
         return { key, size };
+    }
+
+    // Write bytes once using cacache's atomic content writer. A generated key
+    // is only known after EOF; resolveKey can inspect the completed blob before
+    // publication. Failed/aborted uploads never replace an existing key.
+    async ingestStream(source, resolveKey) {
+        return ingestStream(this.#root, source, async content => ({ key: await resolveKey(content) }), this.#algorithms);
     }
 
     // Ranged read for HTTP Range/streaming: cacache has no ranged API, so read a
@@ -119,7 +125,6 @@ export default class CacacheBackend extends StorageBackend {
         const info = await cacache.get.info(this.#root, key);
         if (!info) return false;
         await cacache.rm.entry(this.#root, key, { removeFully: true });
-        this.#dirty = true;
         debug(`DELETE ${key}`);
         return true;
     }
@@ -147,17 +152,15 @@ export default class CacacheBackend extends StorageBackend {
     }
 
     collectGarbage() {
-        return this.#serialize(async () => {
-            const result = await cacache.verify(this.#root);
-            this.#dirty = false;
-            return result;
-        });
+        return this.#serialize(() => collectGarbage(this.#root));
     }
 
+    // Explicit integrity scrub only: reads all bytes and may discard corruption.
+    verify() { return this.#serialize(() => cacache.verify(this.#root)); }
+    compact() { return this.#serialize(() => compactIndex(this.#root)); }
+
     async stop() {
-        clearInterval(this.#gcTimer);
         await this.#mutations;
-        if (this.#dirty) await this.collectGarbage();
     }
 
     // Drop the whole content store (index + content). Used by Destroy/reset paths.
