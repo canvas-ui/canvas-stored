@@ -1,4 +1,4 @@
-import { open } from 'lmdb';
+import { openKeyValueStore } from 'canvas-synapsd/src/storage.js';
 import Debug from 'debug';
 
 const debug = Debug('stored:index');
@@ -40,7 +40,7 @@ export default class Index {
     constructor(path = './.stored/index', options = {}) {
         // Object indexes, edge replicas, operation receipts, ingress and Trash
         // share this environment. LMDB's default named-DB limit is too small.
-        this.#db = open({ path, name: 'metadata', compression: true, maxDbs: 64 });
+        this.#db = openKeyValueStore({ path, name: 'metadata', compression: true, maxDbs: 64 });
         this.#pathDb = this.#db.openDB('paths');
         this.#changesDb = this.#db.openDB('changes');
         this.#metaDb = this.#db.openDB('index-meta');
@@ -357,6 +357,6 @@ export default class Index {
     }
 
     close() {
-        this.#db.close();
+        return this.#db.close();
     }
 }

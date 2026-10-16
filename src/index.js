@@ -12,6 +12,7 @@ import Debug from 'debug';
 import Cache from './cache/index.js';
 import BackendManager from './backends/BackendManager.js';
 import Index from './index/index.js';
+import { verifyDatabase } from 'canvas-synapsd/src/storage.js';
 import SyncQueue from './sync/SyncQueue.js';
 import JobQueue from './sync/JobQueue.js';
 import Ledger from './sync/Ledger.js';
@@ -43,6 +44,17 @@ const RENAME_WINDOW_MS = 1000;
 const MOVE_SUPPRESS_MS = 3000;
 
 export default class Stored extends EventEmitter2 {
+    /** Safe startup for persistent indexes. The sync constructor remains for
+     * callers that already verified their environment (or create a new one).
+     */
+    static async open(config = {}) {
+        const databasePath = resolveStoredPaths(config).index;
+        config.onStartupStage?.({ stage: 'stored.index.verify', databasePath });
+        await verifyDatabase(databasePath);
+        config.onStartupStage?.({ stage: 'stored.index.open', databasePath });
+        return new this(config);
+    }
+
     supportsScopedFolderDeletion = true;
     #mutations;
     #closing = false;
@@ -1484,7 +1496,7 @@ export default class Stored extends EventEmitter2 {
         // staging keys were released without racing an ingress stream.
         await this.#cache.stop();
         this.#replicas.releaseExecutor();
-        this.#index.close();
+        await this.#index.close();
         debug('Stopped');
     }
 

@@ -1,6 +1,6 @@
 {
     "name": "canvas-stored",
-    "version": "1.15.0",
+    "version": "1.16.0",
     "description": "",
     "main": "./src/index.js",
     "type": "module",
@@ -21,11 +21,11 @@
         "fs-extra": "^11.3.4",
         "image-size": "^2.0.2",
         "imap": "^0.8.19",
-        "lmdb": "^3.5.2",
         "music-metadata": "^11.9.0",
-        "picomatch": "^2.3.1"
+        "picomatch": "^2.3.1",
+        "canvas-synapsd": "github:canvas-ui/canvas-synapsd#main"
     },
     "engines": {
-        "node": ">=20.0.0"
+        "node": ">=22.0.0"
     }
 }

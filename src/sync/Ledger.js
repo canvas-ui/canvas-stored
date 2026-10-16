@@ -1,4 +1,4 @@
-import { open } from 'lmdb';
+import { openKeyValueStore } from 'canvas-synapsd/src/storage.js';
 import Debug from 'debug';
 
 const debug = Debug('stored:sync:ledger');
@@ -29,7 +29,7 @@ export default class Ledger {
         if (index && typeof index.openDB === 'function') {
             this.#db = index.openDB(name);
         } else if (path) {
-            this.#own = open({ path, name, compression: true });
+            this.#own = openKeyValueStore({ path, name, compression: true });
             this.#db = this.#own;
         } else {
             throw new Error('Ledger requires { index } or { path }');
@@ -133,6 +133,6 @@ export default class Ledger {
     }
 
     close() {
-        if (this.#own) { this.#own.close(); this.#own = null; }
+        if (this.#own) { const closing = this.#own.close(); this.#own = null; return closing; }
     }
 }
