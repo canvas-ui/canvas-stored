@@ -129,6 +129,20 @@ await stored.stop();
 
 Register additional drivers at runtime with `BackendManager.register(name, Class)` (`import BackendManager from 'canvas-stored/src/backends/BackendManager.js'`).
 
+Drivers declare their features through `static getCapabilities(config)`. Use
+`getBackendCapabilities(config)` (a named export from `canvas-stored`) to inspect
+a stopped/unconfigured backend without opening it, or
+`stored.getBackendCapabilities(name)` for the live instance, including runtime
+mount detection. Unknown drivers report no supported operations.
+
+`paths` means objects can keep a chosen folder/filename, including sub-folder
+paths: file, Google Drive, S3 key prefixes and Canvas hub backends support it;
+the content-addressed blob store and HTTP source do not. `mutableContainers`
+separately reports real folder creation/rename/deletion, including empty folders
+(file and Google Drive). `upload` reports create-only keyed uploads. Write
+features honor `readOnly`. These are driver features; safe replication/retirement
+capabilities remain available through `stored.replicas.capabilities(name)`.
+
 ### Google Drive backend
 
 ```js

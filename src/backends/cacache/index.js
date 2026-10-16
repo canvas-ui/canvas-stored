@@ -57,7 +57,7 @@ export default class CacacheBackend extends StorageBackend {
     get root() { return this.#root; }
     // list() streams the cacache index, so full-key enumeration works even
     // though the store is opaque byte-wise.
-    get capabilities() { return { ...super.capabilities, canEnumerate: true }; }
+    static getCapabilities(config = {}) { return { ...super.getCapabilities(config), canEnumerate: true }; }
     // Legacy keyed writes/transfers still stage before checking preconditions.
     // Keep these outside cacache's tmp, which explicit verify() can remove.
     get tempDir() { return path.join(this.#root, '.stored-tmp'); }

@@ -21,7 +21,7 @@ describe('GdriveBackend', () => {
         assert.strictEqual(backend.type, 'remote');
         assert.strictEqual(backend.remote, true);
         assert.strictEqual(backend.transport, 'gdrive');
-        assert.deepStrictEqual(backend.capabilities, { read: true, write: true, delete: true, canEnumerate: true, remote: true });
+        assert.deepStrictEqual(backend.capabilities, { read: true, write: true, delete: true, canEnumerate: true, remote: true, paths: true, mutableContainers: true, upload: true });
     });
 
     test('verifyRoot() reports auth failures and missing roots with a reason', async () => {

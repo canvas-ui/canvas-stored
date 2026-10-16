@@ -24,7 +24,19 @@ export default class StorageBackend extends EventEmitter {
      * `remote` mirrors the getter below — carried here so a single capabilities
      * snapshot is enough for consumers deciding how expensive an op will be.
      */
-    get capabilities() { return { read: true, write: true, delete: true, canEnumerate: false, remote: this.remote }; }
+    // Available without opening a backend (settings also list stopped mounts).
+    // paths: accepts a chosen folder/filename, including nested path segments.
+    // mutableContainers: can create/rename/delete actual folders, including
+    // empty ones. S3 prefixes support paths without supporting container ops.
+    // upload: supports create-only keyed uploads via createFrom().
+    static getCapabilities(config = {}) {
+        return {
+            read: true, write: config.readOnly !== true, delete: config.readOnly !== true,
+            canEnumerate: false, remote: config.remote === true,
+            paths: false, mutableContainers: false, upload: false,
+        };
+    }
+    get capabilities() { return { ...this.constructor.getCapabilities(this.config), remote: this.remote }; }
     get canDelete() { return this.capabilities.delete !== false; }
     get canWrite() { return this.capabilities.write !== false; }
     get canRead() { return this.capabilities.read !== false; }

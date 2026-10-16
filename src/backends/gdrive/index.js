@@ -107,7 +107,9 @@ export default class GdriveBackend extends StorageBackend {
         debug(`GdriveBackend "${name}" initialized (folder=${this.#rootRef})`);
     }
 
-    get capabilities() { return { read: true, write: true, delete: true, canEnumerate: true, remote: true }; }
+    static getCapabilities(config = {}) {
+        return { ...super.getCapabilities(config), canEnumerate: true, remote: true, paths: true, mutableContainers: config.readOnly !== true, upload: config.readOnly !== true };
+    }
     get remote() { return true; }
     get transport() { return DEV; }
     get watching() { return !!this.#pollTimer; }

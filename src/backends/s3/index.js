@@ -47,7 +47,9 @@ export default class S3Backend extends StorageBackend {
             requestHandler: { connectionTimeout: 10_000, requestTimeout: 120_000 }, maxAttempts: 3,
         });
     }
-    get capabilities() { return { read: true, write: this.config.readOnly !== true, delete: this.config.readOnly !== true && this.config.permanentDelete === true, canEnumerate: true, remote: true }; }
+    static getCapabilities(config = {}) {
+        return { ...super.getCapabilities(config), delete: config.readOnly !== true && config.permanentDelete === true, canEnumerate: true, remote: true, paths: true, upload: config.readOnly !== true };
+    }
     get transport() { return 's3'; }
     get watching() { return Boolean(this.#timer); }
     #safe(key) { return !/[\x00-\x1f\\]/.test(key) && !key.split('/').some(s => !s || s === '.' || s === '..'); }

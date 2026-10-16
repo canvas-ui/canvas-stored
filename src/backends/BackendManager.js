@@ -27,6 +27,14 @@ export default class BackendManager {
 
     static drivers() { return Object.keys(DRIVERS); }
 
+    /** Driver-owned features, without credentials, I/O or starting a backend. */
+    static capabilities(config = {}) {
+        return DRIVERS[config.driver || 'file']?.getCapabilities?.(config) || {
+            read: false, write: false, delete: false, canEnumerate: false,
+            remote: false, paths: false, mutableContainers: false, upload: false,
+        };
+    }
+
     get(name) { return this.#backends.get(name); }
     has(name) { return this.#backends.has(name); }
     list() { return [...this.#backends.keys()]; }
@@ -58,3 +66,5 @@ export default class BackendManager {
         }
     }
 }
+
+export const getBackendCapabilities = (config) => BackendManager.capabilities(config);

@@ -76,7 +76,9 @@ export default class FileBackend extends StorageBackend {
     get root() { return this.#root; }
     get tempDir() { return this.#tempDir; }
     get watching() { return !!this.#watcher; }
-    get capabilities() { return { ...super.capabilities, canEnumerate: true }; }
+    static getCapabilities(config = {}) {
+        return { ...super.getCapabilities(config), canEnumerate: true, paths: true, mutableContainers: config.readOnly !== true, upload: config.readOnly !== true };
+    }
     get remote() { return this.#remote; }
     get transport() { return this.#transport; }
     get mountSource() { return this.#mountSource; }

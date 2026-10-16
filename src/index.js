@@ -11,6 +11,7 @@ import { isDeepStrictEqual } from 'node:util';
 import Debug from 'debug';
 import Cache from './cache/index.js';
 import BackendManager from './backends/BackendManager.js';
+export { getBackendCapabilities } from './backends/BackendManager.js';
 import Index from './index/index.js';
 import { verifyDatabase } from 'canvas-synapsd/src/storage.js';
 import SyncQueue from './sync/SyncQueue.js';
@@ -218,6 +219,7 @@ export default class Stored extends EventEmitter2 {
 
     listBackends() { return this.#backends.list(); }
     getBackend(name) { return this.#backends.get(name); }
+    getBackendCapabilities(name) { return this.#backends.get(name)?.capabilities || null; }
 
     /**
      * Parse a canonical `stored://<backend>/<key>` URL. The backend name may

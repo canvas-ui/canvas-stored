@@ -129,7 +129,9 @@ export default class CanvasBackend extends StorageBackend {
         debug(`CanvasBackend "${name}" initialized (${this.#url} ws=${this.#workspaceId} backend=${this.#backend})`);
     }
 
-    get capabilities() { return { read: true, write: true, delete: true, canEnumerate: true, remote: true }; }
+    static getCapabilities(config = {}) {
+        return { ...super.getCapabilities(config), canEnumerate: true, remote: true, paths: true };
+    }
     get remote() { return true; }
     /** Own writes never come back as events (origin-filtered) — Stored need not hold keys. */
     get suppressEchoes() { return false; }
