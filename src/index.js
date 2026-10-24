@@ -327,7 +327,8 @@ export default class Stored extends EventEmitter2 {
      * Store a blob. Accepts Buffer | string (content) | filesystem path |
      * Readable. Paths and streams are ingested without ever materializing the
      * whole blob in memory. `backends` is required (no implicit fan-out).
-     * `adopt: true` with a path hands the file over: a blob-store target moves
+     * `adopt: true` with a path hands the file over (writeObject takes the
+     * same option): a blob-store target moves
      * it in rather than copying it, and the file is gone afterwards. With
      * `checksums` (hex per configured algorithm, computed by the caller as the
      * bytes arrived) the file is not read again to hash it.
@@ -481,17 +482,25 @@ export default class Stored extends EventEmitter2 {
         if (!live.ok) return { ok: false, reason: 'target-offline', backend: backendName, detail: live.reason };
 
         const pathKey = `${backendName}:${destKey}`;
+        // `adopt`: the source path is a finished file the caller hands over
+        // (a resumable upload's part). It is placed itself, not copied, and
+        // stays where it is if the write does not happen.
+        const adopted = options.adopt && typeof source === 'string' && await isFileAsync(source);
         const tempDir = backend.tempDir || path.join(this.#paths.cache, '.tmp');
-        const tempPath = path.join(tempDir, `${Date.now()}-${crypto.randomUUID()}`);
-        await fsp.mkdir(tempDir, { recursive: true });
+        const tempPath = adopted ? source : path.join(tempDir, `${Date.now()}-${crypto.randomUUID()}`);
+        if (!adopted) await fsp.mkdir(tempDir, { recursive: true });
         let ingress = null;
         let accepted = false;
 
         try {
-            const stream = isBuffer(source) ? Readable.from([source])
-                : (typeof source === 'string' && !await isFileAsync(source)) ? Readable.from([Buffer.from(source)])
-                    : (isStream(source) ? source : createReadStream(source));
-            const { checksums, size, head } = await this.#hashToFile(stream, tempPath);
+            const known = adopted && options.checksums && this.#config.checksums.every(algo => /^[0-9a-f]+$/.test(options.checksums[algo] || ''));
+            const { checksums, size, head } = known
+                ? { checksums: Object.fromEntries(this.#config.checksums.map(algo => [algo, options.checksums[algo]])), size: (await fsp.stat(tempPath)).size, head: await readHead(tempPath) }
+                : adopted
+                    ? await this.#hashFile(tempPath)
+                    : await this.#hashToFile(isBuffer(source) ? Readable.from([source])
+                        : (typeof source === 'string' && !await isFileAsync(source)) ? Readable.from([Buffer.from(source)])
+                            : (isStream(source) ? source : createReadStream(source)), tempPath);
             const id = formatId(checksums, this.#config.primaryChecksum);
             const sha256 = checksums.sha256 ?? null;
             if (options.sha256 && sha256 && String(options.sha256).toLowerCase() !== sha256) {
@@ -550,7 +559,7 @@ export default class Stored extends EventEmitter2 {
                         await this.#trash.restore(backendName, captured.id).catch(() => {});
                         return { ok: false, reason: 'source-changed', trashId: captured.id };
                     }
-                    try { placed = await backend.createFrom(destKey, tempPath); }
+                    try { placed = await backend.createFrom(destKey, tempPath, { owned: true }); }
                     catch (error) {
                         await this.#trash.restore(backendName, captured.id).catch(() => {});
                         if (error.code === 'EEXIST') return { ok: false, reason: 'precondition-failed', trashId: captured.id };
@@ -558,7 +567,7 @@ export default class Stored extends EventEmitter2 {
                     }
                 } else if (String(options.ifNoneMatch || '').trim() === '*') {
                     if (typeof backend.createFrom !== 'function') return { ok: false, reason: 'unsupported-backend' };
-                    try { placed = await backend.createFrom(destKey, tempPath); }
+                    try { placed = await backend.createFrom(destKey, tempPath, { owned: true }); }
                     catch (error) {
                         if (error.code === 'EEXIST') return { ok: false, reason: 'precondition-failed', current: null };
                         throw error;
@@ -610,7 +619,7 @@ export default class Stored extends EventEmitter2 {
             }
         } finally {
             if (!accepted) await this.#replicas.discardIngress(ingress);
-            await fsp.rm(tempPath, { force: true }).catch(() => {});
+            if (accepted || !adopted) await fsp.rm(tempPath, { force: true }).catch(() => {});
         }
     }
 

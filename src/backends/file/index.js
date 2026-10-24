@@ -390,10 +390,26 @@ export default class FileBackend extends StorageBackend {
 
     // Create-only placement: link(2) fails with EEXIST even for an unindexed
     // file, directory or dangling symlink. Never use rename-over for this path.
-    async createFrom(key, srcPath) {
+    // `owned`: srcPath is the caller's private file, removed after this call,
+    // so it is linked into place itself; otherwise (or across filesystems) a
+    // copy gets its own inode first.
+    async createFrom(key, srcPath, { owned = false } = {}) {
         await this.ready();
         const dest = this.#resolvePath(key);
         await fs.ensureDir(path.dirname(dest));
+        if (owned) {
+            const handle = await fsp.open(srcPath, 'r');
+            try { await handle.sync(); } finally { await handle.close(); }
+            try {
+                await fs.link(srcPath, dest);
+                await this.#syncDirectory(path.dirname(dest));
+                const stat = await this.stat(key);
+                if (!stat) throw new Error(`Upload destination disappeared: ${key}`);
+                return stat;
+            } catch (error) {
+                if (error.code !== 'EXDEV') throw error;
+            }
+        }
         const sibling = path.join(path.dirname(dest), `${TMP_DIR}-${process.pid}-${Math.random().toString(16).slice(2)}`);
         try {
             await fs.copyFile(srcPath, sibling, fs.constants.COPYFILE_FICLONE);
