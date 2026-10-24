@@ -52,7 +52,7 @@ export default class S3Backend extends StorageBackend {
     }
     get transport() { return 's3'; }
     get watching() { return Boolean(this.#timer); }
-    #safe(key) { return !/[\x00-\x1f\\]/.test(key) && !key.split('/').some(s => !s || s === '.' || s === '..'); }
+    #safe(key) { return ![...key].some(c => c < ' ' || c === '\\') && !key.split('/').some(s => !s || s === '.' || s === '..'); }
     #key(key) {
         if (typeof key !== 'string' || !this.#safe(key) || key.startsWith(PROBES)) throw fault('INVALID_KEY', 'Invalid or reserved S3 object key');
         return this.#prefix + key;

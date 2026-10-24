@@ -58,17 +58,17 @@ export default class StorageBackend extends EventEmitter {
     // The real, protocol-native URL for `key` (e.g. https://…, s3://…, smb://…,
     // file://…), used for provenance/UI. `stored://<backend>/<key>` remains the
     // canonical fetch form. Returns null when the backend has no meaningful one.
-    nativeUrl(key) { return null; }
+    nativeUrl(_key) { return null; }
 
     // Required methods - must be implemented by subclasses
-    async put(key, data) { throw new Error('Not implemented'); }
+    async put(_key, _data) { throw new Error('Not implemented'); }
     // Place an already-written file at `key` (streaming put commit). Local
     // backends implement this; remote backends are fed via the cache + SyncQueue.
-    async commit(key, srcPath) { throw new Error('Not implemented'); }
-    async get(key, options = {}) { throw new Error('Not implemented'); }
-    async delete(key) { throw new Error('Not implemented'); }
-    async stat(key) { throw new Error('Not implemented'); }
-    async *list(options = {}) { throw new Error('Not implemented'); }
+    async commit(_key, _srcPath) { throw new Error('Not implemented'); }
+    async get(_key, _options = {}) { throw new Error('Not implemented'); }
+    async delete(_key) { throw new Error('Not implemented'); }
+    async stat(_key) { throw new Error('Not implemented'); }
+    list(_options = {}) { throw new Error('Not implemented'); }
 
     // Optional methods
     async watch() { return false; }
@@ -78,7 +78,7 @@ export default class StorageBackend extends EventEmitter {
     // Optional container (directory/folder) mutation — only backends with a real
     // hierarchical namespace (the file driver) implement these. Advertised via
     // the Workspace `mutableContainers` capability; callers must gate on it.
-    async createContainer(key) { throw new Error('Container ops not supported by this backend'); }
-    async deleteContainer(key) { throw new Error('Container ops not supported by this backend'); }
-    async renameContainer(fromKey, toKey) { throw new Error('Container ops not supported by this backend'); }
+    async createContainer(_key) { throw new Error('Container ops not supported by this backend'); }
+    async deleteContainer(_key) { throw new Error('Container ops not supported by this backend'); }
+    async renameContainer(_fromKey, _toKey) { throw new Error('Container ops not supported by this backend'); }
 }

@@ -132,7 +132,8 @@ describe('retention window + atomic placement', async () => {
             await s2.getBackend('fs:x').put('sub/g.txt', Buffer.from('put across'));
             assert.strictEqual(await fs.readFile(path.join(dir, 'sub/g.txt'), 'utf8'), 'put across');
             assert.deepStrictEqual((await fs.readdir(path.join(dir, 'sub'))).sort(), ['f.txt', 'g.txt'], 'no sibling temp left behind');
-            assert.strictEqual((await s2.listObjects('fs:x', { limit: 100 })).objects.map((o) => o.key).sort().join(','), 'sub/f.txt,sub/g.txt' === 'x' ? '' : (await s2.listObjects('fs:x', { limit: 100 })).objects.map((o) => o.key).sort().join(','));
+            // g.txt went to the backend directly (no index write, watch off).
+            assert.strictEqual((await s2.listObjects('fs:x', { limit: 100 })).objects.map((o) => o.key).sort().join(','), 'sub/f.txt');
         } finally {
             await s2.stop();
             await fs.remove(other);

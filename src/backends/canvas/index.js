@@ -200,7 +200,7 @@ export default class CanvasBackend extends StorageBackend {
         const { body: bodySpec, ...rest } = init;
         const streaming = bodySpec != null && typeof bodySpec !== 'function' && !Buffer.isBuffer(bodySpec) && typeof bodySpec !== 'string';
         const timeoutMs = this.#requestTimeoutMs + (uploadBytes > 0 ? Math.ceil(uploadBytes / this.#minUploadBytesPerSec) * 1000 : 0);
-        let last = null;
+        let last;
         for (let attempt = 0; ; attempt += 1) {
             const body = typeof bodySpec === 'function' ? bodySpec() : bodySpec;
             const options = { ...rest, headers: { ...this.#authHeaders(), ...(rest.headers || {}) } };
@@ -607,7 +607,7 @@ export default class CanvasBackend extends StorageBackend {
         if (this.#cursor == null) return { ok: false, reason: 'no-cursor' };
         let since = this.#cursor;
         let applied = 0;
-        let head = this.#head;
+        let head;
         try {
             for (;;) {
                 const page = await this.changes(since, CHANGES_PAGE);

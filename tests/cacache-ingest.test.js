@@ -209,3 +209,30 @@ test('index compaction keeps the newest value, metadata and aliases without touc
         assert.equal(records.length, 1);
     }
 });
+
+test('an adopted file moves into the blob store without a second copy; caller checksums skip the read', async t => {
+    const { root, stored } = await setup(t);
+    const bytes = Buffer.from('a finished resumable upload');
+    const sha256 = createHash('sha256').update(bytes).digest('hex');
+    const part = path.join(root, 'upload.part');
+    await fs.writeFile(part, bytes);
+    const { ino } = await fs.stat(part);
+    const reads = t.mock.method(nativeFs, 'createReadStream');
+
+    const result = await stored.put(part, { backends: ['data'], adopt: true, checksums: { sha256 } });
+    assert.equal(result.ok, true);
+    assert.equal(result.checksums.sha256, sha256);
+    assert.equal(result.size, bytes.length);
+    await assert.rejects(fs.stat(part), { code: 'ENOENT' });
+    const info = await cacache.get.info(path.join(root, 'blobs'), result.key);
+    assert.equal((await fs.stat(info.path)).ino, ino, 'the same inode: renamed, not copied');
+    assert.equal(reads.mock.calls.filter(call => call.arguments[0] === part).length, 0);
+    assert.ok((await stored.get(result.id)).equals(bytes));
+
+    // Without caller checksums the file is hashed (read once), still moved in;
+    // content already stored deduplicates and the handed-over file is dropped.
+    await fs.writeFile(part, bytes);
+    const again = await stored.put(part, { backends: ['data'], adopt: true });
+    assert.equal(again.checksums.sha256, sha256);
+    await assert.rejects(fs.stat(part), { code: 'ENOENT' });
+});

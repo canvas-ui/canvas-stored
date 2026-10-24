@@ -5,7 +5,7 @@ import { pipeline } from 'stream/promises';
 import cacache from 'cacache';
 import contentPath from 'cacache/lib/content/path.js';
 import collectGarbage from '../../cache/collect-garbage.js';
-import ingestStream from '../../cache/ingest-stream.js';
+import ingestStream, { adoptFile } from '../../cache/ingest-stream.js';
 import compactIndex from '../../cache/compact-index.js';
 import Debug from 'debug';
 import StorageBackend from '../StorageBackend.js';
@@ -63,7 +63,7 @@ export default class CacacheBackend extends StorageBackend {
     get tempDir() { return path.join(this.#root, '.stored-tmp'); }
 
     // Internal blob store: no protocol-native URL to surface.
-    nativeUrl(key) { return null; }
+    nativeUrl(_key) { return null; }
 
     // ─────────────────────────────────────────────────────────────────────────
     // CRUD Operations
@@ -94,6 +94,11 @@ export default class CacacheBackend extends StorageBackend {
     // publication. Failed/aborted uploads never replace an existing key.
     async ingestStream(source, resolveKey) {
         return ingestStream(this.#root, source, async content => ({ key: await resolveKey(content) }), this.#algorithms);
+    }
+
+    // Move a finished file in instead of copying it (see adoptFile).
+    async adoptFile(file, digest, resolveKey) {
+        return adoptFile(this.#root, file, digest, async content => ({ key: await resolveKey(content) }), this.#algorithms);
     }
 
     // Ranged read for HTTP Range/streaming: cacache has no ranged API, so read a

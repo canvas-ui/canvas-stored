@@ -29,7 +29,6 @@ export default class FileBackend extends StorageBackend {
     #watcher = null;
     #watchEpoch = 0;
     #rootReady;
-    #watchEnabled;
     #ignored;
     #ignoreMatcher = null;
     #defaultAlgorithms = ['sha256'];
@@ -44,7 +43,6 @@ export default class FileBackend extends StorageBackend {
         this.#tempDir = config.tempDir ? path.resolve(this.#root, String(config.tempDir)) : path.join(this.#root, TMP_DIR);
         const tempRel = path.relative(this.#root, this.#tempDir).split(path.sep).join('/');
         this.#tempRel = tempRel && !tempRel.startsWith('..') && !path.isAbsolute(tempRel) ? tempRel : null;
-        this.#watchEnabled = config.watch ?? false;
         this.#ignored = config.ignored || null;
         this.#ignoreMatcher = this.#buildIgnoreMatcher(this.#ignored);
         this.#defaultAlgorithms = config.algorithms || ['sha256'];

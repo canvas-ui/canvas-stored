@@ -30,6 +30,15 @@ const MOVE_SOURCE = Symbol('move-source');
 
 const HEAD_BYTES = 4096;
 
+async function readHead(file) {
+    const handle = await fsp.open(file, 'r');
+    try {
+        const buffer = Buffer.alloc(HEAD_BYTES);
+        const { bytesRead } = await handle.read(buffer, 0, HEAD_BYTES, 0);
+        return buffer.subarray(0, bytesRead);
+    } finally { await handle.close(); }
+}
+
 // A filesystem move reaches the watcher as unlink(old) + add(new). Unlink
 // processing is held back this long so an add carrying the same inode can
 // claim it as a rename (in-place URL rewrite, no orphan churn). Expired
@@ -318,6 +327,10 @@ export default class Stored extends EventEmitter2 {
      * Store a blob. Accepts Buffer | string (content) | filesystem path |
      * Readable. Paths and streams are ingested without ever materializing the
      * whole blob in memory. `backends` is required (no implicit fan-out).
+     * `adopt: true` with a path hands the file over: a blob-store target moves
+     * it in rather than copying it, and the file is gone afterwards. With
+     * `checksums` (hex per configured algorithm, computed by the caller as the
+     * bytes arrived) the file is not read again to hash it.
      * Returns { ok:true, id, key, size, mimeType, checksums, locations, ... }
      * or { ok:false, reason:'no-targets'|'unknown-backend' }.
      */
@@ -333,7 +346,9 @@ export default class Stored extends EventEmitter2 {
         const ingestOptions = { mtime: options.mtime ?? null };
         const ingest = (isBuffer(blob) || (typeof blob === 'string' && !await isFileAsync(blob)))
             ? await this.#ingestMemory(blob, targets, key, options.mimeType, ingestOptions)
-            : await this.#ingestStream(blob, targets, key, options.mimeType, ingestOptions);
+            : (options.adopt && typeof blob === 'string')
+                ? await this.#ingestAdopted(blob, targets, key, options.mimeType, { ...ingestOptions, checksums: options.checksums })
+                : await this.#ingestStream(blob, targets, key, options.mimeType, ingestOptions);
 
         // Caller-supplied metadata + inline-extracted (EXIF/GPS/dimensions/media)
         // → persisted under `custom`, returned to caller + on the 'put' event.
@@ -2139,6 +2154,54 @@ export default class Stored extends EventEmitter2 {
             locations.splice(targets.indexOf(target), 0, location);
         }
         return { id, finalKey, checksums, size, mimeType, locations, remoteTargets, extracted };
+    }
+
+    // A file handed over by the caller: moved into the blob store when a
+    // target can adopt it (one rename, no copy); otherwise ingested as a
+    // stream and removed. Hashing reads the file only without caller checksums.
+    async #ingestAdopted(file, targets, key, mimeHint, options) {
+        const target = targets.find(t => typeof t.backend.adoptFile === 'function');
+        if (!target) {
+            try { return await this.#ingestStream(file, targets, key, mimeHint, options); }
+            finally { await fsp.rm(file, { force: true }); }
+        }
+        const known = options.checksums && this.#config.checksums.every(algo => /^[0-9a-f]+$/.test(options.checksums[algo] || ''));
+        const { checksums, size, head } = known
+            ? { checksums: Object.fromEntries(this.#config.checksums.map(algo => [algo, options.checksums[algo]])), size: (await fsp.stat(file)).size, head: await readHead(file) }
+            : await this.#hashFile(file);
+        const id = formatId(checksums, this.#config.primaryChecksum);
+        const finalKey = key || this.#generateKey(checksums);
+        const mimeType = mimeHint || await detectMimeFromHead(head, finalKey);
+        let extracted;
+        const adopted = await target.backend.adoptFile(file, { sha256: checksums.sha256, size }, async content => {
+            extracted = await this.#maybeExtract({ file: content.file }, mimeType, finalKey);
+            return finalKey;
+        });
+        const rest = targets.filter(t => t !== target);
+        const { locations, remoteTargets } = await this.#commit(rest, finalKey, id, { file: adopted.file, cached: false }, { checksums, size, mimeType }, options);
+        const stat = await target.backend.stat(finalKey);
+        locations.splice(targets.indexOf(target), 0, this.#buildLocation(target.name, finalKey, true, { size, mtime: stat.modified }));
+        return { id, finalKey, checksums, size, mimeType, locations, remoteTargets, extracted };
+    }
+
+    // One read pass over a file: checksums (all algorithms), size and head.
+    async #hashFile(file) {
+        const hashes = this.#config.checksums.map(algo => ({ algo, hash: crypto.createHash(algo) }));
+        let size = 0;
+        const headChunks = [];
+        let headLen = 0;
+        for await (const chunk of createReadStream(file)) {
+            for (const { hash } of hashes) hash.update(chunk);
+            size += chunk.length;
+            if (headLen < HEAD_BYTES) {
+                const slice = chunk.subarray(0, HEAD_BYTES - headLen);
+                headChunks.push(slice);
+                headLen += slice.length;
+            }
+        }
+        const checksums = {};
+        for (const { algo, hash } of hashes) checksums[algo] = hash.digest('hex');
+        return { checksums, size, head: Buffer.concat(headChunks) };
     }
 
     // Single streaming pass: hash (all algorithms), measure size, peek the head

@@ -780,7 +780,7 @@ export default class GdriveBackend extends StorageBackend {
         }
 
         for (const row of walk.files.values()) {
-            let checksums = null;
+            let checksums;
             const have = row.checksums || {};
             if (algorithms.every((a) => have[a])) {
                 checksums = Object.fromEntries(algorithms.map((a) => [a, have[a]]));
