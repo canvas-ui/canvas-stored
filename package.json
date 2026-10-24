@@ -15,7 +15,6 @@
     "dependencies": {
         "@aws-sdk/client-s3": "^3.1149.0",
         "cacache": "^20.0.4",
-        "canvas-synapsd": "github:canvas-ui/canvas-synapsd#main",
         "chokidar": "^5.0.0",
         "debug": "^4.4.3",
         "eventemitter2": "^6.4.9",
@@ -24,6 +23,7 @@
         "fs-extra": "^11.3.4",
         "image-size": "^2.0.2",
         "imap": "^0.8.19",
+        "lmdb": "3.5.7",
         "music-metadata": "^11.9.0",
         "picomatch": "^2.3.1"
     },

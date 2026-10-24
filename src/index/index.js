@@ -1,4 +1,4 @@
-import { openKeyValueStore } from 'canvas-synapsd/src/storage.js';
+import { openKeyValueStore } from '../storage/lmdb.js';
 import Debug from 'debug';
 
 const debug = Debug('stored:index');

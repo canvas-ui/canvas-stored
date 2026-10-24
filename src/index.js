@@ -13,7 +13,7 @@ import Cache from './cache/index.js';
 import BackendManager from './backends/BackendManager.js';
 export { getBackendCapabilities } from './backends/BackendManager.js';
 import Index from './index/index.js';
-import { verifyDatabase } from 'canvas-synapsd/src/storage.js';
+import { verifyDatabase } from './storage/lmdb.js';
 import SyncQueue from './sync/SyncQueue.js';
 import JobQueue from './sync/JobQueue.js';
 import Ledger from './sync/Ledger.js';
