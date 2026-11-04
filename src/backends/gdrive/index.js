@@ -147,8 +147,13 @@ export default class GdriveBackend extends StorageBackend {
         }
         const json = await res.json().catch(() => null);
         if (!res.ok || !json?.access_token) {
-            const detail = json?.error_description || json?.error || `HTTP ${res.status}`;
-            throw new DriveError(`gdrive token refresh failed: ${detail}`, { code: 'unauthorized', status: res.status });
+            const detail = [json?.error, json?.error_description].filter(Boolean).join(': ') || `HTTP ${res.status}`;
+            const hint = json?.error === 'invalid_grant'
+                ? ' Reconnect this Google account and save the new refresh token.'
+                : json?.error === 'invalid_client'
+                    ? ' Check the OAuth client id and client secret.'
+                    : '';
+            throw new DriveError(`gdrive token refresh failed: ${detail}${hint}`, { code: 'unauthorized', status: res.status });
         }
         this.#accessToken = json.access_token;
         this.#tokenExpiresAt = Date.now() + (Number(json.expires_in) || 3600) * 1000;

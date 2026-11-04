@@ -35,6 +35,17 @@ describe('GdriveBackend', () => {
         assert.strictEqual(res.reason, 'root-missing');
     });
 
+    test('refresh errors retain the OAuth code and explain how to recover', async () => {
+        for (const [error, hint] of [['invalid_grant', /Reconnect/], ['invalid_client', /client id and client secret/]]) {
+            const failed = new GdriveBackend('x', { ...CREDS, fetch: async () =>
+                Response.json({ error, error_description: 'Bad Request' }, { status: 400 }) });
+            const result = await failed.verifyRoot();
+            assert.strictEqual(result.ok, false);
+            assert.match(result.error, new RegExp(error + ': Bad Request'));
+            assert.match(result.error, hint);
+        }
+    });
+
     test('scan() keys files by name path, takes checksums from the API, skips native docs', async () => {
         const docs = drive.addFolder('Docs');
         const sub = drive.addFolder('2026', docs.id);
