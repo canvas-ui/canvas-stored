@@ -13,7 +13,7 @@ import Cache from './cache/index.js';
 import BackendManager from './backends/BackendManager.js';
 export { getBackendCapabilities } from './backends/BackendManager.js';
 import Index from './index/index.js';
-import { verifyDatabase } from './storage/lmdb.js';
+import { prepareIndex } from './storage/recover-index.js';
 import SyncQueue from './sync/SyncQueue.js';
 import JobQueue from './sync/JobQueue.js';
 import Ledger from './sync/Ledger.js';
@@ -60,7 +60,11 @@ export default class Stored extends EventEmitter2 {
     static async open(config = {}) {
         const databasePath = resolveStoredPaths(config).index;
         config.onStartupStage?.({ stage: 'stored.index.verify', databasePath });
-        await verifyDatabase(databasePath);
+        const recovery = await prepareIndex(databasePath);
+        if (recovery) {
+            config.onStartupStage?.({ stage: 'stored.index.quarantined', ...recovery });
+            console.warn(`Stored index verification failed; preserved at ${recovery.preservedIndexPath}. Opening an empty index; rescan backends to rebuild. Operational records remain in quarantine. Reason: ${recovery.reason}`);
+        }
         config.onStartupStage?.({ stage: 'stored.index.open', databasePath });
         return new this(config);
     }

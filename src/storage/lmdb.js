@@ -26,11 +26,12 @@ export async function verifyDatabase(directory) {
         let stat;
         try { stat = await fs.stat(file); }
         catch (error) { if (error.code === 'ENOENT') return null; throw error; }
-        if (!stat.isFile() || stat.size === 0) throw new Error('Expected a non-empty data.mdb');
+        if (!stat.isFile()) throw new Error('Expected data.mdb to be a regular file');
+        if (stat.size === 0) throw Object.assign(new Error('Empty data.mdb'), { canQuarantine: true });
         return await runVerifyWorker(databasePath);
     } catch (cause) {
         throw Object.assign(new Error(`Database verification failed for ${file}: ${cause.message}. No repair or replacement was attempted.`, { cause }),
-            { code: 'DATABASE_INTEGRITY_FAILED', databasePath: file, statusCode: 500 });
+            { code: 'DATABASE_INTEGRITY_FAILED', databasePath: file, canQuarantine: cause.canQuarantine === true, statusCode: 500 });
     }
 }
 
@@ -43,11 +44,18 @@ function runVerifyWorker(databasePath) {
         let errors = '';
         child.stdout.on('data', data => { output += data; });
         child.stderr.on('data', data => { errors = (errors + data).slice(-4096); });
-        const timeout = setTimeout(() => child.kill('SIGKILL'), VERIFY_TIMEOUT_MS);
+        let timedOut = false;
+        const timeout = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, VERIFY_TIMEOUT_MS);
         child.on('error', error => { clearTimeout(timeout); reject(error); });
         child.on('close', (code, signal) => {
             clearTimeout(timeout);
-            if (code !== 0) { reject(new Error(`verify worker ${signal || `exit ${code}`}: ${errors.trim()}`)); return; }
+            if (timedOut) { reject(new Error('Database verification timed out')); return; }
+            if (code !== 0) {
+                const canQuarantine = ['SIGABRT', 'SIGBUS', 'SIGSEGV'].includes(signal)
+                    || /MDB_(CORRUPTED|PAGE_NOTFOUND|INVALID)\b|Unreadable entry in |Incomplete dataset: /.test(errors);
+                reject(Object.assign(new Error(`verify worker ${signal || `exit ${code}`}: ${errors.trim()}`), { canQuarantine }));
+                return;
+            }
             try { resolve(JSON.parse(output)); } catch { reject(new Error('Invalid verify worker response')); }
         });
     });

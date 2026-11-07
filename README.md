@@ -80,19 +80,38 @@ get(id)    → cacache → synced backend location → cache on read (buffers on
 
 Paths and streams are ingested without buffering the whole blob in memory (safe for 10GB+ files). Local-only puts never touch the cache; the cache + sync queue are used only when a remote backend is targeted.
 
+## Index recovery
+
+`Stored.open()` verifies an existing LMDB index before opening it. An unreadable
+index or a native verifier crash quarantines the complete environment in a unique
+sibling directory, `<index>.quarantine-<timestamp>-<suffix>/index`. The sibling
+also contains `recovery.json` recording the original path, time and failure.
+Startup logs the quarantine location and creates a fresh index. No quarantined
+files are deleted automatically. Backend files and the separate cache stay in place.
+
+Rescan each backend to rebuild byte metadata and location mappings. Verification
+timeouts, permission errors and verifier-launch failures do not trigger quarantine.
+If preserving the original environment fails, startup fails instead of replacing it.
+
+The environment also holds operational sub-databases (pending moves, replica
+ownership, sync state and trash records). These remain in quarantine; scanning
+reconstructs the byte inventory, not pending operations or their history. Retain
+the quarantined directory for recovery. Do not merge or replay its operations
+against the fresh index automatically.
+
 ## Quick start
 
 ### Simple example
 ```js
 import Stored from './src/index.js';
 
-const stored = new Stored({ root: './.stored' });
+const stored = await Stored.open({ root: './.stored' });
 stored.addBackend('fs:data', { driver: 'file', root: stored.dataPath });
 ```
 
 ### Backend configuration
 ```js
-const stored = new Stored({
+const stored = await Stored.open({
   root: './.stored',                    // → ./.stored/{index,cache,data}
   checksums: ['sha256'],                // sha256 is the default and the id/cache algorithm
   primaryChecksum: 'sha256',
@@ -273,7 +292,7 @@ serialize writes to either subtree (WorkspaceStoredIndex does this).
 ```js
 import Stored, { Mirror } from 'canvas-stored';
 
-const stored = new Stored({ root: '~/Workspaces/notes/.workspace/db/stored' });
+const stored = await Stored.open({ root: '~/Workspaces/notes/.workspace/db/stored' });
 stored.addBackend('local',     { driver: 'file', root: '~/Workspaces/notes', watch: true, ignored: ['.workspace/**'] });
 stored.addBackend('trash',     { driver: 'file', root: '~/Workspaces/notes/.workspace/trash' });
 stored.addBackend('conflicts', { driver: 'file', root: '~/Workspaces/notes/.workspace/conflicts' });
