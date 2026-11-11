@@ -1011,7 +1011,8 @@ export default class Stored extends EventEmitter2 {
         const backend = this.#backends.get(backendName);
         if (!backend) return { ok: false, reason: 'unknown-backend' };
         if (!backend.canWrite) return { ok: false, reason: 'read-only-target' };
-        if (!backend.root || typeof backend.resolveKeyPath !== 'function') return { ok: false, reason: 'unsupported-backend' };
+        const remote = typeof backend.renameDirectory === 'function';
+        if (!remote && (!backend.root || typeof backend.resolveKeyPath !== 'function')) return { ok: false, reason: 'unsupported-backend' };
         const fromKey = this.#normalizeKey(from, { nfc: true });
         const toKey = this.#normalizeKey(to, { nfc: true });
         if (!fromKey || !toKey || !this.#isSafeKey(fromKey) || !this.#isSafeKey(toKey)
@@ -1023,6 +1024,7 @@ export default class Stored extends EventEmitter2 {
         const receiptKey = `${backendName}:${operationId}`;
         this.#replicas.assertIdleEndpoint(backendName, fromKey, { directory: true });
         this.#replicas.assertIdleEndpoint(backendName, toKey, { directory: true });
+        if (remote) return this.#renameRemoteDirectory(backend, fromKey, toKey, { operationId, origin });
         const prior = this.#directoryMoveTasks.get(backendName) || Promise.resolve();
         const task = prior.catch(() => {}).then(async () => {
             const db = this.#directoryMovesDb ||= this.#index.openDB('directory-moves');
@@ -1093,6 +1095,39 @@ export default class Stored extends EventEmitter2 {
         this.#directoryMoveTasks.set(backendName, task);
         try { return await task; }
         finally { if (this.#directoryMoveTasks.get(backendName) === task) this.#directoryMoveTasks.delete(backendName); }
+    }
+
+    // A backend that renames a directory itself (the canvas driver: one hub
+    // request). The index follows with one re-key of the locations under it.
+    async #renameRemoteDirectory(backend, fromKey, toKey, { operationId, origin }) {
+        const name = backend.name;
+        const prefix = `${fromKey}/`;
+        const rows = this.#index.locationsByBackend(name, { prefix, limit: Number.MAX_SAFE_INTEGER }).objects;
+        const movedKey = (key) => `${toKey}/${key.slice(prefix.length)}`;
+        const release = this.#holdKeys(rows.flatMap(row => [`${name}:${row.key}`, `${name}:${movedKey(row.key)}`]));
+        try {
+            const moved = await backend.renameDirectory(fromKey, toKey, { operationId, origin });
+            const events = [];
+            this.#index.transaction(() => {
+                for (const { key } of rows) {
+                    const current = this.#index.get(`${name}:${key}`);
+                    const old = current?.locations?.find(l => l.backend === name && l.key === key);
+                    if (!old) continue;
+                    const nextKey = movedKey(key);
+                    const location = this.#buildLocation(name, nextKey, old.synced, { ...old, key: nextKey });
+                    const saved = this.#index.put(current.id, {
+                        ...current,
+                        locations: current.locations.map(l => l === old ? location : l),
+                    }, { origin, rename: { backend: name, from: key, to: nextKey } });
+                    events.push({ id: current.id, checksums: saved.checksums,
+                        from: this.#endpoint(old), to: this.#endpoint(location),
+                        location: this.#describeLocation(location),
+                        locations: saved.locations.map(l => this.#describeLocation(l)), origin });
+                }
+            });
+            for (const event of events) this.#emitObject('move', event);
+            return { ok: true, directory: true, from: fromKey, to: toKey, state: 'complete', seq: moved.seq ?? null, count: events.length };
+        } finally { release(); }
     }
 
     // `If-Match` / `If-None-Match` semantics over the index. Returns the typed
@@ -2562,8 +2597,13 @@ export default class Stored extends EventEmitter2 {
             // deletion, and consumers never see the transient absence.
             const meta = this.#index.get(pathKey);
             const loc = meta?.locations?.find(l => l.backend === data.backend && l.key === data.key);
-            if (loc?.ino != null) {
-                const pendingKey = `${data.backend}|${loc.dev}:${loc.ino}`;
+            // A driver that names the inode in the event (the canvas driver:
+            // the content digest) is believed over the indexed location, which
+            // a put() created without one.
+            const ino = data.ino ?? loc?.ino ?? null;
+            const dev = data.ino != null ? data.dev : loc?.dev;
+            if (loc && ino != null) {
+                const pendingKey = `${data.backend}|${dev}:${ino}`;
                 // A second unlink for the same inode (hardlink twin) processes
                 // the held one immediately — one hold per inode.
                 const prior = this.#pendingUnlinks.get(pendingKey);
@@ -2592,6 +2632,7 @@ export default class Stored extends EventEmitter2 {
     #recheckUnlink(data) {
         const pathKey = `${data.backend}:${data.key}`;
         const timer = setTimeout(async () => {
+            if (this.#closing) return;
             if (this.#suppressedKeys.has(pathKey)) { this.#recheckUnlink(data); return; }
             const meta = this.#index.get(pathKey);
             if (!meta) return;

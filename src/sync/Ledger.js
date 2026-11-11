@@ -71,6 +71,24 @@ export default class Ledger {
         });
     }
 
+    /**
+     * Re-key every base under `from/` to `to/` in one transaction (a folder
+     * rename). `patch(toKey)` may add fields. Returns the new keys.
+     */
+    moveBases(from, to, patch = () => ({})) {
+        const rows = [...this.bases(`${from}/`)];
+        return this.#db.transactionSync(() => {
+            const moved = [];
+            for (const [key, base] of rows) {
+                const next = `${to}/${key.slice(from.length + 1)}`;
+                this.#db.removeSync(this.#k('base', key));
+                this.#db.putSync(this.#k('base', next), { ...base, ...patch(next), at: Date.now() });
+                moved.push(next);
+            }
+            return moved;
+        });
+    }
+
     /** All bases in key order: yields `[key, base]`. */
     *bases(prefix = '') {
         const start = this.#k('base', prefix);

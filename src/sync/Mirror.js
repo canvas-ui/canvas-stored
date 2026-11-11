@@ -1,4 +1,6 @@
 import { EventEmitter } from 'events';
+import { randomUUID } from 'crypto';
+import fs from 'fs';
 import Debug from 'debug';
 import JobQueue from './JobQueue.js';
 import Ledger from './Ledger.js';
@@ -13,9 +15,22 @@ const DEFAULTS = {
     conflictMode: 'rename',
     direction: 'bi',
     debounceMs: 1500,
+    // A folder move reaches the mirror as one rename per file. They are
+    // collected until none arrived for this long, so a whole folder goes to
+    // the hub as one directory rename.
+    moveSettleMs: 1500,
+    // An inferred local deletion waits this long before it is sent: the
+    // other half of a move (the file appearing under its new name) can
+    // arrive later than the removal.
+    deleteDelayMs: 5000,
     fullReconcileEvery: 6 * 60 * 60_000,
     concurrency: 4,
     offlineBackoffMs: [5_000, 10_000, 20_000, 40_000, 60_000],
+    // Local deletions are inferred from files being absent. When at least
+    // `min` of them AND `ratio` of the tracked files go missing within
+    // `windowMs`, they are held for `approveDeletes()` / `restoreDeletes()`
+    // instead of being sent to the hub. `false` turns the hold off.
+    deleteGuard: { min: 20, ratio: 0.25, windowMs: 60_000 },
 };
 
 /**
@@ -52,7 +67,7 @@ export function decide(L, B, R) {
  * Every `object:*` event on either backend marks its key dirty; a debounced
  * pass runs the three-way table (`decide`) per dirty key and turns the
  * outcome into durable jobs (`JobQueue`): push, pull, delete-remote,
- * trash-local, rename-remote, rename-local, conflict. A worker (concurrency
+ * trash-local, rename-remote, rename-remote-dir, rename-local, conflict. A worker (concurrency
  * 2, one job per key) executes them through Stored's own copy/move/rename
  * primitives so locations, succession and echo suppression behave exactly
  * as for any other transfer. Base is written only after the byte operation
@@ -74,8 +89,14 @@ export function decide(L, B, R) {
  * lists them all. That is what "this replica holds the current version" is
  * computed from on the hub.
  *
+ * A burst of local deletions (see `deleteGuard`) is not sent upstream: an
+ * unmounted or emptied folder looks exactly like the user deleting
+ * everything. The keys wait in `heldDeletes` until `approveDeletes()` sends
+ * them or `restoreDeletes()` pulls the hub copies back; files that reappear
+ * leave the hold on their own.
+ *
  * Events: `status` (snapshot), `job:start|done|failed` (job), `conflict`,
- * `revert`, `skip`, `offline`, `online`, `error`.
+ * `revert`, `skip`, `hold`, `offline`, `online`, `error`.
  */
 export default class Mirror extends EventEmitter {
     #stored;
@@ -103,6 +124,13 @@ export default class Mirror extends EventEmitter {
     #unbind = [];
     #ignorePatterns;
     #reconcilePass = null;
+    #held = new Map();         // key → ifMatch: local deletions waiting for approval
+    #passDeletes = [];         // deletions decided since the last settle
+    #recentDeletes = [];       // when deletions were last let through (sliding window)
+    #moves = new Map();        // to → from: local renames waiting to be grouped
+    #moveSources = new Set();  // the `from` side of #moves
+    #movedAt = 0;              // when the watcher last reported a local rename
+    #movingDirs = [];          // [from, to] of folder renames the hub has not confirmed
 
     constructor(stored, options = {}) {
         super();
@@ -116,6 +144,7 @@ export default class Mirror extends EventEmitter {
         if (!['prompt', 'rename'].includes(opts.conflictMode)) opts.conflictMode = DEFAULTS.conflictMode;
         if (!['propagate', 'keep'].includes(opts.deletes)) opts.deletes = 'propagate';
         if (!['bi', 'pull', 'push'].includes(opts.direction)) opts.direction = 'bi';
+        opts.deleteGuard = opts.deleteGuard ? { ...DEFAULTS.deleteGuard, ...opts.deleteGuard } : null;
         this.#stored = stored;
         this.#opts = opts;
         this.#ignorePatterns = [...MIRROR_IGNORE_DEFAULTS, ...(opts.ignore || [])];
@@ -186,6 +215,7 @@ export default class Mirror extends EventEmitter {
         this.#stopping = false;
         this.#setState('starting');
         this.#bind();
+        this.#movingDirs = [...this.#queue.all(this.#opts.id)].filter((j) => j.kind === 'rename-remote-dir').map((j) => [j.payload.from, j.payload.to]);
         try {
             await this.#stored.scan(this.#opts.local);
             await this.#catchUp();
@@ -287,7 +317,74 @@ export default class Mirror extends EventEmitter {
             skipped: skips.length,
             skips: Object.fromEntries(skips.map(([k, v]) => [k, v.reason])),
             dirty: this.#dirty.size,
+            heldDeletes: this.#held.size,
         };
+    }
+
+    /** Keys whose local deletion is waiting for approval. */
+    heldDeletes() { return [...this.#held.keys()].sort(); }
+
+    /** The held deletions were meant: send them to the hub. */
+    approveDeletes() {
+        const held = [...this.#held];
+        this.#held.clear();
+        let sent = 0;
+        for (const [key] of held) {
+            const { L, B, R } = this.#local3(key);
+            const d = this.#direct(decide(L, B, R), { L, B, R });
+            if (d.action !== 'delete-remote') { this.#markDirty(key); continue; }
+            this.#enqueue('delete-remote', key, { ifMatch: d.ifMatch });
+            sent += 1;
+        }
+        this.#lastError = null;
+        this.emit('status', this.status());
+        this.#kick();
+        return sent;
+    }
+
+    /** The held deletions were not meant: forget the base so the hub copies are pulled back. */
+    restoreDeletes() {
+        const held = [...this.#held.keys()];
+        this.#held.clear();
+        for (const key of held) { this.#ledger.removeBase(key); this.#markDirty(key); }
+        this.#lastError = null;
+        this.emit('status', this.status());
+        return held.length;
+    }
+
+    // Let the deletions decided since the last call through, or hold them.
+    #settleDeletes() {
+        const guard = this.#opts.deleteGuard;
+        const candidates = this.#passDeletes.splice(0);
+        if (!candidates.length) return;
+        const now = Date.now();
+        this.#recentDeletes = this.#recentDeletes.filter((t) => now - t < guard.windowMs);
+        let hold = this.#held.size > 0;
+        if (!hold) {
+            const count = candidates.length + this.#recentDeletes.length;
+            if (count >= guard.min) {
+                let tracked = 0;
+                for (const _ of this.#ledger.bases()) tracked += 1;
+                hold = count >= guard.ratio * tracked;
+            }
+        }
+        if (!hold) {
+            for (const [key, ifMatch] of candidates) { this.#enqueue('delete-remote', key, { ifMatch }, null, now + this.#opts.deleteDelayMs); this.#recentDeletes.push(now); }
+            return;
+        }
+        const first = this.#held.size === 0;
+        for (const [key, ifMatch] of candidates) this.#held.set(key, ifMatch);
+        // Deletions of the same burst that were let through but have not run yet join the hold.
+        for (const job of [...this.#queue.pending(Infinity, this.#opts.id)]) {
+            if (job.kind !== 'delete-remote' || this.#runningKeys.has(job.key)) continue;
+            this.#queue.cancel(job.seq);
+            this.#held.set(job.key, job.payload?.ifMatch ?? null);
+        }
+        this.#recentDeletes = [];
+        this.#lastError = `${this.#held.size} files are missing locally; their deletion is held until approved or restored`;
+        debug(this.#lastError);
+        if (first) this.emit('hold', { count: this.#held.size });
+        this.emit('status', this.status());
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -303,7 +400,7 @@ export default class Mirror extends EventEmitter {
         };
         on('object:add', (e) => {
             if (e.backend === local) {
-                if (e.renamedFrom) this.#localRenamed(normalizeKey(e.renamedFrom), normalizeKey(e.key));
+                if (e.renamedFrom) { this.#movedAt = Date.now(); this.#localRenamed(normalizeKey(e.renamedFrom), normalizeKey(e.key)); }
                 else this.#markDirty(e.key);
             } else if (e.backend === remote) {
                 if (e.renamedFrom) this.#remoteRenamed(normalizeKey(e.renamedFrom), normalizeKey(e.key));
@@ -338,11 +435,15 @@ export default class Mirror extends EventEmitter {
         const key = normalizeKey(rawKey);
         if (!key) return;
         this.#dirty.add(key);
-        if (this.#debounceTimer) return;
+        this.#schedule();
+    }
+
+    #schedule(ms = this.#opts.debounceMs) {
+        if (this.#debounceTimer || this.#stopping) return;
         this.#debounceTimer = setTimeout(() => {
             this.#debounceTimer = null;
             this.#reconcileDirty().then(() => this.#kick()).catch((err) => this.#report(err));
-        }, this.#opts.debounceMs);
+        }, ms);
         this.#debounceTimer.unref?.();
     }
 
@@ -403,24 +504,81 @@ export default class Mirror extends EventEmitter {
             const wasState = this.#state;
             if (wasState === 'online') this.#setState('syncing');
             try {
-                while (this.#dirty.size) {
+                while (this.#dirty.size || this.#movesDue()) {
                     const batch = [...this.#dirty].sort();
                     this.#dirty.clear();
+                    const moved = this.#pairMoves(batch);
+                    if (this.#movesDue()) this.#planMoves();
                     for (const key of batch) {
+                        if (moved.has(key) || this.#isMoving(key)) continue;
                         try { this.#reconcileKey(key); }
                         catch (err) { this.#report(err); }
                     }
+                    this.#settleDeletes();
                 }
                 // The whole batch reconciled (decisions durable in the queue):
                 // the feed position may move.
                 if (this.#pendingCursor != null && this.#pendingCursor !== this.#ledger.cursor) {
                     this.#ledger.cursor = this.#pendingCursor;
                 }
+                if (this.#moves.size) this.#schedule(Math.max(50, this.#movedAt + this.#opts.moveSettleMs - Date.now()));
             } finally {
                 if (this.#state === 'syncing' || this.#state === 'scanning') this.#setState(this.#stopping ? 'stopping' : 'online');
             }
         })().finally(() => { this.#reconcilePass = null; });
         await this.#reconcilePass;
+    }
+
+    // A folder scan after downtime, or a hub listing, shows a move as one key
+    // that went missing and another that appeared. Pair the two by content
+    // and treat them as the rename they are: the hub keeps its document and
+    // history, no bytes travel, and nothing counts as a deletion. Returns
+    // the keys that were settled this way.
+    #pairMoves(batch) {
+        const settled = new Set();
+        const gone = { local: new Map(), remote: new Map() };
+        const fresh = { local: [], remote: [] };
+        for (const key of batch) {
+            if (!key || !this.#inScope(key) || validateKey(key) || this.#isMoving(key)) continue;
+            const { L, B, R } = this.#local3(key);
+            const left = (side) => {
+                if (!gone[side].has(B)) gone[side].set(B, []);
+                gone[side].get(B).push(key);
+            };
+            if (B && !L && R === B) left('local');
+            else if (B && !R && L) left('remote');
+            else if (!B && L && !R) fresh.local.push([key, L]);
+            else if (!B && R && !L) fresh.remote.push([key, R]);
+        }
+        // A removal that was noticed in an earlier pass (held, or queued and
+        // not sent yet) can still be the first half of a move.
+        if (fresh.local.length) {
+            const earlier = new Set(this.#held.keys());
+            for (const job of this.#queue.all(this.#opts.id)) if (job.state === 'pending' && job.kind === 'delete-remote') earlier.add(job.key);
+            const seen = new Set(batch);
+            for (const key of earlier) {
+                if (seen.has(key) || this.#isMoving(key)) continue;
+                const { L, B, R } = this.#local3(key);
+                if (!B || L || R !== B) continue;
+                if (!gone.local.has(B)) gone.local.set(B, []);
+                gone.local.get(B).push(key);
+            }
+        }
+        const pair = (side, apply) => {
+            for (const [to, sha] of fresh[side]) {
+                const sources = gone[side].get(sha);
+                if (!sources?.length) continue;
+                const leaf = to.slice(to.lastIndexOf('/') + 1);
+                const at = Math.max(0, sources.findIndex((k) => k.slice(k.lastIndexOf('/') + 1) === leaf));
+                const [from] = sources.splice(at, 1);
+                debug(`${from} → ${to}: moved on the ${side === 'local' ? 'device' : 'hub'} while the mirror was not watching`);
+                apply(from, to);
+                settled.add(from); settled.add(to);
+            }
+        };
+        if (this.#opts.direction !== 'pull') pair('local', (from, to) => this.#localRenamed(from, to));
+        if (this.#opts.direction !== 'push') pair('remote', (from, to) => this.#remoteRenamed(from, to));
+        return settled;
     }
 
     #local3(key) {
@@ -464,6 +622,10 @@ export default class Mirror extends EventEmitter {
         const { L, B, R, Lloc, Rloc, base } = this.#local3(key);
         const d = this.#direct(decide(L, B, R), { L, B, R });
         debug(`reconcile ${key}: L=${L?.slice(0, 8) ?? '∅'} B=${B?.slice(0, 8) ?? '∅'} R=${R?.slice(0, 8) ?? '∅'} → ${d.action}${d.reason ? ` (${d.reason})` : ''}`);
+        if (d.action !== 'delete-remote' && this.#held.delete(key) && !this.#held.size) {
+            this.#lastError = null;
+            this.emit('status', this.status());
+        }
         if (d.action === 'skip') { this.#queue.cancelByKey(key, this.#opts.id); this.#skip(key, d.reason); return d; }
         if (this.#ledger.isSkipped(key)) this.#ledger.unskip(key);
         switch (d.action) {
@@ -477,8 +639,9 @@ export default class Mirror extends EventEmitter {
                 this.#enqueue('push', key, { sha256: L, ifMatch: d.ifMatch ?? null });
                 return d;
             case 'delete-remote':
-                if (this.#opts.deletes === 'propagate') this.#enqueue('delete-remote', key, { ifMatch: d.ifMatch });
-                else this.#ledger.removeBase(key);
+                if (this.#opts.deletes !== 'propagate') this.#ledger.removeBase(key);
+                else if (!this.#opts.deleteGuard) this.#enqueue('delete-remote', key, { ifMatch: d.ifMatch }, null, Date.now() + this.#opts.deleteDelayMs);
+                else if (!this.#held.has(key)) this.#passDeletes.push([key, d.ifMatch]);
                 return d;
             case 'pull':
                 this.#enqueue('pull', key, { sha256: R, mtime: Rloc?.mtime ?? null, size: Rloc?.size ?? null });
@@ -519,34 +682,130 @@ export default class Mirror extends EventEmitter {
         }
     }
 
-    #enqueue(kind, key, payload = {}, dedupe = null) {
+    #enqueue(kind, key, payload = {}, dedupe = null, notBefore = 0) {
         // A newer decision for the key supersedes the older pending ones.
         for (const job of this.#queue.byKey(key, this.#opts.id)) {
             if (job.state === 'pending' && job.kind !== kind && job.kind !== 'rename-remote' && job.kind !== 'rename-local') this.#queue.cancel(job.seq);
         }
-        return this.#queue.append({ kind, mirror: this.#opts.id, key, payload, dedupe });
+        return this.#queue.append({ kind, mirror: this.#opts.id, key, payload, dedupe, notBefore });
     }
 
-    // Local `mv`: the base follows the key; the hub gets a rename when it knew
-    // the source. A file never pushed is simply pushed under its new name.
+    // Local `mv`: collected first, so the renames of one folder move can be
+    // sent as one directory rename (#planMoves).
     #localRenamed(from, to) {
-        const base = this.#ledger.getBase(from);
-        if (this.#opts.direction === 'pull' || !base || this.#ledger.getBase(to) || !this.#inScope(from) || !this.#inScope(to)) {
-            this.#markDirty(from);
-            this.#markDirty(to);
-            return;
+        const origin = this.#moves.get(from) ?? from;
+        this.#moves.delete(from);
+        this.#moves.set(to, origin);
+        this.#moveSources.add(origin);
+        this.#markDirty(to);
+    }
+
+    #movesDue() {
+        return this.#moves.size > 0 && Date.now() - this.#movedAt >= this.#opts.moveSettleMs;
+    }
+
+    // A key whose rename is still being grouped or is part of a folder rename
+    // the hub has not confirmed: deciding it on its own would upload or
+    // delete what is only being moved.
+    #isMoving(key) {
+        if (this.#moves.has(key) || this.#moveSources.has(key)) return true;
+        return this.#movingDirs.some(([from, to]) => key.startsWith(`${from}/`) || key.startsWith(`${to}/`));
+    }
+
+    // Turn the collected local renames into jobs. Renames that share a
+    // folder pair (`A/x/y` → `B/x/y`) become one directory rename when the
+    // whole folder went: A is gone from the device, B is there and the hub
+    // has nothing under B. Otherwise the
+    // same test is made one level down, and what remains is renamed per file.
+    #planMoves() {
+        const pairs = [];
+        for (const [to, from] of this.#moves) {
+            if (this.#opts.direction === 'pull' || !this.#ledger.getBase(from) || this.#ledger.getBase(to) || !this.#inScope(from) || !this.#inScope(to)) {
+                this.#dirty.add(from); this.#dirty.add(to);
+                continue;
+            }
+            pairs.push({ from, to });
         }
+        this.#moves.clear();
+        this.#moveSources.clear();
+        const files = [];
+        const groups = new Map();
+        for (const pair of pairs) {
+            const f = pair.from.split('/');
+            const t = pair.to.split('/');
+            let n = 0;
+            while (n < f.length - 1 && n < t.length - 1 && f[f.length - 1 - n] === t[t.length - 1 - n]) n += 1;
+            if (!n) { files.push(pair); continue; }
+            const A = f.slice(0, f.length - n).join('/');
+            const B = t.slice(0, t.length - n).join('/');
+            const id = `${A}\n${B}`;
+            if (!groups.has(id)) groups.set(id, { A, B, group: [] });
+            groups.get(id).group.push({ ...pair, rest: f.slice(f.length - n) });
+        }
+        const descend = (A, B, group) => {
+            if (this.#wholeFolder(A, B, group.length)) { this.#renameFolder(A, B); return; }
+            const below = new Map();
+            for (const pair of group) {
+                if (pair.rest.length <= 1) { files.push(pair); continue; }
+                const [segment, ...rest] = pair.rest;
+                if (!below.has(segment)) below.set(segment, []);
+                below.get(segment).push({ ...pair, rest });
+            }
+            for (const [segment, sub] of below) descend(`${A}/${segment}`, `${B}/${segment}`, sub);
+        };
+        for (const { A, B, group } of groups.values()) descend(A, B, group);
+        for (const { from, to } of files) this.#renameFile(from, to);
+    }
+
+    #wholeFolder(A, B, count) {
+        if (!A || !B || A === B || B.startsWith(`${A}/`) || A.startsWith(`${B}/`)) return false;
+        if (typeof this.#remote.renameDirectory !== 'function') return false;
+        const empty = (backend, prefix) => this.#stored.listObjects(backend, { prefix, limit: 1 }).objects.length === 0;
+        if (!empty(this.#opts.remote, `${B}/`)) return false;
+        for (const _ of this.#ledger.bases(`${B}/`)) return false;
+        // The folder itself has the last word: once A is gone and B is there,
+        // the whole of it moved, whatever part of it the watcher reported so far.
+        const local = this.#local;
+        if (typeof local.resolveKeyPath === 'function') {
+            const directory = (key) => { try { return fs.statSync(local.resolveKeyPath(key)).isDirectory(); } catch { return false; } };
+            const present = (key) => { try { fs.lstatSync(local.resolveKeyPath(key)); return true; } catch { return false; } };
+            return !present(A) && directory(B);
+        }
+        if (!empty(this.#opts.local, `${A}/`)) return false;
+        let tracked = 0;
+        for (const _ of this.#ledger.bases(`${A}/`)) { tracked += 1; if (tracked > count) return false; }
+        return tracked === count;
+    }
+
+    // One job for the folder. The bases stay under `from` until the hub
+    // confirmed, so a crash before that replays the same job.
+    #renameFolder(from, to) {
+        const prefix = `${from}/`;
+        for (const job of [...this.#queue.all(this.#opts.id)]) {
+            if (job.state === 'pending' && ['push', 'delete-remote'].includes(job.kind) && job.key?.startsWith(prefix)) this.#queue.cancel(job.seq);
+        }
+        for (const key of [...this.#held.keys()]) if (key.startsWith(prefix)) this.#held.delete(key);
+        this.#queue.append({ kind: 'rename-remote-dir', mirror: this.#opts.id, key: to, payload: { from, to, operationId: randomUUID() }, dedupe: `rename-remote-dir|${from}→${to}` });
+        this.#movingDirs.push([from, to]);
+        debug(`${from}/ → ${to}/: folder moved on the device`);
+    }
+
+    // The base follows the key; the hub gets a rename when it knew the
+    // source. A file never pushed is simply pushed under its new name.
+    #renameFile(from, to) {
         this.#ledger.moveBase(from, to);
-        for (const job of this.#queue.byKey(from, this.#opts.id)) if (job.state === 'pending' && job.kind === 'push') this.#queue.cancel(job.seq);
+        for (const job of this.#queue.byKey(from, this.#opts.id)) if (job.state === 'pending' && (job.kind === 'push' || job.kind === 'delete-remote')) this.#queue.cancel(job.seq);
+        this.#held.delete(from);
         this.#queue.append({ kind: 'rename-remote', mirror: this.#opts.id, key: to, payload: { from, to }, dedupe: `rename-remote|${from}→${to}` });
         this.#markDirty(to);
     }
 
-    // Hub-side rename: re-key locally when our copy is clean (a job, so it is
-    // durable and serialized with the rest); a dirty source stays put.
+    // Hub-side rename: move the local file too (a job, so it is durable and
+    // serialized with the rest). A local edit that was not pushed yet moves
+    // with the file and is then pushed against the version the hub renamed.
     #remoteRenamed(from, to) {
         const { L, B } = this.#local3(from);
-        if (this.#opts.direction !== 'push' && L && L === B && !this.#stored.index.get(`${this.#opts.local}:${to}`) && this.#inScope(from) && this.#inScope(to)) {
+        if (this.#opts.direction !== 'push' && L && B && !this.#stored.index.get(`${this.#opts.local}:${to}`) && this.#inScope(from) && this.#inScope(to)) {
             this.#queue.append({ kind: 'rename-local', mirror: this.#opts.id, key: to, payload: { from, to }, dedupe: `rename-local|${from}→${to}` });
             this.#kick();
             return;
@@ -635,6 +894,7 @@ export default class Mirror extends EventEmitter {
             case 'delete-remote': return this.#runDeleteRemote(job);
             case 'trash-local': return this.#runTrashLocal(job);
             case 'rename-remote': return this.#runRenameRemote(job);
+            case 'rename-remote-dir': return this.#runRenameRemoteDir(job);
             case 'rename-local': return this.#runRenameLocal(job);
             case 'conflict': return this.#runConflict(job);
             case 'revert': return this.#runRevert(job);
@@ -711,7 +971,7 @@ export default class Mirror extends EventEmitter {
             case 'nothing': return;
             case 'adopt': this.#reconcileKey(key); return;
             case 'push': this.#reconcileKey(key); return;
-            case 'delete-remote': this.#reconcileKey(key); return;
+            case 'delete-remote': this.#reconcileKey(key); this.#settleDeletes(); return;
             case 'pull': this.#enqueue('pull', key, { sha256: R }); return;
             case 'trash-local': this.#enqueue('trash-local', key, { sha256: L }); return;
             case 'conflict': this.#enqueue('conflict', key, { local: L, base: B, remote: R }); return;
@@ -757,6 +1017,12 @@ export default class Mirror extends EventEmitter {
         const { L, B } = this.#local3(key);
         if (!B) return;
         if (L) { this.#markDirty(key); return; }               // it came back
+        if (this.#isMoving(key)) { this.#markDirty(key); return; }
+        // The index says the file is gone; the folder has the last word. An
+        // unavailable root, or a file that is there after all, sends nothing.
+        const live = await this.#local.verifyRoot?.();
+        if (live && !live.ok) throw Object.assign(new Error(`local folder unavailable (${live.reason}); not deleting ${key} on the hub`), { code: 'LOCAL_UNAVAILABLE' });
+        if (await this.#local.stat(key)) { this.#markDirty(key); return; }
         let res;
         try {
             res = await this.#stored.removeObject(this.#opts.remote, key, { ifMatch: B, origin: this.deviceId || undefined });
@@ -829,10 +1095,52 @@ export default class Mirror extends EventEmitter {
         throw this.#failure(res, to);
     }
 
+    async #runRenameRemoteDir(job) {
+        const { from, to, operationId } = job.payload;
+        const settle = () => { this.#movingDirs = this.#movingDirs.filter(([a, b]) => a !== from || b !== to); };
+        const touch = (prefix) => {
+            for (const name of [this.#opts.local, this.#opts.remote]) {
+                for (const o of this.#stored.listObjects(name, { prefix, limit: Number.MAX_SAFE_INTEGER }).objects) this.#markDirty(o.key);
+            }
+            for (const [key] of this.#ledger.bases(prefix)) this.#markDirty(key);
+        };
+        let res;
+        try {
+            res = await this.#stored.renameDirectory(this.#opts.remote, from, to, { operationId, origin: this.deviceId || undefined });
+        } catch (err) {
+            if (this.#isOffline(err) || err.code === 'RETRYABLE' || err.code === 'UNAUTHORIZED') throw err;
+            res = { ok: false, reason: err.hubCode || err.code || 'refused', error: err.message };
+        }
+        if (res.ok) {
+            // The poll brings the hub's row versions for the moved files.
+            await this.#remote.poll().catch(() => {});
+            const seq = res.seq ?? this.#remote.head ?? 0;
+            const moved = this.#ledger.moveBases(from, to, (key) => ({ remoteSeq: seq, ...(this.#remote.describe?.(key) || {}) }));
+            for (const key of moved) {
+                const base = this.#ledger.getBase(key);
+                if (base?.docId && base?.version) this.#applied.set(base.docId, base.version);
+            }
+            settle();
+            debug(`renamed ${from}/ → ${to}/ on the hub (${moved.length} files, one request)`);
+            touch(`${from}/`); touch(`${to}/`);
+            return;
+        }
+        // The hub cannot take the folder as a whole (it changed there, the
+        // target exists, or the hub is older): rename file by file.
+        debug(`${from}/ → ${to}/: directory rename refused (${res.reason}); renaming per file`);
+        settle();
+        for (const [key] of [...this.#ledger.bases(`${from}/`)]) {
+            const target = `${to}/${key.slice(from.length + 1)}`;
+            if (!this.#stored.index.get(`${this.#opts.local}:${key}`) && this.#stored.index.get(`${this.#opts.local}:${target}`) && !this.#ledger.getBase(target)) this.#renameFile(key, target);
+            else this.#markDirty(key);
+        }
+        touch(`${from}/`); touch(`${to}/`);
+    }
+
     async #runRenameLocal(job) {
         const { from, to } = job.payload;
         const src = this.#local3(from);
-        if (!src.L || src.L !== src.B || this.#stored.index.get(`${this.#opts.local}:${to}`)) {
+        if (!src.L || !src.B || this.#stored.index.get(`${this.#opts.local}:${to}`)) {
             this.#markDirty(from); this.#markDirty(to); return;
         }
         const res = await this.#stored.move(`${this.#opts.local}:${from}`, {
@@ -846,6 +1154,7 @@ export default class Mirror extends EventEmitter {
             const moved = this.#ledger.moveBase(from, to, { remoteSeq: this.#remote.head ?? 0, ...(this.#remote.describe?.(to) || {}) });
             if (moved?.docId && moved?.version) this.#applied.set(moved.docId, moved.version);
             debug(`renamed ${from} → ${to} locally (hub rename)`);
+            if (src.L !== src.B) this.#markDirty(to);
             return;
         }
         if (['not-found', 'no-source', 'target-exists'].includes(res.reason)) { this.#markDirty(from); this.#markDirty(to); return; }

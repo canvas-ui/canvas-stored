@@ -377,7 +377,12 @@ export default class CanvasBackend extends StorageBackend {
         if (cursor) u.searchParams.set('cursor', cursor);
         u.searchParams.set('limit', String(limit));
         const { payload } = await this.#json(u.toString());
-        const objects = (payload?.objects || []).map((o) => this.#row(normalizeKey(o.key), o));
+        // Anything but a real listing (a proxy error page, a captive portal
+        // answering 200) must not read as "the hub is empty".
+        if (!Array.isArray(payload?.objects) || !Number.isFinite(Number(payload?.head))) {
+            throw Object.assign(new Error('hub listing response is not a listing'), { code: 'BAD_LISTING' });
+        }
+        const objects = payload.objects.map((o) => this.#row(normalizeKey(o.key), o));
         const head = num(payload?.head, this.#head) ?? 0;
         this.#head = Math.max(this.#head, head);
         return { objects, cursor: payload?.cursor || null, head };
@@ -559,6 +564,36 @@ export default class CanvasBackend extends StorageBackend {
         if (seq) this.#head = Math.max(this.#head, seq);
         debug(`RENAME ${fromKey} -> ${toKey} (seq ${seq})`);
         return { from: fromKey, to: toKey, sha256: lower(payload?.sha256) || row?.checksums?.sha256 || null, seq, docId, version, size: row?.size ?? null, modified: row?.modified ?? null };
+    }
+
+    /**
+     * `POST objects/rename` with `directory: true`: the hub moves the folder
+     * and everything under it in one operation. `operationId` makes a retry
+     * after a lost response return the first result.
+     */
+    async renameDirectory(from, to, { operationId, origin = null } = {}) {
+        const fromKey = normalizeKey(from);
+        const toKey = normalizeKey(to);
+        if (!fromKey || !toKey || !operationId) throw new CanvasHubError('canvas directory rename: from, to and operationId are required', { code: 'REFUSED' });
+        const body = { from: fromKey, to: toKey, directory: true, operationId };
+        if (origin || this.#deviceId) body.origin = origin || this.#deviceId;
+        const { payload } = await this.#json(`${this.#backendUrl()}/objects/rename`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        }, { key: fromKey });
+        if (payload?.directory !== true) throw new CanvasHubError('the hub did not acknowledge a directory rename', { code: 'REFUSED', hubCode: 'NOT_IMPLEMENTED', key: fromKey });
+        const prefix = `${fromKey}/`;
+        for (const [key, row] of [...this.#files]) {
+            if (!key.startsWith(prefix)) continue;
+            const next = `${toKey}/${key.slice(prefix.length)}`;
+            this.#files.delete(key);
+            this.#files.set(next, { ...row, key: next });
+        }
+        const seq = num(payload?.seq, 0);
+        if (seq) this.#head = Math.max(this.#head, seq);
+        debug(`RENAME ${fromKey}/ -> ${toKey}/ (seq ${seq})`);
+        return { from: fromKey, to: toKey, seq };
     }
 
     // ─────────────────────────────────────────────────────────────────────────

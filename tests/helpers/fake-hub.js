@@ -162,6 +162,11 @@ export async function createFakeHub({ root, token = 'device-token', instanceId =
 
         if (tail === 'rename' && req.method === 'POST') {
             const body = JSON.parse((await readAll(req)).toString() || '{}');
+            if (body.directory === true) {
+                const moved = await stored.renameDirectory(backend, body.from, body.to, { operationId: body.operationId, origin: strip(body.origin) });
+                if (!moved.ok) { record.status = REASON_STATUS[moved.reason]?.[0] ?? 500; return fail(res, moved); }
+                return done(200, envelope(200, { from: moved.from, to: moved.to, seq: moved.seq, state: moved.state, directory: true }, { message: 'Directory renamed' }));
+            }
             const result = await stored.renameObject(backend, body.from, body.to, { ifMatch: strip(body.ifMatch), origin: strip(body.origin) ?? strip(req.headers['x-canvas-origin']) });
             if (!result.ok) { record.status = REASON_STATUS[result.reason]?.[0] ?? 500; return fail(res, result); }
             return done(200, envelope(200, { from: result.from, to: result.to, sha256: result.sha256, seq: result.seq, docId: docIdFor(result.sha256), version: touch(docIdFor(result.sha256)) }, { message: 'Object renamed' }));

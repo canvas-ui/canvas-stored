@@ -173,6 +173,15 @@ export default class FileBackend extends StorageBackend {
         if (snapshot?.ino != null && Number(snapshot.ino) !== stats.ino) {
             return { ok: false, reason: 'root-replaced', fsid };
         }
+        // `config.marker` ({ file, id }) binds the folder to whoever keeps
+        // history about it: an empty directory standing in for an unmounted
+        // drive, or another folder at the same path, does not carry the id.
+        const marker = this.config.marker;
+        if (marker?.file) {
+            let found = null;
+            try { found = (await fs.readFile(path.join(this.#root, marker.file), 'utf8')).trim(); } catch { /* absent */ }
+            if (found !== String(marker.id)) return { ok: false, reason: found == null ? 'marker-missing' : 'marker-mismatch', fsid };
+        }
         return { ok: true, fsid };
     }
 

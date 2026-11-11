@@ -6,6 +6,43 @@ The current storage-policy gaps below include Stored 1.11.0,
 canvas-server 2.21.0 and canvas-web 2.20.0 (2026-10-12). They supersede the
 historical delivery notes further down. Existing unrelated backlog is retained.
 
+## Mirror engine: open data-safety items (review 2026-11-11)
+
+Moves made while the mirror was down are paired by content in the reconcile
+pass and sent as renames, in both directions. A whole folder moved on the
+device goes to the hub as one directory rename (`objects/rename` with
+`directory: true`). A folder moved on the hub still arrives as one local
+rename per file, which costs no hub request.
+
+Landed with that review: the delete hold (`deleteGuard`, `approveDeletes`,
+`restoreDeletes`), the file driver's `marker` root check, the local root and
+stat check before a hub DELETE, and listing-shape validation in the canvas
+driver. Still open, most serious first:
+
+- A pull overwrites a local edit the index has not seen yet (`#runPull`
+  compares index state only). Stat the destination against the indexed
+  location before placing and re-decide on a mismatch; give the mirror's
+  `local` backend retention so a displaced file is kept either way.
+- The mirror trash (`<state>/trash`) has no TTL sweep and no list/restore
+  command. Route it through `BackendTrash` with `retention: { days }`.
+- Trash on another filesystem than the folder: the move fails with
+  `recovery-unavailable`, the retry reports `unchanged`, `#runTrashLocal`
+  drops the base with the file still in place and the next pass pushes it
+  back to the hub. Verify the local key is gone before `removeBase`.
+- chokidar's `awaitWriteFinish` swallows an unlink that follows a write of the
+  same file within the stability window, so the delete is only found by the
+  next full reconcile (6 h). Seen while writing `mirror-delete-guard.test.js`
+  (hence its 800 ms settle). Re-stat keys with a pending stability timer when
+  their directory reports a change.
+- Case-insensitive filesystems: no case-fold collision check in `keys.js`; a
+  pull of `a.txt` can replace `A.txt` and the change is then pushed.
+- Local NFD names are indexed raw while the mirror looks up NFC keys, so such
+  files are never synced and no skip is reported.
+- `scan` in the canvas driver takes the highest head across pages as the
+  cursor; it should be the first page's head.
+- A remote unlink is held 1 s for rename pairing while the cursor is already
+  persisted; a crash in that window loses the delete until a relist.
+
 ## Storage policies — remaining gaps and deployment limits
 
 The implemented boundary is: Stored owns physical bytes, exact replica
