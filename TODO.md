@@ -14,6 +14,23 @@ device goes to the hub as one directory rename (`objects/rename` with
 `directory: true`). A folder moved on the hub still arrives as one local
 rename per file, which costs no hub request.
 
+Transfers to and from a hub run outside the storage mutation queue: an upload
+streams unqueued, a download is staged to a temp file and only its commit is
+queued. Measured against a production hub at 0.25 s per request, uploads went
+from 1.5 to 16 files per second. Still serial, because they go through the
+queue for the whole request: `removeObject` and `renameObject` on a remote
+backend. A partial folder move (per-file renames) and a large approved delete
+therefore cost one round trip at a time.
+
+A directory rename waits for the hub to re-index every file under the folder
+(23 ms per file measured in production, 4 ms locally). The request timeout
+grows with the file count, but Node's fetch gives up after 300 s without
+response headers, which that hub reaches at about 13,000 files. The retry
+joins the running operation through its `operationId`, so the move still
+completes; the mirror reports offline in between. The clean fix is a `202`
+receipt polled by the device, and a cheaper rename on the hub (see
+canvas-server and canvas-synapsd TODO).
+
 Landed with that review: the delete hold (`deleteGuard`, `approveDeletes`,
 `restoreDeletes`), the file driver's `marker` root check, the local root and
 stat check before a hub DELETE, and listing-shape validation in the canvas

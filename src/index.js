@@ -27,6 +27,8 @@ import { detectMimeType, detectMimeFromHead } from './utils/mime.js';
 const debug = Debug('stored');
 // Source retirement belongs to the final move event, never a source-loss unlink.
 const MOVE_SOURCE = Symbol('move-source');
+// A remote source already downloaded for this copy: { path, checksums, size, backend, key }.
+const STAGED = Symbol('staged-source');
 
 const HEAD_BYTES = 4096;
 
@@ -112,7 +114,9 @@ export default class Stored extends EventEmitter2 {
         for (const name of ['put', 'copy', 'move', 'writeObject', 'removeObject', 'removeToTrash', 'renameObject', 'renameDirectory', 'trashDirectory', 'removeDirectory',
             'ensureDirectory', 'removeEmptyDirectory', 'restoreTrash', 'discardTrash', 'restoreRetained', 'deleteByUrl', 'delete']) {
             const method = this[name].bind(this);
-            this[name] = (...args) => this.withStorageMutation(() => method(...args), name);
+            this[name] = name === 'copy'
+                ? (idOrKey, options = {}) => this.#routeCopy(method, idOrKey, options)
+                : (...args) => this.withStorageMutation(() => method(...args), name);
         }
         this.#paths = resolveStoredPaths(config);
         this.#config = {
@@ -1196,6 +1200,51 @@ export default class Stored extends EventEmitter2 {
      *   pick the next free `name-1.ext`, or replace it.
      * @returns {Promise<{ ok:true, id, added:string[], locations } | { ok:false, reason:string }>}
      */
+    /**
+     * Network time stays out of the mutation executor, so transfers to and
+     * from a hub run side by side. An upload to a streaming remote touches no
+     * local bytes and records its result in one index transaction, so it runs
+     * unqueued. A download is staged to a temp file first; only the commit
+     * onto the local target is queued.
+     */
+    async #routeCopy(method, idOrKey, options) {
+        const names = (Array.isArray(options.to) ? options.to : [options.to]).filter(Boolean).map(String);
+        const targets = names.map((name) => this.#backends.get(name));
+        if (targets.length === 1 && targets[0]?.type === 'remote' && typeof targets[0].putStream === 'function') {
+            return method(idOrKey, options);
+        }
+        const staged = this.#closing ? null : await this.#stageRemoteSource(idOrKey, options, targets);
+        if (!staged) return this.withStorageMutation(() => method(idOrKey, options), 'copy');
+        try {
+            return await this.withStorageMutation(() => method(idOrKey, { ...options, [STAGED]: staged }), 'copy');
+        } finally {
+            await fsp.rm(staged.path, { force: true }).catch(() => {});
+        }
+    }
+
+    // Download a remote source next to its first local target. Null when the
+    // source is not remote or cannot be read; the queued copy then reports it.
+    async #stageRemoteSource(idOrKey, options, targets) {
+        const meta = this.#index.get(idOrKey);
+        const location = meta ? this.#resolveSourceLocation(meta, options.from) : null;
+        const backend = location ? this.#backends.get(location.backend) : null;
+        if (backend?.type !== 'remote') return null;
+        const firstLocal = targets.find((t) => t?.type === 'local');
+        const tempDir = firstLocal ? firstLocal.tempDir : path.join(this.#paths.cache, '.tmp');
+        const tempPath = path.join(tempDir, `${Date.now()}-${crypto.randomUUID()}`);
+        try {
+            const source = await backend.get(location.key, { stream: true });
+            if (!source) return null;
+            await fsp.mkdir(tempDir, { recursive: true });
+            const { checksums, size } = await this.#hashToFile(source, tempPath);
+            return { path: tempPath, checksums, size, backend: location.backend, key: location.key };
+        } catch (err) {
+            debug(`Staging ${location.backend}:${location.key} failed: ${err.message}`);
+            await fsp.rm(tempPath, { force: true }).catch(() => {});
+            return null;
+        }
+    }
+
     async copy(idOrKey, options = {}) {
         const plan = await this.#planTransfer(idOrKey, options);
         if (!plan.ok) return plan;
@@ -1207,7 +1256,7 @@ export default class Stored extends EventEmitter2 {
 
         const release = this.#holdKeys(targets.map(t => `${t.name}:${t.key || destKey}`));
         try {
-            const transferred = await this.#streamToTargets(meta, sourceLocation, targets, destKey, this.#transferOptions(options));
+            const transferred = await this.#streamToTargets(meta, sourceLocation, targets, destKey, this.#transferOptions(options), options[STAGED]);
             if (!transferred.ok) return transferred;
             // A conflict-inbox upload placed nothing at the key: no location.
             if (transferred.conflict && !transferred.locations.length) {
@@ -1632,7 +1681,13 @@ export default class Stored extends EventEmitter2 {
             // an unmounted share, a failed sync) must not turn a copy into a
             // silent no-op that reports success.
             const ours = (meta.locations || []).some(l => l.backend === name && l.key === destKey);
-            const present = await backend.stat(destKey).catch(() => null);
+            // A streaming remote enforces If-Match / If-None-Match itself, so
+            // the indexed view of the key stands in for a round trip.
+            const preconditioned = backend.type === 'remote' && typeof backend.putStream === 'function'
+                && (options.ifMatch != null || options.ifNoneMatch != null);
+            const present = preconditioned
+                ? (this.#index.get(`${name}:${destKey}`) ? { key: destKey } : null)
+                : await backend.stat(destKey).catch(() => null);
             if (ours && present) continue;
             if (ours) debug(`Stale location ${name}:${destKey} (indexed, no bytes) — re-transferring`);
 
@@ -1724,7 +1779,7 @@ export default class Stored extends EventEmitter2 {
      * content identity before committing. The temp file is staged on the first
      * local target's filesystem so `#commit` can hardlink instead of copying.
      */
-    async #streamToTargets(meta, sourceLocation, targets, destKey, options = {}) {
+    async #streamToTargets(meta, sourceLocation, targets, destKey, options = {}, staged = null) {
         const sourceBackend = this.#backends.get(sourceLocation.backend);
         // One remote target that speaks `putStream`: stream straight to it —
         // no temp file, no cache entry, no SyncQueue. The hub verifies the
@@ -1732,16 +1787,17 @@ export default class Stored extends EventEmitter2 {
         if (targets.length === 1 && targets[0].backend.type === 'remote' && typeof targets[0].backend.putStream === 'function') {
             return this.#streamToRemote(meta, sourceBackend, sourceLocation, targets[0], destKey, options);
         }
-        const source = await sourceBackend.get(sourceLocation.key, { stream: true });
-        if (!source) return { ok: false, reason: 'source-unreadable', backend: sourceLocation.backend, key: sourceLocation.key };
+        const prefetched = staged && staged.backend === sourceLocation.backend && staged.key === sourceLocation.key ? staged : null;
+        const source = prefetched ? null : await sourceBackend.get(sourceLocation.key, { stream: true });
+        if (!prefetched && !source) return { ok: false, reason: 'source-unreadable', backend: sourceLocation.backend, key: sourceLocation.key };
 
         const firstLocal = targets.find(t => t.backend.type === 'local')?.backend;
         const tempDir = firstLocal ? firstLocal.tempDir : path.join(this.#paths.cache, '.tmp');
-        const tempPath = path.join(tempDir, `${Date.now()}-${crypto.randomUUID()}`);
-        await fsp.mkdir(tempDir, { recursive: true });
+        const tempPath = prefetched ? prefetched.path : path.join(tempDir, `${Date.now()}-${crypto.randomUUID()}`);
+        if (!prefetched) await fsp.mkdir(tempDir, { recursive: true });
 
         try {
-            const { checksums, size } = await this.#hashToFile(source, tempPath);
+            const { checksums, size } = prefetched || await this.#hashToFile(source, tempPath);
             const id = formatId(checksums, this.#config.primaryChecksum);
             if (id !== meta.id) {
                 debug(`Transfer aborted: ${sourceLocation.backend}:${sourceLocation.key} hashes to ${id}, indexed as ${meta.id}`);

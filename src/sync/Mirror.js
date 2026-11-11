@@ -926,6 +926,7 @@ export default class Mirror extends EventEmitter {
         const key = job.key;
         const { L, B, Lloc, Lmeta } = this.#local3(key);
         if (!L || !Lmeta) { this.#markDirty(key); return; }
+        if (L === B) return;                                    // an earlier job already pushed these bytes
         // A brand-new key (no base, nothing in the hub view) skips the HEAD:
         // the PUT carries If-None-Match:* and a 412 re-decides below, so the
         // extra round trip bought nothing — and on a slow link it was half the
