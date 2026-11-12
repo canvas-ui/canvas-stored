@@ -42,8 +42,8 @@ const RETRY_DELAYS_MS = [500, 1500, 4000];
 // large file on a slow uplink is never cut short.
 const REQUEST_TIMEOUT_MS = 60_000;
 const MIN_UPLOAD_BYTES_PER_SEC = 50_000;
-// Extra time a directory rename is given per file the hub has under it.
-const DIRECTORY_RENAME_MS_PER_FILE = 250;
+// Pause between two requests for a directory rename the hub is still running.
+const DIRECTORY_RENAME_POLL_MS = [500, 1000, 2000, 5000];
 const JSON_HEADERS = { Accept: 'application/json' };
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -198,10 +198,10 @@ export default class CanvasBackend extends StorageBackend {
      * body is sent once and a retryable status surfaces as `RETRYABLE`.
      * `okStatuses` widens success (304, 404 for stat-like calls).
      */
-    async #call(url, init = {}, { okStatuses = [], key = null, uploadBytes = null, extraMs = 0 } = {}) {
+    async #call(url, init = {}, { okStatuses = [], key = null, uploadBytes = null } = {}) {
         const { body: bodySpec, ...rest } = init;
         const streaming = bodySpec != null && typeof bodySpec !== 'function' && !Buffer.isBuffer(bodySpec) && typeof bodySpec !== 'string';
-        const timeoutMs = this.#requestTimeoutMs + extraMs + (uploadBytes > 0 ? Math.ceil(uploadBytes / this.#minUploadBytesPerSec) * 1000 : 0);
+        const timeoutMs = this.#requestTimeoutMs + (uploadBytes > 0 ? Math.ceil(uploadBytes / this.#minUploadBytesPerSec) * 1000 : 0);
         let last;
         for (let attempt = 0; ; attempt += 1) {
             const body = typeof bodySpec === 'function' ? bodySpec() : bodySpec;
@@ -570,8 +570,10 @@ export default class CanvasBackend extends StorageBackend {
 
     /**
      * `POST objects/rename` with `directory: true`: the hub moves the folder
-     * and everything under it in one operation. `operationId` makes a retry
-     * after a lost response return the first result.
+     * and everything under it in one operation. A large folder is answered
+     * `202` while the hub works; the same request is repeated until it
+     * reports the result. `operationId` makes every repeat, and a retry
+     * after a lost response, return the first result.
      */
     async renameDirectory(from, to, { operationId, origin = null } = {}) {
         const fromKey = normalizeKey(from);
@@ -579,15 +581,18 @@ export default class CanvasBackend extends StorageBackend {
         if (!fromKey || !toKey || !operationId) throw new CanvasHubError('canvas directory rename: from, to and operationId are required', { code: 'REFUSED' });
         const body = { from: fromKey, to: toKey, directory: true, operationId };
         if (origin || this.#deviceId) body.origin = origin || this.#deviceId;
-        // The hub re-indexes every file under the folder before it answers.
         const prefix = `${fromKey}/`;
-        let files = 0;
-        for (const key of this.#files.keys()) if (key.startsWith(prefix)) files += 1;
-        const { payload } = await this.#json(`${this.#backendUrl()}/objects/rename`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-        }, { key: fromKey, extraMs: files * DIRECTORY_RENAME_MS_PER_FILE });
+        let payload;
+        for (let attempt = 0; ; attempt += 1) {
+            const answer = await this.#json(`${this.#backendUrl()}/objects/rename`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+            }, { key: fromKey });
+            payload = answer.payload;
+            if (answer.status !== 202) break;
+            await sleep(DIRECTORY_RENAME_POLL_MS[Math.min(attempt, DIRECTORY_RENAME_POLL_MS.length - 1)]);
+        }
         if (payload?.directory !== true) throw new CanvasHubError('the hub did not acknowledge a directory rename', { code: 'REFUSED', hubCode: 'NOT_IMPLEMENTED', key: fromKey });
         for (const [key, row] of [...this.#files]) {
             if (!key.startsWith(prefix)) continue;

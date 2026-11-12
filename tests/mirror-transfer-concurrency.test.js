@@ -10,12 +10,12 @@ const KEYS = Array.from({ length: 16 }, (_, i) => `Docs/f${i}.txt`);
 
 // A hub that takes `delay` ms to answer, with a count of requests in flight.
 function slowFetch(delay) {
-    const seen = { PUT: 0, GET: 0, HEAD: 0 };
-    const flying = { PUT: 0, GET: 0 };
-    const peak = { PUT: 0, GET: 0 };
+    const seen = { PUT: 0, GET: 0, HEAD: 0, DELETE: 0, POST: 0 };
+    const flying = { PUT: 0, GET: 0, DELETE: 0, POST: 0 };
+    const peak = { PUT: 0, GET: 0, DELETE: 0, POST: 0 };
     const fetchFn = async (url, options = {}) => {
         const method = options.method || 'GET';
-        const object = /\/objects\/Docs\//.test(new URL(url).pathname);
+        const object = /\/objects\/(Docs\/|rename$)/.test(new URL(url).pathname);
         if (!object) return fetch(url, options);
         seen[method] = (seen[method] || 0) + 1;
         if (method in flying) { flying[method] += 1; peak[method] = Math.max(peak[method], flying[method]); }
@@ -58,6 +58,31 @@ describe('Mirror: transfers to and from the hub run side by side', { timeout: 60
             assert.ok(peak.PUT > 1, `uploads in flight together: ${peak.PUT}`);
             assert.strictEqual(seen.HEAD, 0, 'a new file is uploaded without a HEAD first');
             assert.strictEqual(seen.PUT, KEYS.length);
+        } finally { await a.stop(); await hub.close(); await fs.remove(base); }
+    });
+
+    test('deletes and single-file renames overlap', async () => {
+        const base = path.join(os.tmpdir(), `stored-mirror-lanes-rm-${process.pid}`);
+        await fs.remove(base);
+        const hub = await createFakeHub({ root: path.join(base, 'hub'), token: 'tok' });
+        const { fetchFn, seen, peak } = slowFetch(60);
+        const a = await device(base, 'a', hub, fetchFn);
+        try {
+            for (const k of KEYS) await fs.outputFile(path.join(a.folder, k), `data ${k}`);
+            await a.mirror.start();
+            await waitFor(() => KEYS.every((k) => hub.sha(k) === sha256(`data ${k}`)), { label: 'pushed', timeout: 30_000 });
+            await a.mirror.idle();
+            const gone = KEYS.slice(0, 4); const renamed = KEYS.slice(4, 10);
+            for (const k of gone) await fs.remove(path.join(a.folder, k));
+            for (const k of renamed) await fs.rename(path.join(a.folder, k), path.join(a.folder, k.replace('/f', '/g')));
+            await waitFor(() => gone.every((k) => hub.sha(k) === null)
+                && renamed.every((k) => hub.sha(k) === null && hub.sha(k.replace('/f', '/g')) === sha256(`data ${k}`)), { label: 'deleted and renamed', timeout: 30_000 });
+            await a.mirror.idle();
+            assert.strictEqual(seen.DELETE, gone.length);
+            assert.strictEqual(seen.POST, renamed.length);
+            assert.strictEqual(seen.PUT, KEYS.length, 'a rename uploads nothing');
+            assert.ok(peak.DELETE > 1, `deletes in flight together: ${peak.DELETE}`);
+            assert.ok(peak.POST > 1, `renames in flight together: ${peak.POST}`);
         } finally { await a.stop(); await hub.close(); await fs.remove(base); }
     });
 

@@ -8,10 +8,10 @@ import { createFakeHub, sha256, waitFor } from './helpers/fake-hub.js';
 
 const KEYS = Array.from({ length: 8 }, (_, i) => `Docs/f${i}.txt`);
 
-async function setup(name) {
+async function setup(name, hubOptions = {}) {
     const base = path.join(os.tmpdir(), `stored-mirror-moves-${name}-${process.pid}`);
     await fs.remove(base);
-    const hub = await createFakeHub({ root: path.join(base, 'hub'), token: 'tok' });
+    const hub = await createFakeHub({ root: path.join(base, 'hub'), token: 'tok', ...hubOptions });
     const dir = path.join(base, 'a'); const folder = path.join(dir, 'folder');
     for (const d of ['folder', 'trash', 'conflicts']) await fs.ensureDir(path.join(dir, d));
     let stored; let m;
@@ -53,6 +53,24 @@ describe('Mirror: moves made while the mirror was down', { timeout: 120_000 }, (
             const ops = hub.stored.changes({ backend: 'workspace:home', since: 0 }).changes.filter((c) => c.key.startsWith('Archive/')).map((c) => c.op);
             assert.deepStrictEqual([...new Set(ops)], ['rename']);
             for (const k of KEYS) assert.strictEqual(await fs.readFile(path.join(folder, 'Archive', k), 'utf8'), `data ${k}`);
+        } finally { await close(); }
+    });
+
+    test('a folder rename the hub answers with 202 is asked for again until it is done', async () => {
+        const { hub, folder, up, close, mirror } = await setup('receipt', { directoryRenameWaitMs: 1200 });
+        try {
+            const puts = hub.puts().length;
+            await fs.move(path.join(folder, 'Docs'), path.join(folder, 'Archive/Docs'));
+            await up();
+            await waitFor(() => KEYS.every((k) => hub.sha(`Archive/${k}`) === sha256(`data ${k}`) && hub.sha(k) === null), { label: 'renamed on the hub', timeout: 20_000 });
+            await mirror().idle();
+            const statuses = renames(hub).map((c) => c.status);
+            assert.ok(statuses.length > 1 && statuses.slice(0, -1).every((s) => s === 202), `202 until done: ${statuses}`);
+            assert.strictEqual(statuses.at(-1), 200);
+            assert.strictEqual(hub.puts().length, puts, 'no bytes were uploaded');
+            assert.strictEqual(deletes(hub).length, 0);
+            assert.strictEqual(mirror().status().pending, 0);
+            for (const k of KEYS) assert.ok(mirror().ledger.getBase(`Archive/${k}`), `base moved for ${k}`);
         } finally { await close(); }
     });
 

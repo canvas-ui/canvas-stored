@@ -40,7 +40,8 @@ const envelope = (statusCode, payload, { message = 'OK', code = null, count } = 
     ...(code ? { code } : {}),
 });
 
-export async function createFakeHub({ root, token = 'device-token', instanceId = 'hub-instance-1', backend = 'workspace:home', workspaceId = 'ws1', watch = true } = {}) {
+export async function createFakeHub({ root, token = 'device-token', instanceId = 'hub-instance-1', backend = 'workspace:home', workspaceId = 'ws1', watch = true, directoryRenameWaitMs = 0 } = {}) {
+    const directoryRenames = new Map();
     const home = path.join(root, 'home');
     await fs.ensureDir(home);
     const stored = new Stored({ root: path.join(root, '.stored'), checksums: ['sha256'] });
@@ -163,7 +164,20 @@ export async function createFakeHub({ root, token = 'device-token', instanceId =
         if (tail === 'rename' && req.method === 'POST') {
             const body = JSON.parse((await readAll(req)).toString() || '{}');
             if (body.directory === true) {
-                const moved = await stored.renameDirectory(backend, body.from, body.to, { operationId: body.operationId, origin: strip(body.origin) });
+                // `directoryRenameWaitMs` makes the hub answer 202 until the
+                // rename has been running that long, as a real hub does for a
+                // large folder.
+                const id = `${body.operationId}`;
+                if (!directoryRenames.has(id)) {
+                    const started = Date.now();
+                    directoryRenames.set(id, { started, task: sleep(directoryRenameWaitMs).then(() => stored.renameDirectory(backend, body.from, body.to, { operationId: body.operationId, origin: strip(body.origin) })) });
+                }
+                const run = directoryRenames.get(id);
+                if (Date.now() - run.started < directoryRenameWaitMs) {
+                    record.status = 202;
+                    return done(202, envelope(202, { from: body.from, to: body.to, directory: true, state: 'running', operationId: body.operationId }, { message: 'Directory rename running' }));
+                }
+                const moved = await run.task;
                 if (!moved.ok) { record.status = REASON_STATUS[moved.reason]?.[0] ?? 500; return fail(res, moved); }
                 return done(200, envelope(200, { from: moved.from, to: moved.to, seq: moved.seq, state: moved.state, directory: true }, { message: 'Directory renamed' }));
             }

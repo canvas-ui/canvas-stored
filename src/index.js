@@ -103,6 +103,7 @@ export default class Stored extends EventEmitter2 {
     #sweepTimer = null;
     #directoryMovesDb = null;
     #directoryMoveTasks = new Map();
+    #moveUnqueued;
     #replicas;
 
     constructor(config = {}) {
@@ -114,9 +115,15 @@ export default class Stored extends EventEmitter2 {
         for (const name of ['put', 'copy', 'move', 'writeObject', 'removeObject', 'removeToTrash', 'renameObject', 'renameDirectory', 'trashDirectory', 'removeDirectory',
             'ensureDirectory', 'removeEmptyDirectory', 'restoreTrash', 'discardTrash', 'restoreRetained', 'deleteByUrl', 'delete']) {
             const method = this[name].bind(this);
-            this[name] = name === 'copy'
-                ? (idOrKey, options = {}) => this.#routeCopy(method, idOrKey, options)
-                : (...args) => this.withStorageMutation(() => method(...args), name);
+            if (name === 'move') this.#moveUnqueued = method;
+            if (name === 'copy') this[name] = (idOrKey, options = {}) => this.#routeCopy(method, idOrKey, options);
+            // A delete or rename on a streaming remote is one request and one
+            // index transaction, so several run side by side.
+            else if (name === 'removeObject' || name === 'renameObject') {
+                this[name] = (backendName, ...rest) => (this.#streamsRemote(backendName)
+                    ? method(backendName, ...rest)
+                    : this.withStorageMutation(() => method(backendName, ...rest), name));
+            } else this[name] = (...args) => this.withStorageMutation(() => method(...args), name);
         }
         this.#paths = resolveStoredPaths(config);
         this.#config = {
@@ -987,7 +994,8 @@ export default class Stored extends EventEmitter2 {
             return { ok: false, reason: 'target-exists', key: toKey };
         }
 
-        const result = await this.move(`${backendName}:${fromKey}`, {
+        const move = this.#streamsRemote(backendName) ? this.#moveUnqueued : this.move;
+        const result = await move(`${backendName}:${fromKey}`, {
             to: backendName,
             key: toKey,
             from: `stored://${backendName}/${fromKey}`,
@@ -1210,7 +1218,7 @@ export default class Stored extends EventEmitter2 {
     async #routeCopy(method, idOrKey, options) {
         const names = (Array.isArray(options.to) ? options.to : [options.to]).filter(Boolean).map(String);
         const targets = names.map((name) => this.#backends.get(name));
-        if (targets.length === 1 && targets[0]?.type === 'remote' && typeof targets[0].putStream === 'function') {
+        if (names.length === 1 && this.#streamsRemote(names[0])) {
             return method(idOrKey, options);
         }
         const staged = this.#closing ? null : await this.#stageRemoteSource(idOrKey, options, targets);
@@ -1220,6 +1228,13 @@ export default class Stored extends EventEmitter2 {
         } finally {
             await fsp.rm(staged.path, { force: true }).catch(() => {});
         }
+    }
+
+    // A remote that takes writes directly (the canvas driver): it holds no
+    // local bytes, so its requests need no place in the mutation queue.
+    #streamsRemote(backendName) {
+        const backend = this.#backends.get(String(backendName));
+        return backend?.type === 'remote' && typeof backend.putStream === 'function';
     }
 
     // Download a remote source next to its first local target. Null when the

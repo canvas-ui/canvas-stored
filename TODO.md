@@ -14,22 +14,16 @@ device goes to the hub as one directory rename (`objects/rename` with
 `directory: true`). A folder moved on the hub still arrives as one local
 rename per file, which costs no hub request.
 
-Transfers to and from a hub run outside the storage mutation queue: an upload
-streams unqueued, a download is staged to a temp file and only its commit is
-queued. Measured against a production hub at 0.25 s per request, uploads went
-from 1.5 to 16 files per second. Still serial, because they go through the
-queue for the whole request: `removeObject` and `renameObject` on a remote
-backend. A partial folder move (per-file renames) and a large approved delete
-therefore cost one round trip at a time.
+Requests to a hub run outside the storage mutation queue: an upload streams
+unqueued, a download is staged to a temp file and only its commit is queued,
+and a delete or a single-file rename is one request and one index
+transaction. Measured against a production hub at 0.25 s per request,
+uploads went from 1.5 to 16 files per second.
 
-A directory rename waits for the hub to re-index every file under the folder
-(23 ms per file measured in production before the hub treated a move as a move and batched its commits; 1.1 to 1.7 ms locally after). The request timeout
-grows with the file count, but Node's fetch gives up after 300 s without
-response headers, which that hub reaches at about 13,000 files. The retry
-joins the running operation through its `operationId`, so the move still
-completes; the mirror reports offline in between. The clean fix is a `202`
-receipt polled by the device, and a cheaper rename on the hub (see
-canvas-server and canvas-synapsd TODO).
+A directory rename is answered `202` by the hub when it runs longer than 15
+seconds, and the driver repeats the request until the hub reports the
+result. Measured in production: 1,997 files in 2 to 7 seconds (45 seconds
+before the hub treated a move as a move and batched its commits).
 
 Landed with that review: the delete hold (`deleteGuard`, `approveDeletes`,
 `restoreDeletes`), the file driver's `marker` root check, the local root and
