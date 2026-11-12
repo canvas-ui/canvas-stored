@@ -23,7 +23,7 @@ backend. A partial folder move (per-file renames) and a large approved delete
 therefore cost one round trip at a time.
 
 A directory rename waits for the hub to re-index every file under the folder
-(23 ms per file measured in production, 4 ms locally). The request timeout
+(23 ms per file measured in production before synapsd treated a move as a move; 2.5 ms locally after). The request timeout
 grows with the file count, but Node's fetch gives up after 300 s without
 response headers, which that hub reaches at about 13,000 files. The retry
 joins the running operation through its `operationId`, so the move still
