@@ -359,7 +359,7 @@ export default class Stored extends EventEmitter2 {
             .filter(t => t.backend);
         if (!targets.length) return { ok: false, reason: 'unknown-backend' };
 
-        const ingestOptions = { mtime: options.mtime ?? null };
+        const ingestOptions = { mtime: options.mtime ?? null, generatedKey: !key };
         const ingest = (isBuffer(blob) || (typeof blob === 'string' && !await isFileAsync(blob)))
             ? await this.#ingestMemory(blob, targets, key, options.mimeType, ingestOptions)
             : (options.adopt && typeof blob === 'string')
@@ -2369,7 +2369,8 @@ export default class Stored extends EventEmitter2 {
             // A target may carry its own key: conflict resolution can rename per
             // backend (`photo.jpg` is free on one, taken on another). `put()`
             // targets never do, so they all land on `finalKey`.
-            const targetKey = key || finalKey;
+            // A content-derived key lands under the backend's blob prefix.
+            const targetKey = key || (options.generatedKey ? `${backend.blobPrefix || ''}${finalKey}` : finalKey);
             if (backend.type === 'local') {
                 if (overwrite) await this.#retain(name, targetKey, this.#index.get(`${name}:${targetKey}`));
                 if (source.data) await backend.put(targetKey, source.data);
@@ -2387,6 +2388,9 @@ export default class Stored extends EventEmitter2 {
                     ...(st?.ino != null ? { ino: st.ino, dev: st.dev } : {}),
                 }));
             } else {
+                // The same content is already verified at this key.
+                const held = this.#index.get(id)?.locations?.find(l => l.backend === name && l.key === targetKey && l.synced);
+                if (held) { locations.push(held); continue; }
                 locations.push(this.#buildLocation(name, targetKey, false, { size: meta.size }));
                 remoteTargets.push({ name, driver: backend.config.driver, root: backend.config.root, key: targetKey });
             }
@@ -2502,10 +2506,12 @@ export default class Stored extends EventEmitter2 {
         const present = new Set([...presentKeys].map(nfc));
         const underErroredPrefix = (key) => erroredPrefixes.some((prefix) =>
             key === prefix || key.startsWith(`${prefix}/`) || key.startsWith(`${prefix}\\`));
+        const backend = this.#backends.get(backendName);
         for (const [id, meta] of this.#index.entries()) {
             const nextLocations = (meta.locations || []).filter(location =>
                 location.backend !== backendName
                 || present.has(nfc(location.key))
+                || backend?.listed(location.key) === false
                 || underErroredPrefix(location.key)
             );
 

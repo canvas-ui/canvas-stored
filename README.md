@@ -143,7 +143,7 @@ await stored.stop();
 | `cacache` | local | Content-addressable blob store (managed; opaque keys) |
 | `gdrive` | remote | Google Drive folder subtree over OAuth refresh token — see below |
 | `canvas` | remote | One backend of a workspace on a canvas hub, over the objects/sync protocol — see *Sync engine* below |
-| `s3` | remote | S3-compatible bucket/prefix: reads, indexing, polling and conditional create-only uploads |
+| `s3` | remote | S3-compatible bucket/prefix: reads, indexing, polling, conditional create-only uploads, content-addressed blobs |
 | `http` | remote | Read-only `get` / `stat` |
 
 Register additional drivers at runtime with `BackendManager.register(name, Class)` (`import BackendManager from 'canvas-stored/src/backends/BackendManager.js'`).
@@ -214,14 +214,25 @@ endpoint requires a new backend to preserve existing locations and pending plans
   empty directory markers and folder mutations are not supported.
 - `put` and streaming `createFrom`/`commit` use conditional `If-None-Match: *`
   writes with a content MD5. Existing keys are never overwritten. Single PUT
-  uploads are limited to **5 GiB**; larger uploads fail before publication.
-  Multipart/resumable upload is deferred.
+  uploads to a chosen key are limited to **5 GiB**; larger uploads fail before
+  publication.
+- Content-addressed blobs: `stored.put(blob, { backends: ['data', 's3:name'] })`
+  without a `key` writes the blob to the local store and queues an upload to
+  `<prefix>/.canvas-blobs/<aa>/<bb>/<sha256>` (`backend.blobPrefix`). The same
+  key always holds the same bytes, so these writes are unconditional, an
+  existing object of the right size is reused, and blobs above 64 MiB are sent
+  as a multipart upload with a content MD5 per part (no 5 GiB limit). Blob keys
+  are skipped by `list`/`scan`/`poll` (`backend.listed(key) === false`), and a
+  scan never removes their index locations. The capability is `blobs`.
 - Before allowing writes, each new driver instance tests conditional creation
   on a random key under `<prefix>/.canvas-probe/`, checks the original bytes,
   and deletes its probe. The key needs ListBucket scoped to the prefix, GetObject
   and PutObject, plus DeleteObject on the probe prefix (DeleteObjectVersion on
   versioned buckets). An endpoint that ignores preconditions is rejected before
-  writing user keys. Read-only connections do not probe writes.
+  writing user keys. Read-only connections do not probe writes. The probe
+  result includes `versioned` (the bucket returned a version id). Under Object
+  Lock a probe version cannot be removed before its retention ends; it is
+  hidden behind a delete marker and the connection still verifies.
 - ETags are observation tokens, **never content checksums or rename identity**.
   Initial scans download bytes to hash them; subsequent scans reuse only hashes
   matching the current ETag/version/size/time. Polling lists the prefix and checks
@@ -230,8 +241,13 @@ endpoint requires a new backend to preserve existing locations and pending plans
 - Workspace `kind: "filing"` policies support automated copies with `error` or
   `rename` conflicts. The existing durable replica executor verifies each exact
   destination before releasing staging. Full mirrors, overwrite and automated
-  removal are refused. `delete()` is disabled unless `permanentDelete: true` is
-  explicitly configured; this manual opt-in does not enable mirror capabilities.
+  removal are refused.
+- `delete()` works with `versioned: true` (set it from the probe result): on a
+  versioned bucket a delete adds a delete marker and every earlier version
+  stays in the bucket, so the removal is recoverable there. Object Lock (WORM)
+  protects object versions and does not reject a delete marker. On an
+  unversioned bucket `delete()` needs an explicit `permanentDelete: true`.
+  Neither setting enables mirror capabilities.
 
 `tests/s3.test.js` covers collision protection, incompatible endpoints, failed
 enumeration, mid-read changes and replica recovery. Run the live test against an
@@ -536,7 +552,7 @@ Registered in `BackendManager` via `DRIVERS`:
 | `file` | `local` | complete | CRUD, chokidar `watch`, `scan` |
 | `cacache` | `local` | complete | Content-addressable blob store (cacache); CRUD, no `watch`/`scan` |
 | `http` | `remote` | partial | Read-only `get` / `stat` via `fetch`; `config.baseUrl`, `headers` |
-| `s3` | `remote` | filing/read support | Conditional creates, streaming reads, scan/poll; mirrors and overwrite disabled |
+| `s3` | `remote` | filing/read/blob support | Conditional creates, content-addressed blobs, streaming reads, scan/poll, deletes on versioned buckets; mirrors and overwrite disabled |
 
 Each backend implements `StorageBackend`: `put`, `get`, `delete`, `stat`, `list`; optional `commit` (local, for streaming put), `watch`, `scan`, `stop`.
 

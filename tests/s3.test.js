@@ -32,7 +32,7 @@ test('S3 probes conditional creation, preserves a collision and refuses implicit
     assert.equal((await s3.get('invoice.txt')).toString(), 'invoice');
     assert.ok(![...client.objects.keys()].some(k => k.includes('.canvas-probe')));
     assert.equal(client.calls.filter(c => c.op === 'PutObjectCommand' && c.input.Key.includes('.canvas-probe')).length, 2);
-    await assert.rejects(s3.delete('invoice.txt'), { code: 'RECOVERY_UNAVAILABLE' });
+    await assert.rejects(s3.delete('invoice.txt'), { code: 'DELETE_DISABLED' });
     assert.equal(s3.capabilities.delete, false);
 });
 test('S3 refuses endpoints that ignore If-None-Match before touching user keys', async t => {
@@ -114,4 +114,76 @@ test('Stored S3 filing verifies every target, keeps staging on failure and recov
     assert.equal(await stored.getBackend('data').get('upload'), null);
     assert.equal(client.objects.get('backup/invoice.txt').data.toString(), 'accounting');
     assert.throws(() => stored.replicas.submit({ id: 'unsafe', owner: 'doc:2', contentId: upload.id, replicas: [{ backend: 's3:test', key: 'mirror' }] }), { code: 'UNSUPPORTED_RETIRE' });
+});
+
+test('S3 versioned bucket: the probe reports versioning and a delete leaves a marker over the kept version', async t => {
+    const client = new FakeS3(); client.versioned = true;
+    const probe = driver(client); t.after(() => probe.stop());
+    assert.equal((await probe.verifyWrites()).versioned, true);
+    assert.equal(probe.capabilities.delete, false);
+    const s3 = driver(client, { versioned: true }); t.after(() => s3.stop());
+    assert.equal(s3.capabilities.delete, true);
+    await s3.put('invoice.txt', Buffer.from('invoice'));
+    assert.equal(await s3.delete('invoice.txt'), true);
+    assert.equal(await s3.stat('invoice.txt'), null);
+    const history = client.versions.filter(v => v.Key === 'scope/invoice.txt');
+    assert.equal(history[0].data.toString(), 'invoice');
+    assert.equal(history.at(-1).deleteMarker, true);
+    const plain = new FakeS3(), unversioned = driver(plain); t.after(() => unversioned.stop());
+    assert.equal((await unversioned.verifyWrites()).versioned, false);
+});
+test('S3 Object Lock: a probe version that cannot be removed is hidden, and the connection still verifies', async t => {
+    const client = new FakeS3(); client.versioned = true; client.objectLock = true;
+    const s3 = driver(client); t.after(() => s3.stop());
+    assert.deepEqual(await s3.verifyWrites(), { ok: true, conditionalCreate: true, versioned: true });
+    assert.ok(![...client.objects.keys()].some(k => k.includes('.canvas-probe')));
+});
+test('S3 blob keys are unconditional, deduplicated by size, multipart when large and never listed', async t => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 's3-blob-'));
+    const client = new FakeS3(), s3 = driver(client);
+    t.after(async () => { await s3.stop(); await fs.rm(root, { recursive: true, force: true }); });
+    const file = path.join(root, 'blob');
+    await fs.writeFile(file, 'blob bytes');
+    const key = `${s3.blobPrefix}ab/cd/abcd`;
+    assert.equal((await s3.createFrom(key, file)).size, 10);
+    assert.equal(client.calls.filter(c => c.input.Key?.includes('.canvas-probe')).length, 0);
+    client.calls.length = 0;
+    await s3.createFrom(key, file);
+    assert.equal(client.calls.filter(c => c.op === 'PutObjectCommand').length, 0);
+    await fs.truncate(file, 64 * 1024 ** 2 + 5);
+    const large = `${s3.blobPrefix}ef/01/ef01`;
+    assert.equal((await s3.createFrom(large, file)).size, 64 * 1024 ** 2 + 5);
+    assert.equal(client.calls.filter(c => c.op === 'UploadPartCommand').length, 2);
+    client.add('scope/visible.txt', 'visible');
+    assert.deepEqual((await s3.scan()).files.map(row => row.key), ['visible.txt']);
+    assert.equal(s3.listed(key), false);
+    assert.equal(s3.listed('visible.txt'), true);
+});
+test('Stored uploads a blob to its local store and a remote blob prefix; a scan keeps the unlisted location', async t => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'stored-s3-primary-'));
+    const client = new FakeS3();
+    const stored = new Stored({ root, checksums: ['sha256'], replication: { autoStart: false } });
+    t.after(async () => { await stored.stop(); await fs.rm(root, { recursive: true, force: true }); });
+    stored.addBackend('data', { driver: 'cacache', root: path.join(root, 'data') });
+    stored.addBackend('s3:test', { driver: 's3', bucket: 'test', prefix: 'scope', client, versioned: true });
+    const sum = hash('ledger');
+    const remoteKey = `.canvas-blobs/${sum.slice(0, 2)}/${sum.slice(2, 4)}/${sum}`;
+    const upload = await stored.put(Buffer.from('ledger'), { backends: ['data', 's3:test'] });
+    assert.equal(upload.key, `${sum.slice(0, 2)}/${sum.slice(2, 4)}/${sum}`);
+    assert.deepEqual(upload.locations.map(l => [l.backend, l.key, l.synced]), [['data', upload.key, true], ['s3:test', remoteKey, false]]);
+    await stored.replicas.drain();
+    assert.equal(client.objects.get(`scope/${remoteKey}`).data.toString(), 'ledger');
+    const synced = () => stored.stat(upload.id).then(meta => meta.locations.find(l => l.backend === 's3:test'));
+    assert.equal((await synced()).synced, true);
+    client.add('scope/report.txt', 'report');
+    assert.equal((await stored.scan('s3:test')).count, 1);
+    assert.equal((await synced()).key, remoteKey);
+    const puts = () => client.calls.filter(c => c.op === 'PutObjectCommand' && c.input.Key === `scope/${remoteKey}`).length;
+    const before = puts();
+    const again = await stored.put(Buffer.from('ledger'), { backends: ['data', 's3:test'] });
+    assert.equal(again.locations.find(l => l.backend === 's3:test').synced, true);
+    await stored.replicas.drain();
+    assert.equal(puts(), before);
+    assert.equal((await stored.deleteByUrl(`stored://s3:test/${remoteKey}`)).ok, true);
+    assert.equal(client.objects.has(`scope/${remoteKey}`), false);
 });

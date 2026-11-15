@@ -1,12 +1,22 @@
 import { createReadStream, promises as fs } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { S3Client, ListObjectsV2Command, HeadObjectCommand, GetObjectCommand, PutObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, ListObjectsV2Command, HeadObjectCommand, GetObjectCommand, PutObjectCommand, DeleteObjectCommand,
+    CreateMultipartUploadCommand, UploadPartCommand, CompleteMultipartUploadCommand, AbortMultipartUploadCommand } from '@aws-sdk/client-s3';
 import StorageBackend from '../StorageBackend.js';
+import { createHash } from 'node:crypto';
 import { checksumBuffer, checksumFile, checksumStream } from '../../utils/checksum.js';
 import { detectMimeFromHead } from '../../utils/mime.js';
 
 const MAX_PUT = 5 * 1024 ** 3;
+const PART = 64 * 1024 ** 2;
+const MAX_PARTS = 10_000;
 const PROBES = '.canvas-probe/';
+// Content-addressed blobs of a workspace that uses this bucket as its primary
+// data store. Keys are `<BLOBS><aa>/<bb>/<sha256>`: never listed, scanned or
+// mirrored into a tree, and written without a conditional create because the
+// same key always holds the same bytes.
+const BLOBS = '.canvas-blobs/';
+const locked = error => status(error) === 403 || ['AccessDenied', 'InvalidRequest', 'ObjectLocked'].includes(error?.name);
 const fault = (code, message, retryable = false) => Object.assign(new Error(message), { code, retryable });
 const status = error => error?.$metadata?.httpStatusCode;
 const missing = error => status(error) === 404 && !['NoSuchBucket', 'NotFoundBucket'].includes(error.name);
@@ -17,9 +27,13 @@ const bodyBuffer = async body => {
     return Buffer.concat(chunks);
 };
 
-/** One existing bucket/prefix. Creates are conditional; destructive policy
- * capabilities stay disabled. ETags/version IDs are observation tokens, never
- * content checksums or stable inodes. No implicit host IAM credentials. */
+/** One existing bucket/prefix. Creates of user keys are conditional. Removal is
+ * enabled on a versioned bucket (`config.versioned`, detected by the write
+ * probe), where a delete adds a delete marker and every earlier version stays
+ * in the bucket, or with an explicit `permanentDelete`. Object Lock (WORM)
+ * applies to object versions, so it never blocks a delete marker. ETags and
+ * version IDs are observation tokens, never content checksums or stable
+ * inodes. No implicit host IAM credentials. */
 export default class S3Backend extends StorageBackend {
     #client; #bucket; #prefix; #timer; #polling; #rows = new Map(); #hashes = new Map(); #writeCheck;
     constructor(name, config = {}) {
@@ -48,8 +62,13 @@ export default class S3Backend extends StorageBackend {
         });
     }
     static getCapabilities(config = {}) {
-        return { ...super.getCapabilities(config), delete: config.readOnly !== true && config.permanentDelete === true, canEnumerate: true, remote: true, paths: true, upload: config.readOnly !== true };
+        return { ...super.getCapabilities(config), delete: config.readOnly !== true && (config.versioned === true || config.permanentDelete === true),
+            canEnumerate: true, remote: true, paths: true, upload: config.readOnly !== true, blobs: config.readOnly !== true };
     }
+    /** Key prefix for content-addressed blobs (see BLOBS). */
+    get blobPrefix() { return BLOBS; }
+    /** False for keys a listing never reports; a scan is no evidence about them. */
+    listed(key) { return !String(key).startsWith(BLOBS); }
     get transport() { return 's3'; }
     get watching() { return Boolean(this.#timer); }
     #safe(key) { return ![...key].some(c => c < ' ' || c === '\\') && !key.split('/').some(s => !s || s === '.' || s === '..'); }
@@ -83,6 +102,7 @@ export default class S3Backend extends StorageBackend {
     async #probeWrites() {
         const Key = this.#prefix + PROBES + randomUUID();
         const versions = new Set();
+        let outcome;
         try {
             const first = await this.#send(PutObjectCommand, { Key, Body: Buffer.from('canvas-probe'), IfNoneMatch: '*' });
             versions.add(first.VersionId);
@@ -94,13 +114,26 @@ export default class S3Backend extends StorageBackend {
             const found = await this.#send(GetObjectCommand, { Key });
             const bytes = await bodyBuffer(found.Body);
             if (!rejected || bytes.toString() !== 'canvas-probe') throw fault('CONDITIONAL_WRITES_UNSUPPORTED', 'S3 endpoint does not enforce If-None-Match; user-key writes are disabled');
-            return { ok: true, conditionalCreate: true };
+            // A versioned bucket returns a version id for every write.
+            outcome = { ok: true, conditionalCreate: true, versioned: Boolean(first.VersionId) && first.VersionId !== 'null' };
         } finally {
             // Exact random keys only, including any versions created by a
             // nonconforming endpoint; never sweep a user prefix.
             if (!versions.size) versions.add(undefined);
-            for (const VersionId of versions) await this.#send(DeleteObjectCommand, { Key, ...(VersionId ? { VersionId } : {}) });
+            let hidden = false;
+            for (const VersionId of versions) {
+                const removed = await this.#send(DeleteObjectCommand, { Key, ...(VersionId ? { VersionId } : {}) }).then(() => true, error => {
+                    if (VersionId && locked(error)) return false;
+                    if (outcome) outcome = { error };
+                    return true;
+                });
+                // Object Lock retention keeps the probe version until it
+                // expires; hide it behind one delete marker instead.
+                if (!removed && !hidden) { hidden = true; await this.#send(DeleteObjectCommand, { Key }).catch(() => {}); }
+            }
         }
+        if (outcome.error) throw outcome.error;
+        return outcome;
     }
     #row(key, result) {
         return { backend: this.name, key, size: Number(result.ContentLength ?? result.Size ?? 0),
@@ -130,7 +163,8 @@ export default class S3Backend extends StorageBackend {
     async commit(key, file) { return this.createFrom(key, file); }
     async createFrom(key, file) {
         const { size } = await fs.stat(file);
-        if (size > MAX_PUT) throw fault('OBJECT_TOO_LARGE', 'S3 uploads currently support objects up to 5 GiB; multipart upload is not enabled');
+        if (key.startsWith(BLOBS)) return this.#createBlob(key, file, size);
+        if (size > MAX_PUT) throw fault('OBJECT_TOO_LARGE', 'S3 uploads to a chosen path support objects up to 5 GiB');
         const handle = await fs.open(file, 'r');
         let head;
         try {
@@ -151,8 +185,43 @@ export default class S3Backend extends StorageBackend {
         this.#hashes.delete(key);
         return this.stat(key);
     }
+    /** Same key, same bytes: an existing object of the right size is the
+     * upload. Large blobs go up in parts, each with its own MD5. */
+    async #createBlob(key, file, size) {
+        const Key = this.#key(key);
+        if (!this.canWrite) throw fault('READ_ONLY', 'S3 backend is read-only');
+        const existing = await this.stat(key);
+        if (existing?.size === size) return existing;
+        if (size <= PART) {
+            const sums = await checksumFile(file, ['md5']);
+            const input = createReadStream(file);
+            try { await this.#send(PutObjectCommand, { Key, Body: input, ContentLength: size, ContentType: 'application/octet-stream', ContentMD5: Buffer.from(sums.md5, 'hex').toString('base64') }); }
+            finally { input.destroy(); }
+            return this.stat(key);
+        }
+        const partSize = Math.max(PART, Math.ceil(size / MAX_PARTS));
+        const { UploadId } = await this.#send(CreateMultipartUploadCommand, { Key, ContentType: 'application/octet-stream' });
+        try {
+            const Parts = [];
+            for (let start = 0, PartNumber = 1; start < size; start += partSize, PartNumber++) {
+                const end = Math.min(start + partSize, size) - 1;
+                const md5 = createHash('md5');
+                for await (const chunk of createReadStream(file, { start, end })) md5.update(chunk);
+                const input = createReadStream(file, { start, end });
+                try {
+                    const part = await this.#send(UploadPartCommand, { Key, UploadId, PartNumber, Body: input, ContentLength: end - start + 1, ContentMD5: md5.digest('base64') });
+                    Parts.push({ PartNumber, ETag: part.ETag });
+                } finally { input.destroy(); }
+            }
+            await this.#send(CompleteMultipartUploadCommand, { Key, UploadId, MultipartUpload: { Parts } });
+        } catch (error) {
+            await this.#send(AbortMultipartUploadCommand, { Key, UploadId }).catch(() => {});
+            throw error;
+        }
+        return this.stat(key);
+    }
     async delete(key) {
-        if (!this.canDelete) throw fault('RECOVERY_UNAVAILABLE', 'S3 removal requires explicit permanentDelete; recoverable mirror removal is not implemented');
+        if (!this.canDelete) throw fault('DELETE_DISABLED', 'S3 removal needs a versioned bucket (a delete then keeps every earlier version) or an explicit permanentDelete');
         await this.#send(DeleteObjectCommand, { Key: this.#key(key) });
         this.#hashes.delete(key);
         return true;
@@ -167,7 +236,7 @@ export default class S3Backend extends StorageBackend {
                 const absolute = result.EncodingType === 'url' ? decodeURIComponent(item.Key) : item.Key;
                 if (typeof absolute !== 'string' || !absolute.startsWith(this.#prefix)) throw fault('INVALID_LIST', 'S3 listing escaped the configured prefix');
                 const key = absolute.slice(this.#prefix.length);
-                if (!key || key.endsWith('/') || key.startsWith(PROBES)) continue;
+                if (!key || key.endsWith('/') || key.startsWith(PROBES) || key.startsWith(BLOBS)) continue;
                 if (!this.#safe(key)) throw fault('UNSUPPORTED_KEY', `S3 key cannot be represented safely: ${key}`);
                 yield this.#row(key, item);
             }

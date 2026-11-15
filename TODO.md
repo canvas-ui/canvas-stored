@@ -622,3 +622,9 @@ directly (`putStream`). Hub-side file replication now uses that replica service.
 Google Drive destructive mirror support and NAS deployment qualification remain
 open as described above; they are not implied by the device mirror's completion.
 Not needed: cluster mode, pub/sub, cron expressions, priorities
+
+## S3 backend: open items
+
+- A blob upload to a remote target is copied locally three times on its way (cache entry, operation staging, writeObject temp file). Hand the staged file to `createFrom` directly for `replica:` writes.
+- The scan hash cache is in memory: every process start with `scanOnStart` downloads the whole bucket again to hash it. Persist ETag/version to checksum pairs in the index.
+- Under Object Lock with default retention each write probe leaves one small locked version under `.canvas-probe/` until its retention ends. Remember a passed probe per backend instead of probing per process.
