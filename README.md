@@ -216,14 +216,20 @@ endpoint requires a new backend to preserve existing locations and pending plans
   writes with a content MD5. Existing keys are never overwritten. Single PUT
   uploads to a chosen key are limited to **5 GiB**; larger uploads fail before
   publication.
-- Content-addressed blobs: `stored.put(blob, { backends: ['data', 's3:name'] })`
-  without a `key` writes the blob to the local store and queues an upload to
-  `<prefix>/.canvas-blobs/<aa>/<bb>/<sha256>` (`backend.blobPrefix`). The same
-  key always holds the same bytes, so these writes are unconditional, an
-  existing object of the right size is reused, and blobs above 64 MiB are sent
-  as a multipart upload with a content MD5 per part (no 5 GiB limit). Blob keys
-  are skipped by `list`/`scan`/`poll` (`backend.listed(key) === false`), and a
-  scan never removes their index locations. The capability is `blobs`.
+- `mode` is `'path'` (default) or `'cas'` and is fixed for a backend. A path
+  backend holds objects under chosen keys and behaves as described above. A CAS
+  backend holds content-addressed blobs only: `stored.put(blob, { backends:
+  ['data', 's3:name'] })` without a `key` writes the blob to the local store
+  and queues an upload to `<prefix>/.canvas-blobs/<aa>/<bb>/<sha256>`
+  (`backend.blobPrefix`). The same key always holds the same bytes, so these
+  writes are unconditional, an existing object of the right size is reused, and
+  blobs above 64 MiB are sent as a multipart upload with a content MD5 per part
+  (no 5 GiB limit). A CAS backend lists nothing (`canEnumerate`, `paths` and
+  `upload` are false, `blobs` is true), refuses chosen keys, and a scan never
+  removes its index locations. A path backend refuses blob keys.
+- `writeSidecar(blobKey, document)` on a CAS backend stores `<blob key>.json`
+  once (an existing sidecar is kept), `readSidecar(blobKey)` returns it, and
+  deleting a blob deletes its sidecar.
 - Before allowing writes, each new driver instance tests conditional creation
   on a random key under `<prefix>/.canvas-probe/`, checks the original bytes,
   and deletes its probe. The key needs ListBucket scoped to the prefix, GetObject

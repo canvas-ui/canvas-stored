@@ -140,7 +140,7 @@ test('S3 Object Lock: a probe version that cannot be removed is hidden, and the 
 });
 test('S3 blob keys are unconditional, deduplicated by size, multipart when large and never listed', async t => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 's3-blob-'));
-    const client = new FakeS3(), s3 = driver(client);
+    const client = new FakeS3(), s3 = driver(client, { mode: 'cas', versioned: true });
     t.after(async () => { await s3.stop(); await fs.rm(root, { recursive: true, force: true }); });
     const file = path.join(root, 'blob');
     await fs.writeFile(file, 'blob bytes');
@@ -154,10 +154,20 @@ test('S3 blob keys are unconditional, deduplicated by size, multipart when large
     const large = `${s3.blobPrefix}ef/01/ef01`;
     assert.equal((await s3.createFrom(large, file)).size, 64 * 1024 ** 2 + 5);
     assert.equal(client.calls.filter(c => c.op === 'UploadPartCommand').length, 2);
+    // CAS mode: nothing is listed, chosen keys are refused, a blob takes its sidecar with it.
     client.add('scope/visible.txt', 'visible');
-    assert.deepEqual((await s3.scan()).files.map(row => row.key), ['visible.txt']);
+    assert.deepEqual((await s3.scan()).files, []);
     assert.equal(s3.listed(key), false);
-    assert.equal(s3.listed('visible.txt'), true);
+    await assert.rejects(s3.put('invoice.txt', 'x'), { code: 'INVALID_KEY' });
+    assert.deepEqual([s3.capabilities.blobs, s3.capabilities.paths, s3.capabilities.upload, s3.capabilities.canEnumerate], [true, false, false, false]);
+    assert.equal(await s3.writeSidecar(key, { schema: 'data/schema/file', data: { title: 'Blob' } }), true);
+    assert.equal(await s3.writeSidecar(key, { schema: 'changed' }), false);
+    assert.equal((await s3.readSidecar(key)).data.title, 'Blob');
+    await s3.delete(key);
+    assert.equal(client.objects.has(`scope/${key}`) || client.objects.has(`scope/${key}.json`), false);
+    const paths = driver(new FakeS3()); t.after(() => paths.stop());
+    assert.equal(paths.capabilities.blobs, false);
+    await assert.rejects(paths.createFrom(key, file), { code: 'INVALID_KEY' });
 });
 test('Stored uploads a blob to its local store and a remote blob prefix; a scan keeps the unlisted location', async t => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'stored-s3-primary-'));
@@ -165,7 +175,7 @@ test('Stored uploads a blob to its local store and a remote blob prefix; a scan 
     const stored = new Stored({ root, checksums: ['sha256'], replication: { autoStart: false } });
     t.after(async () => { await stored.stop(); await fs.rm(root, { recursive: true, force: true }); });
     stored.addBackend('data', { driver: 'cacache', root: path.join(root, 'data') });
-    stored.addBackend('s3:test', { driver: 's3', bucket: 'test', prefix: 'scope', client, versioned: true });
+    stored.addBackend('s3:test', { driver: 's3', bucket: 'test', prefix: 'scope', client, versioned: true, mode: 'cas' });
     const sum = hash('ledger');
     const remoteKey = `.canvas-blobs/${sum.slice(0, 2)}/${sum.slice(2, 4)}/${sum}`;
     const upload = await stored.put(Buffer.from('ledger'), { backends: ['data', 's3:test'] });
@@ -175,8 +185,7 @@ test('Stored uploads a blob to its local store and a remote blob prefix; a scan 
     assert.equal(client.objects.get(`scope/${remoteKey}`).data.toString(), 'ledger');
     const synced = () => stored.stat(upload.id).then(meta => meta.locations.find(l => l.backend === 's3:test'));
     assert.equal((await synced()).synced, true);
-    client.add('scope/report.txt', 'report');
-    assert.equal((await stored.scan('s3:test')).count, 1);
+    assert.equal((await stored.scan('s3:test')).count, 0);
     assert.equal((await synced()).key, remoteKey);
     const puts = () => client.calls.filter(c => c.op === 'PutObjectCommand' && c.input.Key === `scope/${remoteKey}`).length;
     const before = puts();

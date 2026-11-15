@@ -11,11 +11,12 @@ const MAX_PUT = 5 * 1024 ** 3;
 const PART = 64 * 1024 ** 2;
 const MAX_PARTS = 10_000;
 const PROBES = '.canvas-probe/';
-// Content-addressed blobs of a workspace that uses this bucket as its primary
-// data store. Keys are `<BLOBS><aa>/<bb>/<sha256>`: never listed, scanned or
-// mirrored into a tree, and written without a conditional create because the
-// same key always holds the same bytes.
+// Content-addressed blobs: the only keys of a bucket in `mode: 'cas'`. Keys are
+// `<BLOBS><aa>/<bb>/<sha256>`, never listed, scanned or mirrored into a tree,
+// and written without a conditional create because the same key always holds
+// the same bytes. `<blob key>.json` is the blob's optional sidecar.
 const BLOBS = '.canvas-blobs/';
+const SIDECAR = '.json';
 const locked = error => status(error) === 403 || ['AccessDenied', 'InvalidRequest', 'ObjectLocked'].includes(error?.name);
 const fault = (code, message, retryable = false) => Object.assign(new Error(message), { code, retryable });
 const status = error => error?.$metadata?.httpStatusCode;
@@ -27,7 +28,10 @@ const bodyBuffer = async body => {
     return Buffer.concat(chunks);
 };
 
-/** One existing bucket/prefix. Creates of user keys are conditional. Removal is
+/** One existing bucket/prefix in one of two modes, fixed when it is connected.
+ * `mode: 'path'` (default) holds objects under chosen keys: listed, scanned,
+ * conditional creates. `mode: 'cas'` holds only content-addressed blobs under
+ * BLOBS: nothing is listed and chosen keys are refused. Removal is
  * enabled on a versioned bucket (`config.versioned`, detected by the write
  * probe), where a delete adds a delete marker and every earlier version stays
  * in the bucket, or with an explicit `permanentDelete`. Object Lock (WORM)
@@ -62,9 +66,11 @@ export default class S3Backend extends StorageBackend {
         });
     }
     static getCapabilities(config = {}) {
-        return { ...super.getCapabilities(config), delete: config.readOnly !== true && (config.versioned === true || config.permanentDelete === true),
-            canEnumerate: true, remote: true, paths: true, upload: config.readOnly !== true, blobs: config.readOnly !== true };
+        const cas = config.mode === 'cas', writable = config.readOnly !== true;
+        return { ...super.getCapabilities(config), delete: writable && (config.versioned === true || config.permanentDelete === true),
+            canEnumerate: !cas, remote: true, paths: !cas, upload: !cas && writable, blobs: cas && writable };
     }
+    get #cas() { return this.config.mode === 'cas'; }
     /** Key prefix for content-addressed blobs (see BLOBS). */
     get blobPrefix() { return BLOBS; }
     /** False for keys a listing never reports; a scan is no evidence about them. */
@@ -74,6 +80,9 @@ export default class S3Backend extends StorageBackend {
     #safe(key) { return ![...key].some(c => c < ' ' || c === '\\') && !key.split('/').some(s => !s || s === '.' || s === '..'); }
     #key(key) {
         if (typeof key !== 'string' || !this.#safe(key) || key.startsWith(PROBES)) throw fault('INVALID_KEY', 'Invalid or reserved S3 object key');
+        if (key.startsWith(BLOBS) !== this.#cas) {
+            throw fault('INVALID_KEY', this.#cas ? 'This S3 backend stores content-addressed blobs only' : 'Content-addressed blobs need an S3 backend in CAS mode');
+        }
         return this.#prefix + key;
     }
     nativeUrl(key) { return `s3://${this.#bucket}/${this.#key(key).split('/').map(encodeURIComponent).join('/')}`; }
@@ -220,13 +229,30 @@ export default class S3Backend extends StorageBackend {
         }
         return this.stat(key);
     }
+    /** Write the JSON sidecar of a blob once; an existing one is kept. */
+    async writeSidecar(blobKey, document) {
+        if (!this.canWrite) throw fault('READ_ONLY', 'S3 backend is read-only');
+        const key = blobKey + SIDECAR;
+        if (await this.stat(key)) return false;
+        const Body = Buffer.from(JSON.stringify(document));
+        await this.#send(PutObjectCommand, { Key: this.#key(key), Body, ContentLength: Body.length, ContentType: 'application/json',
+            ContentMD5: createHash('md5').update(Body).digest('base64') });
+        return true;
+    }
+    async readSidecar(blobKey) {
+        const data = await this.get(blobKey + SIDECAR);
+        return data ? JSON.parse(data.toString()) : null;
+    }
     async delete(key) {
         if (!this.canDelete) throw fault('DELETE_DISABLED', 'S3 removal needs a versioned bucket (a delete then keeps every earlier version) or an explicit permanentDelete');
         await this.#send(DeleteObjectCommand, { Key: this.#key(key) });
+        // A blob takes its sidecar with it.
+        if (this.#cas && !key.endsWith(SIDECAR)) await this.#send(DeleteObjectCommand, { Key: this.#key(key + SIDECAR) }).catch(() => {});
         this.#hashes.delete(key);
         return true;
     }
     async *list({ prefix = '' } = {}) {
+        if (this.#cas) return;
         if (prefix && !this.#safe(prefix.replace(/\/$/, ''))) throw fault('INVALID_KEY', 'Invalid list prefix');
         let token;
         const seen = new Set();
