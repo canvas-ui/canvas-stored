@@ -3,7 +3,7 @@ import { Readable } from 'node:stream';
 export const credentials = { accessKeyId: 'test-key', secretAccessKey: 'test-secret' };
 const fail = (name, status) => Object.assign(new Error(name), { name, $metadata: { httpStatusCode: status } });
 export class FakeS3 {
-    objects = new Map(); calls = []; versioned = false; objectLock = false; versions = []; uploads = new Map(); ignoreConditional = false; listFailure = false; failKey = null; pageSize = 2; clock = 0; afterGet = null;
+    objects = new Map(); calls = []; versioned = false; objectLock = false; versions = []; uploads = new Map(); ignoreConditional = false; checksums = false; listFailure = false; failKey = null; pageSize = 2; clock = 0; afterGet = null;
     add(key, value) {
         const data = Buffer.from(value);
         this.objects.set(key, { data, ETag: `"${createHash('md5').update(data).digest('hex')}-2"`, LastModified: new Date(1700000000000 + ++this.clock), ContentType: 'text/plain' });
@@ -28,8 +28,11 @@ export class FakeS3 {
             else for await (const chunk of input.Body) chunks.push(chunk);
             const data = Buffer.concat(chunks);
             if (input.ContentMD5 && createHash('md5').update(data).digest('base64') !== input.ContentMD5) throw fail('BadDigest', 400);
+            if (this.checksums && input.ChecksumSHA256 && createHash('sha256').update(data).digest('base64') !== input.ChecksumSHA256) throw fail('BadDigest', 400);
             this.add(Key, data);
+            if (this.checksums && input.ChecksumSHA256) this.objects.get(Key).ChecksumSHA256 = input.ChecksumSHA256;
             this.objects.get(Key).ContentType = input.ContentType || 'application/octet-stream';
+            if (input.Metadata) this.objects.get(Key).Metadata = input.Metadata;
             if (!this.versioned) return { ETag: this.objects.get(Key).ETag };
             const VersionId = `v${this.versions.length + 1}`;
             this.versions.push({ Key, VersionId, data });
@@ -43,7 +46,7 @@ export class FakeS3 {
             this.objects.delete(Key);
             return {};
         }
-        if (op === 'CreateMultipartUploadCommand') { const UploadId = `u${this.uploads.size + 1}`; this.uploads.set(UploadId, new Map()); return { UploadId }; }
+        if (op === 'CreateMultipartUploadCommand') { const UploadId = `u${this.uploads.size + 1}`; this.uploads.set(UploadId, Object.assign(new Map(), { Metadata: input.Metadata })); return { UploadId }; }
         if (op === 'UploadPartCommand') {
             const chunks = []; for await (const chunk of input.Body) chunks.push(chunk);
             const data = Buffer.concat(chunks);
@@ -54,12 +57,13 @@ export class FakeS3 {
         if (op === 'CompleteMultipartUploadCommand') {
             const parts = this.uploads.get(input.UploadId);
             this.add(Key, Buffer.concat(input.MultipartUpload.Parts.map(p => parts.get(p.PartNumber))));
+            if (parts.Metadata) this.objects.get(Key).Metadata = parts.Metadata;
             this.uploads.delete(input.UploadId);
             return {};
         }
         if (op === 'AbortMultipartUploadCommand') { this.uploads.delete(input.UploadId); return {}; }
         if (!row) throw fail('NoSuchKey', 404);
-        if (op === 'HeadObjectCommand') return { ...row, ContentLength: row.data.length };
+        if (op === 'HeadObjectCommand') return { ...row, ContentLength: row.data.length, ChecksumSHA256: input.ChecksumMode === 'ENABLED' ? row.ChecksumSHA256 : undefined };
         if (op === 'GetObjectCommand') {
             if (input.IfMatch && input.IfMatch !== row.ETag) throw fail('PreconditionFailed', 412);
             let data = row.data;

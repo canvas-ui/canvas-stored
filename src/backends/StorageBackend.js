@@ -29,8 +29,8 @@ export default class StorageBackend extends EventEmitter {
     // mutableContainers: can create/rename/delete actual folders, including
     // empty ones. S3 prefixes support paths without supporting container ops.
     // upload: supports create-only keyed uploads via createFrom().
-    // blobs: can hold a workspace's content-addressed blobs under `blobPrefix`
-    // (the remote half of a primary data store).
+    // blobs: holds content-addressed blobs only; every key is derived from the
+    // object's checksum (the remote half of a primary data store).
     static getCapabilities(config = {}) {
         return {
             read: true, write: config.readOnly !== true, delete: config.readOnly !== true,
@@ -38,8 +38,6 @@ export default class StorageBackend extends EventEmitter {
             paths: false, mutableContainers: false, upload: false, blobs: false,
         };
     }
-    /** Key prefix content-addressed blobs are stored under; '' for none. */
-    get blobPrefix() { return ''; }
     /** Whether a complete listing would report `key`. */
     listed(_key) { return true; }
     get capabilities() { return { ...this.constructor.getCapabilities(this.config), remote: this.remote }; }

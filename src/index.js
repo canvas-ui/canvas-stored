@@ -359,7 +359,7 @@ export default class Stored extends EventEmitter2 {
             .filter(t => t.backend);
         if (!targets.length) return { ok: false, reason: 'unknown-backend' };
 
-        const ingestOptions = { mtime: options.mtime ?? null, generatedKey: !key };
+        const ingestOptions = { mtime: options.mtime ?? null };
         const ingest = (isBuffer(blob) || (typeof blob === 'string' && !await isFileAsync(blob)))
             ? await this.#ingestMemory(blob, targets, key, options.mimeType, ingestOptions)
             : (options.adopt && typeof blob === 'string')
@@ -574,7 +574,7 @@ export default class Stored extends EventEmitter2 {
                         await this.#trash.restore(backendName, captured.id).catch(() => {});
                         return { ok: false, reason: 'source-changed', trashId: captured.id };
                     }
-                    try { placed = await backend.createFrom(destKey, tempPath, { owned: true }); }
+                    try { placed = await backend.createFrom(destKey, tempPath, { owned: true, sha256 }); }
                     catch (error) {
                         await this.#trash.restore(backendName, captured.id).catch(() => {});
                         if (error.code === 'EEXIST') return { ok: false, reason: 'precondition-failed', trashId: captured.id };
@@ -582,7 +582,7 @@ export default class Stored extends EventEmitter2 {
                     }
                 } else if (String(options.ifNoneMatch || '').trim() === '*') {
                     if (typeof backend.createFrom !== 'function') return { ok: false, reason: 'unsupported-backend' };
-                    try { placed = await backend.createFrom(destKey, tempPath, { owned: true }); }
+                    try { placed = await backend.createFrom(destKey, tempPath, { owned: true, sha256 }); }
                     catch (error) {
                         if (error.code === 'EEXIST') return { ok: false, reason: 'precondition-failed', current: null };
                         throw error;
@@ -1328,7 +1328,7 @@ export default class Stored extends EventEmitter2 {
 
         const { meta, sourceLocation, sourceBackend, targets, destKey } = plan;
         this.#replicas.assertIdleEndpoint(sourceLocation.backend, sourceLocation.key);
-        for (const target of targets) this.#replicas.assertIdleEndpoint(target.name, destKey);
+        for (const target of targets) this.#replicas.assertIdleEndpoint(target.name, target.key || destKey);
         if (!targets.length) {
             return { ok: true, id: meta.id, state: 'complete', unchanged: true, locations: await this.locations(meta.id) };
         }
@@ -1682,14 +1682,16 @@ export default class Stored extends EventEmitter2 {
         // segment ('Fotky//2019') writes a file the OS reports back under the
         // collapsed path, and the watcher would then index it a SECOND time as
         // a new location. The index must spell keys the way the filesystem does.
-        const destKey = this.#normalizeKey(options.key || sourceLocation.key);
-        if (!destKey) return { ok: false, reason: 'invalid-key' };
+        const chosenKey = this.#normalizeKey(options.key || sourceLocation.key);
+        if (!chosenKey) return { ok: false, reason: 'invalid-key' };
         const conflictKey = options.conflictKey ? this.#normalizeKey(options.conflictKey) : null;
         const targets = [];
         for (const name of toNames) {
             const backend = this.#backends.get(name);
             if (!backend) return { ok: false, reason: 'unknown-backend', backend: name };
             if (!backend.canWrite) return { ok: false, reason: 'read-only-target', backend: name };
+            // A content store names every object by its checksum.
+            const destKey = backend.capabilities.blobs ? this.#generateKey(meta.checksums) : chosenKey;
             if (name === sourceLocation.backend && destKey === sourceLocation.key) continue;
             // Already recorded there — but only skip if the bytes are REALLY
             // there. An index that outlived its file (deleted behind our back,
@@ -1713,7 +1715,7 @@ export default class Stored extends EventEmitter2 {
             // over them is silent data loss, so it takes an explicit policy.
             let key = destKey;
             let overwrite = false;
-            if (present && !ours && !this.#isSameContent(name, destKey, meta.id)) {
+            if (present && !ours && !backend.capabilities.blobs && !this.#isSameContent(name, destKey, meta.id)) {
                 if (onConflict === 'error') return { ok: false, reason: 'target-exists', backend: name, key: destKey };
                 if (onConflict === 'rename') {
                     // A caller-chosen conflict name (`… (conflict from laptop …).ext`)
@@ -1730,7 +1732,7 @@ export default class Stored extends EventEmitter2 {
             targets.push({ name, backend, key, overwrite });
         }
 
-        return { ok: true, meta, sourceLocation, sourceBackend, targets, destKey };
+        return { ok: true, meta, sourceLocation, sourceBackend, targets, destKey: chosenKey };
     }
 
     /** Do the bytes already on `key` happen to BE this content? Then it is not a conflict. */
@@ -2369,8 +2371,7 @@ export default class Stored extends EventEmitter2 {
             // A target may carry its own key: conflict resolution can rename per
             // backend (`photo.jpg` is free on one, taken on another). `put()`
             // targets never do, so they all land on `finalKey`.
-            // A content-derived key lands under the backend's blob prefix.
-            const targetKey = key || (options.generatedKey ? `${backend.blobPrefix || ''}${finalKey}` : finalKey);
+            const targetKey = key || finalKey;
             if (backend.type === 'local') {
                 if (overwrite) await this.#retain(name, targetKey, this.#index.get(`${name}:${targetKey}`));
                 if (source.data) await backend.put(targetKey, source.data);

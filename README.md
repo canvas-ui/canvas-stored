@@ -220,13 +220,25 @@ endpoint requires a new backend to preserve existing locations and pending plans
   backend holds objects under chosen keys and behaves as described above. A CAS
   backend holds content-addressed blobs only: `stored.put(blob, { backends:
   ['data', 's3:name'] })` without a `key` writes the blob to the local store
-  and queues an upload to `<prefix>/.canvas-blobs/<aa>/<bb>/<sha256>`
-  (`backend.blobPrefix`). The same key always holds the same bytes, so these
+  and queues an upload to `<prefix>/<aa>/<bb>/<sha256>`: the configured
+  prefix is the blob root. `stored.copy(id, { to: 's3:name' })` lands on the
+  same key whatever `key` was asked for. The same key always holds the same bytes, so these
   writes are unconditional, an existing object of the right size is reused, and
   blobs above 64 MiB are sent as a multipart upload with a content MD5 per part
   (no 5 GiB limit). A CAS backend lists nothing (`canEnumerate`, `paths` and
-  `upload` are false, `blobs` is true), refuses chosen keys, and a scan never
-  removes its index locations. A path backend refuses blob keys.
+  `upload` are false, `blobs` is true) and a scan never removes its index
+  locations.
+- Each driver instance probes once whether the endpoint checks
+  `x-amz-checksum-sha256`: it must refuse a wrong value and report the right
+  one back (`verifyWrites()` returns this as `sha256`). If so, an upload sends
+  the file's SHA-256 for the endpoint to check, reusing the checksum the caller
+  passes (`createFrom(key, file, { sha256 })`, which `Stored` does), so the
+  file is not hashed again. Otherwise the upload sends a Content-MD5. Multipart
+  parts always carry an MD5, because a multipart SHA-256 is not the file's.
+  Either way the object's SHA-256 is recorded as user metadata
+  (`x-amz-meta-sha256`). `stat()` returns it as `sha256`, and the replica executor accepts it as the verified content
+  identity, so an upload is not downloaded again to verify it. Objects written
+  by anything else carry no such metadata and are read back and hashed.
 - `writeSidecar(blobKey, document)` on a CAS backend stores `<blob key>.json`
   once (an existing sidecar is kept), `readSidecar(blobKey)` returns it, and
   deleting a blob deletes its sidecar.
@@ -235,8 +247,7 @@ endpoint requires a new backend to preserve existing locations and pending plans
   and deletes its probe. The key needs ListBucket scoped to the prefix, GetObject
   and PutObject, plus DeleteObject on the probe prefix (DeleteObjectVersion on
   versioned buckets). An endpoint that ignores preconditions is rejected before
-  writing user keys. Read-only connections do not probe writes. The probe
-  result includes `versioned` (the bucket returned a version id). Under Object
+  writing user keys. Read-only connections do not probe writes. Under Object
   Lock a probe version cannot be removed before its retention ends; it is
   hidden behind a delete marker and the connection still verifies.
 - ETags are observation tokens, **never content checksums or rename identity**.
@@ -248,12 +259,10 @@ endpoint requires a new backend to preserve existing locations and pending plans
   `rename` conflicts. The existing durable replica executor verifies each exact
   destination before releasing staging. Full mirrors, overwrite and automated
   removal are refused.
-- `delete()` works with `versioned: true` (set it from the probe result): on a
-  versioned bucket a delete adds a delete marker and every earlier version
-  stays in the bucket, so the removal is recoverable there. Object Lock (WORM)
-  protects object versions and does not reject a delete marker. On an
-  unversioned bucket `delete()` needs an explicit `permanentDelete: true`.
-  Neither setting enables mirror capabilities.
+- `delete()` needs an explicit `permanentDelete: true`, which does not enable
+  mirror capabilities. Bucket versioning and Object Lock retention are not
+  managed: a delete on a versioned bucket adds a delete marker like any other
+  S3 client's would.
 
 `tests/s3.test.js` covers collision protection, incompatible endpoints, failed
 enumeration, mid-read changes and replica recovery. Run the live test against an
@@ -558,7 +567,7 @@ Registered in `BackendManager` via `DRIVERS`:
 | `file` | `local` | complete | CRUD, chokidar `watch`, `scan` |
 | `cacache` | `local` | complete | Content-addressable blob store (cacache); CRUD, no `watch`/`scan` |
 | `http` | `remote` | partial | Read-only `get` / `stat` via `fetch`; `config.baseUrl`, `headers` |
-| `s3` | `remote` | filing/read/blob support | Conditional creates, content-addressed blobs, streaming reads, scan/poll, deletes on versioned buckets; mirrors and overwrite disabled |
+| `s3` | `remote` | filing/read/blob support | Conditional creates, content-addressed blobs, streaming reads, scan/poll, opt-in deletes; mirrors and overwrite disabled |
 
 Each backend implements `StorageBackend`: `put`, `get`, `delete`, `stat`, `list`; optional `commit` (local, for streaming put), `watch`, `scan`, `stop`.
 

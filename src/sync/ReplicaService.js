@@ -448,6 +448,9 @@ export default class ReplicaService extends EventEmitter {
         const stat = endpoint.kind === 'directory' ? await backend.statContainer(endpoint.key) : await backend.stat(endpoint.key);
         if (!stat) return null;
         if (endpoint.kind === 'directory') return { kind: 'directory' };
+        // A driver reports `sha256` only for bytes the remote verified on
+        // upload; anything else is read back and hashed.
+        if (stat.sha256) return { id: `sha256:${stat.sha256}`, stat };
         const input = await backend.get(endpoint.key, { stream: true });
         if (!input) throw failure('SOURCE_CHANGED', `Cannot read ${endpoint.backend}:${endpoint.key}`, true);
         const hash = createHash('sha256');

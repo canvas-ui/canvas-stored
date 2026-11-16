@@ -11,12 +11,9 @@ const MAX_PUT = 5 * 1024 ** 3;
 const PART = 64 * 1024 ** 2;
 const MAX_PARTS = 10_000;
 const PROBES = '.canvas-probe/';
-// Content-addressed blobs: the only keys of a bucket in `mode: 'cas'`. Keys are
-// `<BLOBS><aa>/<bb>/<sha256>`, never listed, scanned or mirrored into a tree,
-// and written without a conditional create because the same key always holds
-// the same bytes. `<blob key>.json` is the blob's optional sidecar.
-const BLOBS = '.canvas-blobs/';
+// `<blob key>.json` is the optional sidecar of a blob in `mode: 'cas'`.
 const SIDECAR = '.json';
+const SHA256 = /^[a-f0-9]{64}$/;
 const locked = error => status(error) === 403 || ['AccessDenied', 'InvalidRequest', 'ObjectLocked'].includes(error?.name);
 const fault = (code, message, retryable = false) => Object.assign(new Error(message), { code, retryable });
 const status = error => error?.$metadata?.httpStatusCode;
@@ -30,16 +27,14 @@ const bodyBuffer = async body => {
 
 /** One existing bucket/prefix in one of two modes, fixed when it is connected.
  * `mode: 'path'` (default) holds objects under chosen keys: listed, scanned,
- * conditional creates. `mode: 'cas'` holds only content-addressed blobs under
- * BLOBS: nothing is listed and chosen keys are refused. Removal is
- * enabled on a versioned bucket (`config.versioned`, detected by the write
- * probe), where a delete adds a delete marker and every earlier version stays
- * in the bucket, or with an explicit `permanentDelete`. Object Lock (WORM)
- * applies to object versions, so it never blocks a delete marker. ETags and
+ * conditional creates. `mode: 'cas'` makes the prefix a content store: every key
+ * is `<aa>/<bb>/<sha256>` directly under it, nothing is listed or scanned, and
+ * writes are unconditional because the same key always holds the same bytes.
+ * Removal needs an explicit `permanentDelete`. ETags and
  * version IDs are observation tokens, never content checksums or stable
  * inodes. No implicit host IAM credentials. */
 export default class S3Backend extends StorageBackend {
-    #client; #bucket; #prefix; #timer; #polling; #rows = new Map(); #hashes = new Map(); #writeCheck;
+    #client; #bucket; #prefix; #timer; #polling; #rows = new Map(); #hashes = new Map(); #writeCheck; #checksumCheck;
     constructor(name, config = {}) {
         super(name, config);
         this.type = 'remote';
@@ -67,22 +62,17 @@ export default class S3Backend extends StorageBackend {
     }
     static getCapabilities(config = {}) {
         const cas = config.mode === 'cas', writable = config.readOnly !== true;
-        return { ...super.getCapabilities(config), delete: writable && (config.versioned === true || config.permanentDelete === true),
+        return { ...super.getCapabilities(config), delete: writable && config.permanentDelete === true,
             canEnumerate: !cas, remote: true, paths: !cas, upload: !cas && writable, blobs: cas && writable };
     }
     get #cas() { return this.config.mode === 'cas'; }
-    /** Key prefix for content-addressed blobs (see BLOBS). */
-    get blobPrefix() { return BLOBS; }
-    /** False for keys a listing never reports; a scan is no evidence about them. */
-    listed(key) { return !String(key).startsWith(BLOBS); }
+    /** A content store is never listed; a scan is no evidence about its keys. */
+    listed() { return !this.#cas; }
     get transport() { return 's3'; }
     get watching() { return Boolean(this.#timer); }
     #safe(key) { return ![...key].some(c => c < ' ' || c === '\\') && !key.split('/').some(s => !s || s === '.' || s === '..'); }
     #key(key) {
         if (typeof key !== 'string' || !this.#safe(key) || key.startsWith(PROBES)) throw fault('INVALID_KEY', 'Invalid or reserved S3 object key');
-        if (key.startsWith(BLOBS) !== this.#cas) {
-            throw fault('INVALID_KEY', this.#cas ? 'This S3 backend stores content-addressed blobs only' : 'Content-addressed blobs need an S3 backend in CAS mode');
-        }
         return this.#prefix + key;
     }
     nativeUrl(key) { return `s3://${this.#bucket}/${this.#key(key).split('/').map(encodeURIComponent).join('/')}`; }
@@ -106,7 +96,46 @@ export default class S3Backend extends StorageBackend {
     async verifyWrites() {
         if (!this.canWrite) throw fault('READ_ONLY', 'S3 backend is read-only');
         if (!this.#writeCheck) this.#writeCheck = this.#probeWrites().catch(error => { this.#writeCheck = null; throw error; });
-        return this.#writeCheck;
+        return { ...await this.#writeCheck, sha256: await this.#nativeSha256() };
+    }
+    /** Whether the endpoint checks `x-amz-checksum-sha256` on upload: it must
+     * refuse a wrong value and report the right one back. Anything else,
+     * including an endpoint that ignores the header, means Content-MD5. */
+    #nativeSha256() {
+        if (!this.#checksumCheck) this.#checksumCheck = this.#probeChecksum();
+        return this.#checksumCheck;
+    }
+    async #probeChecksum() {
+        const Key = this.#prefix + PROBES + randomUUID(), Body = Buffer.from('canvas-probe');
+        const right = createHash('sha256').update(Body).digest('base64'), wrong = createHash('sha256').update('not the body').digest('base64');
+        const versions = [];
+        try {
+            try {
+                versions.push((await this.#send(PutObjectCommand, { Key, Body, ChecksumSHA256: wrong })).VersionId);
+                return false;
+            } catch (error) { if (status(error) !== 400) return false; }
+            versions.push((await this.#send(PutObjectCommand, { Key, Body, ChecksumSHA256: right })).VersionId);
+            return (await this.#send(HeadObjectCommand, { Key, ChecksumMode: 'ENABLED' })).ChecksumSHA256 === right;
+        } catch { return false; }
+        finally {
+            let hidden = false;
+            for (const VersionId of versions.length ? versions : [undefined]) {
+                const removed = await this.#send(DeleteObjectCommand, { Key, ...(VersionId ? { VersionId } : {}) }).then(() => true, () => false);
+                if (!removed && !hidden) { hidden = true; await this.#send(DeleteObjectCommand, { Key }).catch(() => {}); }
+            }
+        }
+    }
+    /** Integrity fields of one PUT. The SHA-256 the caller already computed is
+     * reused; `hash(algorithms)` runs only for what is still missing: nothing
+     * when the endpoint checks SHA-256 itself, MD5 otherwise. */
+    async #integrity(sha256, hash) {
+        const native = await this.#nativeSha256();
+        const known = SHA256.test(sha256 || '') ? { sha256 } : {};
+        const missing = [...(native ? [] : ['md5']), ...(known.sha256 ? [] : ['sha256'])];
+        const sums = { ...known, ...(missing.length ? await hash(missing) : {}) };
+        return { Metadata: { sha256: sums.sha256 }, ...(native
+            ? { ChecksumSHA256: Buffer.from(sums.sha256, 'hex').toString('base64') }
+            : { ContentMD5: Buffer.from(sums.md5, 'hex').toString('base64') }) };
     }
     async #probeWrites() {
         const Key = this.#prefix + PROBES + randomUUID();
@@ -123,8 +152,7 @@ export default class S3Backend extends StorageBackend {
             const found = await this.#send(GetObjectCommand, { Key });
             const bytes = await bodyBuffer(found.Body);
             if (!rejected || bytes.toString() !== 'canvas-probe') throw fault('CONDITIONAL_WRITES_UNSUPPORTED', 'S3 endpoint does not enforce If-None-Match; user-key writes are disabled');
-            // A versioned bucket returns a version id for every write.
-            outcome = { ok: true, conditionalCreate: true, versioned: Boolean(first.VersionId) && first.VersionId !== 'null' };
+            outcome = { ok: true, conditionalCreate: true };
         } finally {
             // Exact random keys only, including any versions created by a
             // nonconforming endpoint; never sweep a user prefix.
@@ -147,7 +175,10 @@ export default class S3Backend extends StorageBackend {
     #row(key, result) {
         return { backend: this.name, key, size: Number(result.ContentLength ?? result.Size ?? 0),
             modified: result.LastModified?.getTime() ?? null, mimeType: result.ContentType || 'application/octet-stream',
-            id: JSON.stringify([result.ETag || null, result.VersionId || null]), etag: result.ETag, versionId: result.VersionId };
+            id: JSON.stringify([result.ETag || null, result.VersionId || null]), etag: result.ETag, versionId: result.VersionId,
+            // Recorded by this driver on an upload the endpoint checked (its
+            // SHA-256 or Content-MD5); absent on objects written by anything else.
+            sha256: SHA256.test(result.Metadata?.sha256 || '') ? result.Metadata.sha256 : null };
     }
     async stat(key) {
         try { return this.#row(key, await this.#send(HeadObjectCommand, { Key: this.#key(key) })); }
@@ -167,12 +198,13 @@ export default class S3Backend extends StorageBackend {
     async put(key, data) {
         if (!Buffer.isBuffer(data) && typeof data !== 'string') throw fault('SIZE_REQUIRED', 'Use createFrom for streamed S3 uploads with a known size');
         const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
-        return this.#create(key, buffer, buffer.length, checksumBuffer(buffer, ['md5']), await detectMimeFromHead(buffer.subarray(0, 4096), key));
+        return this.#create(key, buffer, buffer.length, await this.#integrity(null, algorithms => checksumBuffer(buffer, algorithms)), await detectMimeFromHead(buffer.subarray(0, 4096), key));
     }
     async commit(key, file) { return this.createFrom(key, file); }
-    async createFrom(key, file) {
+    /** `sha256` (hex) is the file's checksum when the caller already has it. */
+    async createFrom(key, file, { sha256 } = {}) {
         const { size } = await fs.stat(file);
-        if (key.startsWith(BLOBS)) return this.#createBlob(key, file, size);
+        if (this.#cas) return this.#createBlob(key, file, size, sha256);
         if (size > MAX_PUT) throw fault('OBJECT_TOO_LARGE', 'S3 uploads to a chosen path support objects up to 5 GiB');
         const handle = await fs.open(file, 'r');
         let head;
@@ -181,35 +213,38 @@ export default class S3Backend extends StorageBackend {
             const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
             head = buffer.subarray(0, bytesRead);
         } finally { await handle.close(); }
-        const sums = await checksumFile(file, ['md5']);
+        const integrity = await this.#integrity(sha256, algorithms => checksumFile(file, algorithms));
         const input = createReadStream(file);
-        try { return await this.#create(key, input, size, sums, await detectMimeFromHead(head, key)); }
+        try { return await this.#create(key, input, size, integrity, await detectMimeFromHead(head, key)); }
         finally { input.destroy(); }
     }
-    async #create(key, Body, ContentLength, checksums, ContentType) {
+    async #create(key, Body, ContentLength, integrity, ContentType) {
         const Key = this.#key(key);
         if (ContentLength > MAX_PUT) throw fault('OBJECT_TOO_LARGE', 'S3 uploads currently support objects up to 5 GiB');
         await this.verifyWrites();
-        await this.#send(PutObjectCommand, { Key, Body, ContentLength, ContentType, ContentMD5: Buffer.from(checksums.md5, 'hex').toString('base64'), IfNoneMatch: '*' });
+        await this.#send(PutObjectCommand, { Key, Body, ContentLength, ContentType, ...integrity, IfNoneMatch: '*' });
         this.#hashes.delete(key);
         return this.stat(key);
     }
     /** Same key, same bytes: an existing object of the right size is the
      * upload. Large blobs go up in parts, each with its own MD5. */
-    async #createBlob(key, file, size) {
+    async #createBlob(key, file, size, sha256) {
         const Key = this.#key(key);
         if (!this.canWrite) throw fault('READ_ONLY', 'S3 backend is read-only');
         const existing = await this.stat(key);
         if (existing?.size === size) return existing;
         if (size <= PART) {
-            const sums = await checksumFile(file, ['md5']);
+            const integrity = await this.#integrity(sha256, algorithms => checksumFile(file, algorithms));
             const input = createReadStream(file);
-            try { await this.#send(PutObjectCommand, { Key, Body: input, ContentLength: size, ContentType: 'application/octet-stream', ContentMD5: Buffer.from(sums.md5, 'hex').toString('base64') }); }
+            try { await this.#send(PutObjectCommand, { Key, Body: input, ContentLength: size, ContentType: 'application/octet-stream', ...integrity }); }
             finally { input.destroy(); }
             return this.stat(key);
         }
         const partSize = Math.max(PART, Math.ceil(size / MAX_PARTS));
-        const { UploadId } = await this.#send(CreateMultipartUploadCommand, { Key, ContentType: 'application/octet-stream' });
+        // Parts are checked by their MD5: a multipart SHA-256 is a checksum of
+        // part checksums, not the file's.
+        const whole = SHA256.test(sha256 || '') ? sha256 : (await checksumFile(file, ['sha256'])).sha256;
+        const { UploadId } = await this.#send(CreateMultipartUploadCommand, { Key, ContentType: 'application/octet-stream', Metadata: { sha256: whole } });
         try {
             const Parts = [];
             for (let start = 0, PartNumber = 1; start < size; start += partSize, PartNumber++) {
@@ -244,7 +279,7 @@ export default class S3Backend extends StorageBackend {
         return data ? JSON.parse(data.toString()) : null;
     }
     async delete(key) {
-        if (!this.canDelete) throw fault('DELETE_DISABLED', 'S3 removal needs a versioned bucket (a delete then keeps every earlier version) or an explicit permanentDelete');
+        if (!this.canDelete) throw fault('DELETE_DISABLED', 'S3 removal needs an explicit permanentDelete');
         await this.#send(DeleteObjectCommand, { Key: this.#key(key) });
         // A blob takes its sidecar with it.
         if (this.#cas && !key.endsWith(SIDECAR)) await this.#send(DeleteObjectCommand, { Key: this.#key(key + SIDECAR) }).catch(() => {});
@@ -262,7 +297,7 @@ export default class S3Backend extends StorageBackend {
                 const absolute = result.EncodingType === 'url' ? decodeURIComponent(item.Key) : item.Key;
                 if (typeof absolute !== 'string' || !absolute.startsWith(this.#prefix)) throw fault('INVALID_LIST', 'S3 listing escaped the configured prefix');
                 const key = absolute.slice(this.#prefix.length);
-                if (!key || key.endsWith('/') || key.startsWith(PROBES) || key.startsWith(BLOBS)) continue;
+                if (!key || key.endsWith('/') || key.startsWith(PROBES)) continue;
                 if (!this.#safe(key)) throw fault('UNSUPPORTED_KEY', `S3 key cannot be represented safely: ${key}`);
                 yield this.#row(key, item);
             }
