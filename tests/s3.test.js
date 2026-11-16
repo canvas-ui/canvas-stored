@@ -357,3 +357,25 @@ test('Stored uploads to chosen S3 paths side by side, outside the write lock, an
     assert.equal((await stored.stat(same.id)).locations[0].synced, true);
     assert.equal(client.calls.filter(c => c.op === 'PutObjectCommand' && c.input.Key === 'scope/Reports/same.txt').length, 0);
 });
+
+test('forgetting a removed backend cancels work that targets it and owners stop claiming its replicas', async t => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'stored-s3-forget-'));
+    const client = new FakeS3();
+    const stored = new Stored({ root, checksums: ['sha256'], replication: { autoStart: false } });
+    t.after(async () => { await stored.stop(); await fs.rm(root, { recursive: true, force: true }); });
+    stored.addBackend('data', { driver: 'cacache', root: path.join(root, 'data') });
+    stored.addBackend('s3:test', { driver: 's3', bucket: 'test', prefix: 'scope', client, mode: 'cas' });
+    const done = await stored.put(Buffer.from('uploaded'), { backends: ['data', 's3:test'] });
+    await stored.replicas.drain();
+    client.failKey = `scope/${blobKey(hash('stuck'))}`;
+    const stuck = await stored.put(Buffer.from('stuck'), { backends: ['data', 's3:test'] });
+    await stored.replicas.drain();
+    assert.equal(stored.replicas.counts().blocked, 1);
+    assert.ok(stored.replicas.owners().some(owner => owner.replicas.some(r => r.backend === 's3:test')));
+    await stored.removeBackend('s3:test');
+    assert.equal(await stored.replicas.forgetBackend('s3:test'), 1);
+    assert.deepEqual(stored.replicas.counts(), { pending: 0, running: 0, blocked: 0 });
+    assert.ok(!stored.replicas.owners().some(owner => owner.replicas.some(r => r.backend === 's3:test')));
+    for (const put of [done, stuck]) assert.deepEqual((await stored.stat(put.id)).locations.map(l => l.backend), ['data']);
+    assert.equal((await stored.get(stuck.id)).toString(), 'stuck');
+});

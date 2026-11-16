@@ -410,13 +410,32 @@ export default class ReplicaService extends EventEmitter {
             if (!op) throw failure('NOT_FOUND', 'Operation not found');
             if (terminal(op.state)) return op;
             if (op.plan.release?.length || op.plan.replicas.some(r => r.mirror !== false)) throw failure('UNSUPPORTED_CANCEL', 'Only copies can be cancelled; change the storage policy instead');
-            this.#save(op, { state: 'cancelled', phase: 'cancelled' });
-            const pending = op.plan.replicas.filter((r, i) => op.outcomes[i]?.state !== 'verified');
-            const kept = this.#stored.forgetPendingReplicas(op.plan.contentId, pending);
-            if (op.stageKey) await this.#stored.cache.delete(op.stageKey);
-            const shared = [...this.#unfinished()].some(value => value.plan.sourceCacheKey === op.plan.sourceCacheKey);
-            if (op.plan.sourceCacheKey && kept && !shared) await this.#stored.cache.delete(op.plan.sourceCacheKey);
+            await this.#abandon(op);
             return op;
+        });
+    }
+    async #abandon(op) {
+        this.#save(op, { state: 'cancelled', phase: 'cancelled' });
+        const pending = op.plan.replicas.filter((r, i) => op.outcomes[i]?.state !== 'verified');
+        const kept = this.#stored.forgetPendingReplicas(op.plan.contentId, pending);
+        if (op.stageKey) await this.#stored.cache.delete(op.stageKey);
+        const shared = [...this.#unfinished()].some(value => value.plan.sourceCacheKey === op.plan.sourceCacheKey);
+        if (op.plan.sourceCacheKey && kept && !shared) await this.#stored.cache.delete(op.plan.sourceCacheKey);
+    }
+    /** A backend was removed for good. Unfinished work that reads from it or
+     * writes to it is cancelled and owners stop claiming replicas on it, so
+     * nothing keeps asking for a backend that will not come back. Returns how
+     * many owners changed. */
+    async forgetBackend(name) {
+        return this.#stored.withStorageMutation(async () => {
+            for (const value of [...this.#unfinished()]) {
+                if ([...value.plan.replicas, ...(value.plan.source ? [value.plan.source] : [])].some(r => r.backend === name)) await this.#abandon(clone(value));
+            }
+            const changed = this.owners().filter(owner => owner.replicas.some(r => r.backend === name));
+            this.#updateOwners(() => {
+                for (const owner of changed) this.#owners.putSync(owner.owner, { ...owner, replicas: owner.replicas.filter(r => r.backend !== name) });
+            });
+            return changed.length;
         });
     }
     /** Cancel every blocked copy. Returns how many. */

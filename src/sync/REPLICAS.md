@@ -37,7 +37,9 @@ Transient failures retry with backoff, permanent conflicts wait for `retry(id)`
 or `retryBlocked()`. A copy-only operation (no mirror target, nothing to
 release) can be given up with `cancel(id)` or `cancelBlocked()`: destinations
 that never received the bytes lose their placeholder location and existing
-copies stay.
+copies stay. `forgetBackend(name)` is for a backend that was removed for good:
+unfinished work that reads from it or writes to it is cancelled and owners stop
+claiming replicas on it.
 
 A transfer (an upload or copy queued through the SyncQueue) to remote backends
 skips the phases below. It is copy-only, its source is pinned in the cache and
