@@ -33,7 +33,18 @@ accepted only with recovery support. A changed destination blocks the operation.
 
 All mutations share one reentrant executor with the public Stored API. Unfinished
 operations serialize by owner; one blocked owner does not stop unrelated work.
-Transient failures retry with backoff, permanent conflicts wait for `retry(id)`.
+Transient failures retry with backoff, permanent conflicts wait for `retry(id)`
+or `retryBlocked()`. A copy-only operation (no mirror target, nothing to
+release) can be given up with `cancel(id)` or `cancelBlocked()`: destinations
+that never received the bytes lose their placeholder location and existing
+copies stay.
+
+A copy to a content store (a backend with the `blobs` capability) skips the
+phases below. Its key is its checksum, so nothing is staged, resolved or
+retired: the backend uploads the cached file, the endpoint checks the bytes,
+and only the bookkeeping takes the executor lock. Six such uploads run at once.
+Unfinished operations are tracked in memory, so a pass never rereads the
+receipts of finished ones.
 `list({ active: true })` lists pending/blocked operations without completed history
 hiding current work. `owner(id)` exposes verified exact-key ownership and content
 versions. `audit(id)` verifies actual physical bytes rather than index presence.

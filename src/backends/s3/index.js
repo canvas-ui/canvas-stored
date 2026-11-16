@@ -1,19 +1,18 @@
-import { createReadStream, promises as fs } from 'node:fs';
-import { randomUUID } from 'node:crypto';
-import { S3Client, ListObjectsV2Command, HeadObjectCommand, GetObjectCommand, PutObjectCommand, DeleteObjectCommand,
-    CreateMultipartUploadCommand, UploadPartCommand, CompleteMultipartUploadCommand, AbortMultipartUploadCommand } from '@aws-sdk/client-s3';
+import { promises as fs } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { Worker } from 'node:worker_threads';
+import { S3Client, ListObjectsV2Command, HeadObjectCommand, GetObjectCommand, PutObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
 import StorageBackend from '../StorageBackend.js';
-import { createHash } from 'node:crypto';
-import { checksumBuffer, checksumFile, checksumStream } from '../../utils/checksum.js';
+import { checksumBuffer, checksumStream } from '../../utils/checksum.js';
 import { detectMimeFromHead } from '../../utils/mime.js';
+import { PART, classify, uploadFile } from './upload.js';
 
 const MAX_PUT = 5 * 1024 ** 3;
-const PART = 64 * 1024 ** 2;
-const MAX_PARTS = 10_000;
 const PROBES = '.canvas-probe/';
 // `<blob key>.json` is the optional sidecar of a blob in `mode: 'cas'`.
 const SIDECAR = '.json';
 const SHA256 = /^[a-f0-9]{64}$/;
+const BLOB_KEY = /^(?:.*\/)?([a-f0-9]{64})$/;
 const locked = error => status(error) === 403 || ['AccessDenied', 'InvalidRequest', 'ObjectLocked'].includes(error?.name);
 const fault = (code, message, retryable = false) => Object.assign(new Error(message), { code, retryable });
 const status = error => error?.$metadata?.httpStatusCode;
@@ -30,11 +29,13 @@ const bodyBuffer = async body => {
  * conditional creates. `mode: 'cas'` makes the prefix a content store: every key
  * is `<aa>/<bb>/<sha256>` directly under it, nothing is listed or scanned, and
  * writes are unconditional because the same key always holds the same bytes.
- * Removal needs an explicit `permanentDelete`. ETags and
+ * Removal is on unless `permanentDelete` is false. File uploads run on the
+ * backend's own thread (`upload-worker.js`). ETags and
  * version IDs are observation tokens, never content checksums or stable
  * inodes. No implicit host IAM credentials. */
 export default class S3Backend extends StorageBackend {
     #client; #bucket; #prefix; #timer; #polling; #rows = new Map(); #hashes = new Map(); #writeCheck; #checksumCheck;
+    #clientConfig = null; #worker = null; #jobs = new Map(); #jobSeq = 0;
     constructor(name, config = {}) {
         super(name, config);
         this.type = 'remote';
@@ -53,16 +54,48 @@ export default class S3Backend extends StorageBackend {
             ...(config.sessionToken ? { sessionToken: config.sessionToken } : {}),
         } : null);
         if (!credentials && !config.client) throw fault('INVALID_CONFIG', 'S3 accessKeyId and secretAccessKey are required');
-        this.#client = config.client || new S3Client({
+        const clientConfig = {
             region: config.region || 'us-east-1', endpoint: endpoint?.href,
             forcePathStyle: config.forcePathStyle ?? Boolean(endpoint), credentials,
             requestChecksumCalculation: 'WHEN_REQUIRED', responseChecksumValidation: 'WHEN_REQUIRED',
             requestHandler: { connectionTimeout: 10_000, requestTimeout: 120_000 }, maxAttempts: 3,
+        };
+        this.#client = config.client || new S3Client(clientConfig);
+        // An injected client or a credential provider function cannot cross
+        // into a thread; those uploads run on the calling thread.
+        if (!config.client && typeof credentials !== 'function') this.#clientConfig = clientConfig;
+    }
+    /** Run one file upload on the backend's upload thread. */
+    #upload(job) {
+        const input = { Bucket: this.#bucket, ...job };
+        if (!this.#clientConfig) return uploadFile(this.#client, input);
+        if (!this.#worker) {
+            const worker = new Worker(new URL('./upload-worker.js', import.meta.url), { workerData: { client: this.#clientConfig } });
+            worker.unref();
+            const lost = error => {
+                if (this.#worker === worker) this.#worker = null;
+                for (const [id, { reject }] of this.#jobs) { this.#jobs.delete(id); reject(fault('UPLOAD_INTERRUPTED', `S3 upload thread stopped: ${error?.message || 'exit'}`, true)); }
+            };
+            worker.on('message', ({ id, result, error }) => {
+                const pending = this.#jobs.get(id);
+                if (!pending) return;
+                this.#jobs.delete(id);
+                if (error) pending.reject(Object.assign(new Error(error.message), error));
+                else pending.resolve(result);
+            });
+            worker.on('error', lost);
+            worker.on('exit', () => lost());
+            this.#worker = worker;
+        }
+        return new Promise((resolve, reject) => {
+            const id = ++this.#jobSeq;
+            this.#jobs.set(id, { resolve, reject });
+            this.#worker.postMessage({ id, job: input });
         });
     }
     static getCapabilities(config = {}) {
         const cas = config.mode === 'cas', writable = config.readOnly !== true;
-        return { ...super.getCapabilities(config), delete: writable && config.permanentDelete === true,
+        return { ...super.getCapabilities(config), delete: writable && config.permanentDelete !== false,
             canEnumerate: !cas, remote: true, paths: !cas, upload: !cas && writable, blobs: cas && writable };
     }
     get #cas() { return this.config.mode === 'cas'; }
@@ -78,11 +111,7 @@ export default class S3Backend extends StorageBackend {
     nativeUrl(key) { return `s3://${this.#bucket}/${this.#key(key).split('/').map(encodeURIComponent).join('/')}`; }
     async #send(Command, input) {
         try { return await this.#client.send(new Command({ Bucket: this.#bucket, ...input })); }
-        catch (error) {
-            if (status(error) === 412) throw fault('EEXIST', 'S3 precondition failed: destination exists or source changed');
-            if (status(error) === 409 || status(error) >= 500 || ['SlowDown', 'RequestTimeout', 'TimeoutError'].includes(error.name)) error.retryable = true;
-            throw error;
-        }
+        catch (error) { throw classify(error); }
     }
     async verifyRoot() {
         try {
@@ -124,18 +153,6 @@ export default class S3Backend extends StorageBackend {
                 if (!removed && !hidden) { hidden = true; await this.#send(DeleteObjectCommand, { Key }).catch(() => {}); }
             }
         }
-    }
-    /** Integrity fields of one PUT. The SHA-256 the caller already computed is
-     * reused; `hash(algorithms)` runs only for what is still missing: nothing
-     * when the endpoint checks SHA-256 itself, MD5 otherwise. */
-    async #integrity(sha256, hash) {
-        const native = await this.#nativeSha256();
-        const known = SHA256.test(sha256 || '') ? { sha256 } : {};
-        const missing = [...(native ? [] : ['md5']), ...(known.sha256 ? [] : ['sha256'])];
-        const sums = { ...known, ...(missing.length ? await hash(missing) : {}) };
-        return { Metadata: { sha256: sums.sha256 }, ...(native
-            ? { ChecksumSHA256: Buffer.from(sums.sha256, 'hex').toString('base64') }
-            : { ContentMD5: Buffer.from(sums.md5, 'hex').toString('base64') }) };
     }
     async #probeWrites() {
         const Key = this.#prefix + PROBES + randomUUID();
@@ -197,14 +214,24 @@ export default class S3Backend extends StorageBackend {
     }
     async put(key, data) {
         if (!Buffer.isBuffer(data) && typeof data !== 'string') throw fault('SIZE_REQUIRED', 'Use createFrom for streamed S3 uploads with a known size');
-        const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
-        return this.#create(key, buffer, buffer.length, await this.#integrity(null, algorithms => checksumBuffer(buffer, algorithms)), await detectMimeFromHead(buffer.subarray(0, 4096), key));
+        if (this.#cas) throw fault('INVALID_KEY', 'A content store takes files through createFrom');
+        const Body = Buffer.isBuffer(data) ? data : Buffer.from(data);
+        const native = (await this.verifyWrites()).sha256;
+        const { sha256, md5 } = checksumBuffer(Body, native ? ['sha256'] : ['sha256', 'md5']);
+        await this.#send(PutObjectCommand, { Key: this.#key(key), Body, ContentLength: Body.length, ContentType: await detectMimeFromHead(Body.subarray(0, 4096), key),
+            Metadata: { sha256 }, IfNoneMatch: '*',
+            ...(native ? { ChecksumSHA256: Buffer.from(sha256, 'hex').toString('base64') } : { ContentMD5: Buffer.from(md5, 'hex').toString('base64') }) });
+        this.#hashes.delete(key);
+        return this.stat(key);
     }
     async commit(key, file) { return this.createFrom(key, file); }
-    /** `sha256` (hex) is the file's checksum when the caller already has it. */
+    /** Upload a local file. `sha256` (hex) is its checksum when the caller
+     * already has it. Returns the row of the object the endpoint accepted. */
     async createFrom(key, file, { sha256 } = {}) {
+        const Key = this.#key(key);
+        if (!this.canWrite) throw fault('READ_ONLY', 'S3 backend is read-only');
         const { size } = await fs.stat(file);
-        if (this.#cas) return this.#createBlob(key, file, size, sha256);
+        if (this.#cas) return this.#createBlob(key, Key, file, size, sha256);
         if (size > MAX_PUT) throw fault('OBJECT_TOO_LARGE', 'S3 uploads to a chosen path support objects up to 5 GiB');
         const handle = await fs.open(file, 'r');
         let head;
@@ -213,56 +240,26 @@ export default class S3Backend extends StorageBackend {
             const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
             head = buffer.subarray(0, bytesRead);
         } finally { await handle.close(); }
-        const integrity = await this.#integrity(sha256, algorithms => checksumFile(file, algorithms));
-        const input = createReadStream(file);
-        try { return await this.#create(key, input, size, integrity, await detectMimeFromHead(head, key)); }
-        finally { input.destroy(); }
-    }
-    async #create(key, Body, ContentLength, integrity, ContentType) {
-        const Key = this.#key(key);
-        if (ContentLength > MAX_PUT) throw fault('OBJECT_TOO_LARGE', 'S3 uploads currently support objects up to 5 GiB');
-        await this.verifyWrites();
-        await this.#send(PutObjectCommand, { Key, Body, ContentLength, ContentType, ...integrity, IfNoneMatch: '*' });
+        const native = (await this.verifyWrites()).sha256;
+        await this.#upload({ Key, file, size, ContentType: await detectMimeFromHead(head, key), sha256, native, IfNoneMatch: '*' });
         this.#hashes.delete(key);
         return this.stat(key);
     }
-    /** Same key, same bytes: an existing object of the right size is the
-     * upload. Large blobs go up in parts, each with its own MD5. */
-    async #createBlob(key, file, size, sha256) {
-        const Key = this.#key(key);
-        if (!this.canWrite) throw fault('READ_ONLY', 'S3 backend is read-only');
+    /** A blob's key ends in its SHA-256, so the same key always holds the same
+     * bytes: an object already recorded with that checksum is the upload, and
+     * a new one costs one HEAD and one PUT. Large blobs go up in parts. */
+    async #createBlob(key, Key, file, size, sha256) {
+        const named = BLOB_KEY.exec(key)?.[1];
+        if (!named || (sha256 && sha256 !== named)) throw fault('INVALID_KEY', 'A content store names every object by its SHA-256');
         const existing = await this.stat(key);
-        if (existing?.size === size) return existing;
-        if (size <= PART) {
-            const integrity = await this.#integrity(sha256, algorithms => checksumFile(file, algorithms));
-            const input = createReadStream(file);
-            try { await this.#send(PutObjectCommand, { Key, Body: input, ContentLength: size, ContentType: 'application/octet-stream', ...integrity }); }
-            finally { input.destroy(); }
-            return this.stat(key);
-        }
-        const partSize = Math.max(PART, Math.ceil(size / MAX_PARTS));
-        // Parts are checked by their MD5: a multipart SHA-256 is a checksum of
-        // part checksums, not the file's.
-        const whole = SHA256.test(sha256 || '') ? sha256 : (await checksumFile(file, ['sha256'])).sha256;
-        const { UploadId } = await this.#send(CreateMultipartUploadCommand, { Key, ContentType: 'application/octet-stream', Metadata: { sha256: whole } });
-        try {
-            const Parts = [];
-            for (let start = 0, PartNumber = 1; start < size; start += partSize, PartNumber++) {
-                const end = Math.min(start + partSize, size) - 1;
-                const md5 = createHash('md5');
-                for await (const chunk of createReadStream(file, { start, end })) md5.update(chunk);
-                const input = createReadStream(file, { start, end });
-                try {
-                    const part = await this.#send(UploadPartCommand, { Key, UploadId, PartNumber, Body: input, ContentLength: end - start + 1, ContentMD5: md5.digest('base64') });
-                    Parts.push({ PartNumber, ETag: part.ETag });
-                } finally { input.destroy(); }
-            }
-            await this.#send(CompleteMultipartUploadCommand, { Key, UploadId, MultipartUpload: { Parts } });
-        } catch (error) {
-            await this.#send(AbortMultipartUploadCommand, { Key, UploadId }).catch(() => {});
-            throw error;
-        }
-        return this.stat(key);
+        if (existing?.size === size && existing.sha256 === named) return existing;
+        const multipart = size > PART;
+        const native = !multipart && await this.#nativeSha256();
+        const result = await this.#upload({ Key, file, size, ContentType: 'application/octet-stream', sha256: named, native, multipart });
+        // The endpoint accepted bytes it checked against the checksum sent
+        // with them, so the row is built from its answer without another HEAD.
+        return this.#row(key, { ContentLength: size, LastModified: new Date(), ContentType: 'application/octet-stream',
+            ETag: result.ETag, VersionId: result.VersionId, Metadata: { sha256: named } });
     }
     /** Write the JSON sidecar of a blob once; an existing one is kept. */
     async writeSidecar(blobKey, document) {
@@ -279,7 +276,7 @@ export default class S3Backend extends StorageBackend {
         return data ? JSON.parse(data.toString()) : null;
     }
     async delete(key) {
-        if (!this.canDelete) throw fault('DELETE_DISABLED', 'S3 removal needs an explicit permanentDelete');
+        if (!this.canDelete) throw fault('DELETE_DISABLED', 'Deletes are turned off for this S3 backend');
         await this.#send(DeleteObjectCommand, { Key: this.#key(key) });
         // A blob takes its sidecar with it.
         if (this.#cas && !key.endsWith(SIDECAR)) await this.#send(DeleteObjectCommand, { Key: this.#key(key + SIDECAR) }).catch(() => {});
@@ -380,5 +377,11 @@ export default class S3Backend extends StorageBackend {
         await this.poll();
         return true;
     }
-    async stop() { clearInterval(this.#timer); this.#timer = null; await this.#polling; this.#client.destroy?.(); }
+    async stop() {
+        clearInterval(this.#timer); this.#timer = null;
+        await this.#polling;
+        const worker = this.#worker; this.#worker = null;
+        await worker?.terminate();
+        this.#client.destroy?.();
+    }
 }

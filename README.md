@@ -223,9 +223,10 @@ endpoint requires a new backend to preserve existing locations and pending plans
   and queues an upload to `<prefix>/<aa>/<bb>/<sha256>`: the configured
   prefix is the blob root. `stored.copy(id, { to: 's3:name' })` lands on the
   same key whatever `key` was asked for. The same key always holds the same bytes, so these
-  writes are unconditional, an existing object of the right size is reused, and
-  blobs above 64 MiB are sent as a multipart upload with a content MD5 per part
-  (no 5 GiB limit). A CAS backend lists nothing (`canEnumerate`, `paths` and
+  writes are unconditional, an existing object recorded with that checksum is
+  reused, and blobs above 64 MiB are sent as a multipart upload with a content
+  MD5 per part (no 5 GiB limit). A key that does not end in the file's SHA-256
+  is refused. A new blob costs one HEAD and one PUT. A CAS backend lists nothing (`canEnumerate`, `paths` and
   `upload` are false, `blobs` is true) and a scan never removes its index
   locations.
 - Each driver instance probes once whether the endpoint checks
@@ -233,12 +234,19 @@ endpoint requires a new backend to preserve existing locations and pending plans
   one back (`verifyWrites()` returns this as `sha256`). If so, an upload sends
   the file's SHA-256 for the endpoint to check, reusing the checksum the caller
   passes (`createFrom(key, file, { sha256 })`, which `Stored` does), so the
-  file is not hashed again. Otherwise the upload sends a Content-MD5. Multipart
+  file is not hashed again. Otherwise the file is read once for a Content-MD5
+  and its SHA-256, which must equal the expected one. Multipart
   parts always carry an MD5, because a multipart SHA-256 is not the file's.
   Either way the object's SHA-256 is recorded as user metadata
   (`x-amz-meta-sha256`). `stat()` returns it as `sha256`, and the replica executor accepts it as the verified content
   identity, so an upload is not downloaded again to verify it. Objects written
   by anything else carry no such metadata and are read back and hashed.
+- File uploads (`createFrom`) run on a worker thread owned by the backend
+  (`src/backends/s3/upload-worker.js`), started on the first upload and stopped
+  with the backend: hashing, request signing, TLS and the file stream stay off
+  the calling thread. Copies to a CAS backend are placed by the replica
+  executor six at a time, without the storage mutation lock, so other writes
+  are not queued behind a transfer.
 - `writeSidecar(blobKey, document)` on a CAS backend stores `<blob key>.json`
   once (an existing sidecar is kept), `readSidecar(blobKey)` returns it, and
   deleting a blob deletes its sidecar.
@@ -259,8 +267,8 @@ endpoint requires a new backend to preserve existing locations and pending plans
   `rename` conflicts. The existing durable replica executor verifies each exact
   destination before releasing staging. Full mirrors, overwrite and automated
   removal are refused.
-- `delete()` needs an explicit `permanentDelete: true`, which does not enable
-  mirror capabilities. Bucket versioning and Object Lock retention are not
+- `delete()` works unless the backend is configured with `permanentDelete:
+  false`; it does not enable mirror capabilities. Bucket versioning and Object Lock retention are not
   managed: a delete on a versioned bucket adds a delete marker like any other
   S3 client's would.
 
@@ -567,7 +575,7 @@ Registered in `BackendManager` via `DRIVERS`:
 | `file` | `local` | complete | CRUD, chokidar `watch`, `scan` |
 | `cacache` | `local` | complete | Content-addressable blob store (cacache); CRUD, no `watch`/`scan` |
 | `http` | `remote` | partial | Read-only `get` / `stat` via `fetch`; `config.baseUrl`, `headers` |
-| `s3` | `remote` | filing/read/blob support | Conditional creates, content-addressed blobs, streaming reads, scan/poll, opt-in deletes; mirrors and overwrite disabled |
+| `s3` | `remote` | filing/read/blob support | Conditional creates, content-addressed blobs, streaming reads, scan/poll, deletes; mirrors and overwrite disabled |
 
 Each backend implements `StorageBackend`: `put`, `get`, `delete`, `stat`, `list`; optional `commit` (local, for streaming put), `watch`, `scan`, `stop`.
 

@@ -174,18 +174,31 @@ export default class Stored extends EventEmitter2 {
     get replicas() { return this.#replicas; }
 
     // Called only after the executor has verified the exact target bytes.
-    async acknowledgeReplica(backendName, key, id, origin) {
+    // `row` is the backend row of an upload that just finished, when the
+    // caller has it; otherwise the key is looked up.
+    async acknowledgeReplica(backendName, key, id, origin, row = null) {
+        const stat = row || await this.#backends.get(backendName).stat(key);
+        if (!stat) throw new Error('Verified replica disappeared');
         const meta = this.#index.get(id);
         if (!meta) throw new Error('Replica content is not indexed');
-        const backend = this.#backends.get(backendName);
-        const stat = await backend.stat(key);
-        if (!stat) throw new Error('Verified replica disappeared');
         const location = this.#buildLocation(backendName, key, true, {
             size: stat.size, mtime: stat.modified,
             ...(stat.ino != null ? { ino: stat.ino, dev: stat.dev } : {}),
         });
         const saved = this.#index.put(id, { ...meta, locations: this.#mergeLocations(meta, [location]) }, { origin });
         this.#emitLocationEvent('location:add', saved, location, { origin });
+    }
+
+    /** Drop the placeholder locations of copies that never arrived. Returns
+     * whether the content still has a verified copy somewhere. */
+    forgetPendingReplicas(id, endpoints) {
+        const meta = this.#index.get(id);
+        if (!meta) return false;
+        const pending = l => l.synced === false && endpoints.some(e => e.backend === l.backend && e.key === l.key);
+        const locations = (meta.locations || []).filter(l => !pending(l));
+        const kept = locations.some(l => l.synced !== false);
+        if (kept && locations.length !== meta.locations.length) this.#index.put(id, { ...meta, locations });
+        return kept;
     }
 
     async ensureDirectory(backendName, key) {

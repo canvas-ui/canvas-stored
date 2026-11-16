@@ -17,6 +17,8 @@ const terminal = state => state === 'complete' || state === 'cancelled';
 const failure = (code, message, retryable = false) => Object.assign(new Error(message), { code, retryable });
 const transient = error => error.retryable || ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'ENETUNREACH', 'EAI_AGAIN', 'target-offline'].includes(error.code)
     || [429, 502, 503, 504].includes(error.status ?? error.statusCode);
+// Uploads to content stores that run side by side.
+const UPLOADS = 6;
 const safeKey = key => typeof key === 'string' && key.length > 0 && !key.includes('\0')
     && !key.includes('\\') && !key.startsWith('/') && !/^[A-Za-z]:/.test(key)
     && key.split('/').every(part => part && part !== '.' && part !== '..');
@@ -26,6 +28,11 @@ const safeKey = key => typeof key === 'string' && key.length > 0 && !key.include
  * A caller supplies the complete ordered destination set for one opaque owner.
  * The journal, owner ledger and receipts share Stored's LMDB environment.
  * Accepted plans are immutable; retries reuse their resolved keys and outcomes.
+ *
+ * A copy to a content store (a backend with the `blobs` capability) takes a
+ * shorter road than the phases below: its key is its checksum, so there is
+ * nothing to stage, resolve or retire. Up to `UPLOADS` of them run at once,
+ * and only their bookkeeping takes the storage mutation lock.
  */
 export default class ReplicaService extends EventEmitter {
     #stored; #ops; #owners; #meta; #running = null; #timer = null; #stopped = false; #requested = false;
@@ -36,7 +43,20 @@ export default class ReplicaService extends EventEmitter {
     #ownerGuard = null;
     #ownerEndpoints = null;
     #latestOperations = null;
+    // id -> seq of every operation the executor still has work for, in seq
+    // order. Finished receipts stay in LMDB and out of every pass.
+    #live = new Map();
 
+    #track(op) {
+        const settled = terminal(op.state) && (op.cleaned || !(op.state === 'complete' || op.supersededBy));
+        if (settled) this.#live.delete(op.id); else this.#live.set(op.id, op.seq);
+    }
+    *#unfinished() {
+        for (const id of this.#live.keys()) {
+            const value = this.#ops.get(id);
+            if (value && !terminal(value.state)) yield value;
+        }
+    }
     // Derived, process-local lookups. The durable ledgers remain authoritative.
     // Invalidate on BOTH sides of an owner transaction, including rollback;
     // callbacks inside the transaction must not leave a speculative cache.
@@ -122,9 +142,12 @@ export default class ReplicaService extends EventEmitter {
             }
             this.#meta.putSync('executor', this.#lease);
         });
+        const unsettled = [];
         for (const { key, value } of this.#ops.getRange()) {
             if (value.state === 'running') this.#ops.putSync(key, { ...value, state: 'pending' });
+            unsettled.push(value);
         }
+        for (const value of unsettled.sort((a, b) => a.seq - b.seq)) this.#track(value);
         if (autoStart) {
             this.#timer = setInterval(() => { this.drain().catch(error => this.emit('fault', error)); }, retryIntervalMs);
             this.#timer.unref?.();
@@ -207,6 +230,7 @@ export default class ReplicaService extends EventEmitter {
         // in this lookup: completing an operation or adding one new receipt
         // must not force another full-ledger decode during reconciliation.
         this.#latestOperations?.set(op.owner, { id: op.id, seq: op.seq });
+        this.#track(op);
         this.emit('changed', clone(op));
         this.#requested = true;
         queueMicrotask(() => this.#stored.detachedStorageWork(() => { if (!this.#stopped) this.drain().catch(error => this.emit('fault', error)); }));
@@ -232,15 +256,16 @@ export default class ReplicaService extends EventEmitter {
     }
     commitIngress(entry) { if (entry) this.#ingress.putSync(entry.cacheKey, { ...entry, state: 'committed' }); }
     async discardIngress(entry) {
-        if (!entry || [...this.#ops.getRange()].some(({ value }) => !terminal(value.state) && value.plan.sourceCacheKey === entry.cacheKey)) return;
+        if (!entry) return;
+        for (const value of this.#unfinished()) if (value.plan.sourceCacheKey === entry.cacheKey) return;
         await this.#stored.cache.delete(entry.cacheKey);
         this.#ingress.removeSync(entry.cacheKey);
     }
     get hasIngress() { return this.#ingress.getKeysCount() > 0; }
     assertIdleEndpoint(backend, key, { directory = false, except = null } = {}) {
         const matches = r => r.backend === backend && (r.key === key || (directory && r.key.startsWith(`${key}/`)));
-        for (const { value } of this.#ops.getRange()) {
-            if (terminal(value.state) || value.id === except) continue;
+        for (const value of this.#unfinished()) {
+            if (value.id === except) continue;
             if ([...value.plan.replicas, ...value.outcomes, ...(value.base?.replicas || []), ...(value.plan.source ? [value.plan.source] : [])].some(matches)) {
                 throw failure('OPERATION_PENDING', `Finish storage operation ${value.id} before changing this path`);
             }
@@ -341,7 +366,8 @@ export default class ReplicaService extends EventEmitter {
         });
     }
     list({ owner, limit = 100, after = 0, active = false } = {}) {
-        const all = [...this.#ops.getRange()].map(r => r.value).filter(r => (!owner || r.owner === owner) && r.seq > after && (!active || !terminal(r.state))).sort((a, b) => a.seq - b.seq);
+        const all = (active ? [...this.#unfinished()] : [...this.#ops.getRange()].map(r => r.value))
+            .filter(r => (!owner || r.owner === owner) && r.seq > after).sort((a, b) => a.seq - b.seq);
         const operations = all.slice(0, Math.min(1000, Math.max(1, limit))).map(clone);
         return { operations, next: all.length > operations.length ? operations.at(-1).seq : null, head: this.#meta.get('head') || 0 };
     }
@@ -351,6 +377,52 @@ export default class ReplicaService extends EventEmitter {
         if (!terminal(op.state)) this.#save(op, { state: 'pending', nextAt: 0, error: null });
         this.#requested = true;
         return this.drain().then(() => this.get(id));
+    }
+    /** How many unfinished operations are in each state. */
+    counts() {
+        const counts = { pending: 0, running: 0, blocked: 0 };
+        for (const value of this.#unfinished()) counts[value.state]++;
+        return counts;
+    }
+    /** Put every blocked operation back on the queue. Returns how many. */
+    retryBlocked() {
+        let count = 0;
+        for (const value of [...this.#unfinished()]) {
+            if (value.state !== 'blocked') continue;
+            this.#save(clone(value), { state: 'pending', nextAt: 0, error: null });
+            count++;
+        }
+        if (count) { this.#requested = true; this.drain().catch(error => this.emit('fault', error)); }
+        return count;
+    }
+    /** Give up an unfinished copy. Only copy-only work can be given up: it
+     * retires and releases nothing, so stopping it leaves every existing copy
+     * where it is. A destination that never received the bytes loses its
+     * placeholder location; the staged bytes go once another copy is known. */
+    async cancel(id) {
+        return this.#stored.withStorageMutation(async () => {
+            const op = this.get(id);
+            if (!op) throw failure('NOT_FOUND', 'Operation not found');
+            if (terminal(op.state)) return op;
+            if (op.plan.release?.length || op.plan.replicas.some(r => r.mirror !== false)) throw failure('UNSUPPORTED_CANCEL', 'Only copies can be cancelled; change the storage policy instead');
+            this.#save(op, { state: 'cancelled', phase: 'cancelled' });
+            const pending = op.plan.replicas.filter((r, i) => op.outcomes[i]?.state !== 'verified');
+            const kept = this.#stored.forgetPendingReplicas(op.plan.contentId, pending);
+            if (op.stageKey) await this.#stored.cache.delete(op.stageKey);
+            const shared = [...this.#unfinished()].some(value => value.plan.sourceCacheKey === op.plan.sourceCacheKey);
+            if (op.plan.sourceCacheKey && kept && !shared) await this.#stored.cache.delete(op.plan.sourceCacheKey);
+            return op;
+        });
+    }
+    /** Cancel every blocked copy. Returns how many. */
+    async cancelBlocked() {
+        let count = 0;
+        for (const value of [...this.#unfinished()]) {
+            if (value.state !== 'blocked' || value.plan.release?.length || value.plan.replicas.some(r => r.mirror !== false)) continue;
+            await this.cancel(value.id);
+            if (++count % 32 === 0) await yieldToIO();
+        }
+        return count;
     }
     async stop() {
         this.#stopped = true;
@@ -387,34 +459,81 @@ export default class ReplicaService extends EventEmitter {
         });
         if (!this.#stopped) await this.#stored.resumePendingMoves();
         const blockedOwners = new Set();
-        const rows = [...this.#ops.getRange()].map(r => r.value).sort((a, b) => a.seq - b.seq);
+        const uploads = new Set();
         let visited = 0;
-        for (const row of rows) {
+        for (const id of [...this.#live.keys()]) {
             // Awaiting an already-resolved promise only drains microtasks. A
-            // large receipt/backoff backlog must still let sockets and timers run.
+            // large backoff backlog must still let sockets and timers run.
             if (++visited % 32 === 0) await yieldToIO();
             if (this.#stopped) break;
-            const op = this.get(row.id);
+            const op = this.get(id);
+            if (!op) { this.#live.delete(id); continue; }
             if (terminal(op.state)) { await this.#cleanup(op); continue; }
             if (blockedOwners.has(op.owner)) continue;
-            if (op.state === 'blocked' || op.nextAt > Date.now()) { blockedOwners.add(op.owner); continue; }
-            try {
-                this.#save(op, { state: 'running', error: null });
-                await this.#stored.withStorageMutation(() => this.#apply(op));
-            } catch (error) {
+            blockedOwners.add(op.owner);
+            if (op.state === 'blocked' || op.nextAt > Date.now()) continue;
+            const failed = error => {
                 const attempts = op.attempts + 1;
                 this.#save(op, { state: transient(error) ? 'pending' : 'blocked', attempts,
                     nextAt: transient(error) ? Date.now() + backoffMs(attempts) : 0,
                     error: { code: error.code || 'IO_ERROR', message: error.message } });
-                blockedOwners.add(op.owner);
+            };
+            this.#save(op, { state: 'running', error: null });
+            if (this.#uploadsBlob(op)) {
+                while (uploads.size >= UPLOADS) await Promise.race(uploads);
+                const upload = this.#uploadBlob(op).catch(failed).finally(() => uploads.delete(upload));
+                uploads.add(upload);
+                continue;
             }
+            try { await this.#stored.withStorageMutation(() => this.#apply(op)); }
+            catch (error) { failed(error); }
         }
+        await Promise.all(uploads);
         if (!this.#stopped) await this.#stored.resumePendingMoves();
     }
     #save(op, patch) {
         Object.assign(op, patch, { updatedAt: Date.now() });
         this.#ops.putSync(op.id, op);
+        this.#track(op);
         this.emit('changed', clone(op));
+    }
+    #uploadsBlob(op) {
+        const { plan } = op;
+        return Boolean(plan.transportJob && plan.sourceCacheKey && plan.replicas.length && !plan.release?.length
+            && plan.replicas.every(r => r.mirror === false && r.kind !== 'directory' && this.#stored.getBackend(r.backend)?.capabilities.blobs));
+    }
+    /** Copy staged content to content stores. The endpoint checks the bytes
+     * against the checksum sent with them, and the row it answers with carries
+     * that checksum; the transfer holds no lock. */
+    async #uploadBlob(op) {
+        const sha256 = op.plan.contentId.slice(7);
+        const info = await this.#stored.cache.getInfo(op.plan.sourceCacheKey);
+        if (!info) throw failure('NO_SOURCE', 'The staged content of this copy is gone');
+        const rows = [];
+        for (const target of op.plan.replicas) {
+            const row = await this.#backend(target.backend).createFrom(target.key, info.path, { sha256 });
+            if (row?.sha256 !== sha256) throw failure('VERIFY_FAILED', 'Destination verification failed');
+            rows.push(row);
+        }
+        await this.#stored.withStorageMutation(async () => {
+            if (terminal(this.#ops.get(op.id)?.state)) return;
+            const origin = `replica:${op.id}`;
+            const outcomes = [];
+            for (const [i, target] of op.plan.replicas.entries()) {
+                await this.#stored.acknowledgeReplica(target.backend, target.key, op.plan.contentId, origin, rows[i]);
+                outcomes.push({ ...target, requestedKey: target.key, contentId: op.plan.contentId, state: 'verified', managed: true, expected: null, replaces: null });
+            }
+            const base = this.owner(op.owner) || { owner: op.owner, replicas: [] };
+            const kept = base.replicas.filter(r => !outcomes.some(n => address(n) === address(r))).map(r => ({ ...r, mirror: false }));
+            this.#updateOwners(() => {
+                this.#owners.putSync(op.owner, { owner: op.owner, operationId: op.id, contentId: op.plan.contentId, replicas: [...kept, ...outcomes], updatedAt: Date.now() });
+                Object.assign(op, { base, outcomes, state: 'complete', phase: 'complete', updatedAt: Date.now() });
+                this.#ops.putSync(op.id, op);
+            });
+            this.#track(op);
+            this.emit('changed', clone(op));
+            await this.#cleanup(op);
+        });
     }
     async #cleanup(op) {
         if (op.state === 'complete' && op.plan.ingressSeq) {
@@ -432,10 +551,12 @@ export default class ReplicaService extends EventEmitter {
         if (successor?.state !== 'complete') return;
         if (op.stageKey) await this.#stored.cache.delete(op.stageKey);
         if (op.plan.sourceCacheKey) {
-            if ([...this.#ops.getRange()].some(({ value }) => !terminal(value.state) && value.plan.sourceCacheKey === op.plan.sourceCacheKey)) return;
+            for (const value of this.#unfinished()) if (value.plan.sourceCacheKey === op.plan.sourceCacheKey) return;
             await this.#stored.cache.delete(op.plan.sourceCacheKey);
         }
-        this.#ops.putSync(op.id, { ...op, cleaned: true });
+        Object.assign(op, { cleaned: true });
+        this.#ops.putSync(op.id, op);
+        this.#track(op);
     }
     #backend(name) {
         const backend = this.#stored.getBackend(name);
@@ -507,8 +628,8 @@ export default class ReplicaService extends EventEmitter {
         for (const value of this.ownersAt(endpoint.backend, endpoint.key)) {
             if (value.owner !== op.owner && value.replicas.some(r => address(r) === wanted)) return true;
         }
-        for (const { value } of this.#ops.getRange()) {
-            if (value.id !== op.id && !terminal(value.state)
+        for (const value of this.#unfinished()) {
+            if (value.id !== op.id
                 && [...value.plan.replicas, ...(value.plan.source ? [value.plan.source] : [])].some(r => address(r) === wanted)) return true;
         }
         return false;
@@ -620,6 +741,7 @@ export default class ReplicaService extends EventEmitter {
             Object.assign(op, { state: 'complete', phase: 'complete', updatedAt: Date.now() });
             this.#ops.putSync(op.id, op);
         });
+        this.#track(op);
         this.emit('changed', clone(op));
         await this.#cleanup(op);
     }
