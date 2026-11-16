@@ -244,9 +244,10 @@ endpoint requires a new backend to preserve existing locations and pending plans
 - File uploads (`createFrom`) run on a worker thread owned by the backend
   (`src/backends/s3/upload-worker.js`), started on the first upload and stopped
   with the backend: hashing, request signing, TLS and the file stream stay off
-  the calling thread. Copies to a CAS backend are placed by the replica
-  executor six at a time, without the storage mutation lock, so other writes
-  are not queued behind a transfer.
+  the calling thread. Uploads and copies to either mode are placed by the
+  replica executor six at a time, without the storage mutation lock, so other
+  writes are not queued behind a transfer. A new object costs one HEAD and one
+  PUT in both modes.
 - `writeSidecar(blobKey, document)` on a CAS backend stores `<blob key>.json`
   once (an existing sidecar is kept), `readSidecar(blobKey)` returns it, and
   deleting a blob deletes its sidecar.

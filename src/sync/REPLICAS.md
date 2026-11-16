@@ -39,10 +39,22 @@ release) can be given up with `cancel(id)` or `cancelBlocked()`: destinations
 that never received the bytes lose their placeholder location and existing
 copies stay.
 
-A copy to a content store (a backend with the `blobs` capability) skips the
-phases below. Its key is its checksum, so nothing is staged, resolved or
-retired: the backend uploads the cached file, the endpoint checks the bytes,
-and only the bookkeeping takes the executor lock. Six such uploads run at once.
+A transfer (an upload or copy queued through the SyncQueue) to remote backends
+skips the phases below. It is copy-only, its source is pinned in the cache and
+a taken name is an error, so nothing is staged, resolved or retired. The
+executor looks at the destination key (a content store answers for its own
+keys), reuses an object that already holds the bytes, blocks on one that holds
+other bytes, and otherwise uploads the cached file. The row the backend
+answers with must carry the expected SHA-256: S3 records it with an upload the
+endpoint checked, Drive computes it from the bytes it holds; a backend that
+vouches for none is read back. Up to eight transfers run at once, each backend
+within its `uploadConcurrency` (S3 6, Drive 2, default 4), one per destination
+key, and only the bookkeeping takes the executor lock.
+
+Policy placements keep the phases. For remote backends they ask for liveness
+at most once every ten seconds, trust the same vouched checksum instead of
+downloading, and verify destinations a second time only when something was
+retired or staging is about to be released.
 Unfinished operations are tracked in memory, so a pass never rereads the
 receipts of finished ones.
 `list({ active: true })` lists pending/blocked operations without completed history

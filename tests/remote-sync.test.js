@@ -53,7 +53,20 @@ describe('Stored ↔ remote (gdrive) backend', () => {
         assert.strictEqual(remote.data.toString(), 'remote bytes');
     });
 
+    test('uploads into one new Drive folder run side by side, create it once and are not downloaded to verify', async () => {
+        const first = drive.calls.length;
+        const puts = [];
+        for (let i = 0; i < 6; i++) puts.push(await stored.put(Buffer.from(`scan ${i}`), { key: `Scans/2026/page-${i}.txt`, backends: ['gdrive:acc'] }));
+        await stored.replicas.drain();
+        for (const put of puts) assert.strictEqual((await stored.locations(put.id))[0].synced, true);
+        const folders = [...drive.files.values()].filter((f) => f.mimeType === 'application/vnd.google-apps.folder' && ['Scans', '2026'].includes(f.name));
+        assert.deepStrictEqual(folders.map((f) => f.name).sort(), ['2026', 'Scans']);
+        assert.strictEqual([...drive.files.values()].filter((f) => /^page-\d\.txt$/.test(f.name)).length, 6);
+        assert.ok(!drive.calls.slice(first).some((c) => c.path.includes('alt=media')), 'Drive checksums verify the upload');
+    });
+
     test('getByUrl() reads remote bytes; a cache miss falls back to the API', async () => {
+
         const buf = await stored.getByUrl('stored://gdrive:acc/Inbox/note.txt');
         assert.strictEqual(buf.toString(), 'remote bytes');
         const ranged = await stored.getRangeStreamByUrl('stored://gdrive:acc/Inbox/note.txt', { start: 7, end: 11 });

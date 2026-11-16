@@ -41,6 +41,8 @@ export default class StorageBackend extends EventEmitter {
     /** Whether a complete listing would report `key`. */
     listed(_key) { return true; }
     get capabilities() { return { ...this.constructor.getCapabilities(this.config), remote: this.remote }; }
+    /** How many uploads the replica executor may run on this backend at once. */
+    get uploadConcurrency() { return 4; }
     get canDelete() { return this.capabilities.delete !== false; }
     get canWrite() { return this.capabilities.write !== false; }
     get canRead() { return this.capabilities.read !== false; }

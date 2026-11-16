@@ -17,8 +17,10 @@ const terminal = state => state === 'complete' || state === 'cancelled';
 const failure = (code, message, retryable = false) => Object.assign(new Error(message), { code, retryable });
 const transient = error => error.retryable || ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'ENETUNREACH', 'EAI_AGAIN', 'target-offline'].includes(error.code)
     || [429, 502, 503, 504].includes(error.status ?? error.statusCode);
-// Uploads to content stores that run side by side.
-const UPLOADS = 6;
+// Remote transfers that run side by side, across all backends.
+const TRANSFERS = 8;
+// How long a remote backend that just answered counts as reachable.
+const ALIVE_MS = 10_000;
 const safeKey = key => typeof key === 'string' && key.length > 0 && !key.includes('\0')
     && !key.includes('\\') && !key.startsWith('/') && !/^[A-Za-z]:/.test(key)
     && key.split('/').every(part => part && part !== '.' && part !== '..');
@@ -29,10 +31,12 @@ const safeKey = key => typeof key === 'string' && key.length > 0 && !key.include
  * The journal, owner ledger and receipts share Stored's LMDB environment.
  * Accepted plans are immutable; retries reuse their resolved keys and outcomes.
  *
- * A copy to a content store (a backend with the `blobs` capability) takes a
- * shorter road than the phases below: its key is its checksum, so there is
- * nothing to stage, resolve or retire. Up to `UPLOADS` of them run at once,
- * and only their bookkeeping takes the storage mutation lock.
+ * A transfer (an upload or copy queued through the SyncQueue) to remote
+ * backends takes a shorter road than the phases below: it is copy-only, its
+ * source is pinned in the cache and it fails on a name conflict, so there is
+ * nothing to stage, resolve or retire. Up to `TRANSFERS` run at once, each
+ * backend within its own `uploadConcurrency`, and only their bookkeeping takes
+ * the storage mutation lock.
  */
 export default class ReplicaService extends EventEmitter {
     #stored; #ops; #owners; #meta; #running = null; #timer = null; #stopped = false; #requested = false;
@@ -46,6 +50,7 @@ export default class ReplicaService extends EventEmitter {
     // id -> seq of every operation the executor still has work for, in seq
     // order. Finished receipts stay in LMDB and out of every pass.
     #live = new Map();
+    #alive = new Map();
 
     #track(op) {
         const settled = terminal(op.state) && (op.cleaned || !(op.state === 'complete' || op.supersededBy));
@@ -459,7 +464,10 @@ export default class ReplicaService extends EventEmitter {
         });
         if (!this.#stopped) await this.#stored.resumePendingMoves();
         const blockedOwners = new Set();
-        const uploads = new Set();
+        const transfers = new Set(), busy = new Map();
+        const held = op => op.plan.replicas.flatMap(r => [`backend:${r.backend}`, address(r)]);
+        const room = op => op.plan.replicas.every(r => (busy.get(`backend:${r.backend}`) || 0) < (this.#stored.getBackend(r.backend)?.uploadConcurrency || 1)
+            && !busy.get(address(r)));
         let visited = 0;
         for (const id of [...this.#live.keys()]) {
             // Awaiting an already-resolved promise only drains microtasks. A
@@ -479,16 +487,22 @@ export default class ReplicaService extends EventEmitter {
                     error: { code: error.code || 'IO_ERROR', message: error.message } });
             };
             this.#save(op, { state: 'running', error: null });
-            if (this.#uploadsBlob(op)) {
-                while (uploads.size >= UPLOADS) await Promise.race(uploads);
-                const upload = this.#uploadBlob(op).catch(failed).finally(() => uploads.delete(upload));
-                uploads.add(upload);
+            if (this.#transfers(op)) {
+                // One transfer per destination key at a time, and no more per
+                // backend than it asks for.
+                while (transfers.size >= TRANSFERS || !room(op)) await Promise.race(transfers);
+                for (const key of held(op)) busy.set(key, (busy.get(key) || 0) + 1);
+                const transfer = this.#transfer(op).catch(failed).finally(() => {
+                    transfers.delete(transfer);
+                    for (const key of held(op)) busy.set(key, busy.get(key) - 1);
+                });
+                transfers.add(transfer);
                 continue;
             }
             try { await this.#stored.withStorageMutation(() => this.#apply(op)); }
             catch (error) { failed(error); }
         }
-        await Promise.all(uploads);
+        await Promise.all(transfers);
         if (!this.#stopped) await this.#stored.resumePendingMoves();
     }
     #save(op, patch) {
@@ -497,31 +511,44 @@ export default class ReplicaService extends EventEmitter {
         this.#track(op);
         this.emit('changed', clone(op));
     }
-    #uploadsBlob(op) {
+    #transfers(op) {
         const { plan } = op;
+        const remote = name => {
+            const backend = this.#stored.getBackend(name);
+            return backend?.type === 'remote' && backend.canWrite && typeof backend.createFrom === 'function';
+        };
         return Boolean(plan.transportJob && plan.sourceCacheKey && plan.replicas.length && !plan.release?.length
-            && plan.replicas.every(r => r.mirror === false && r.kind !== 'directory' && this.#stored.getBackend(r.backend)?.capabilities.blobs));
+            && plan.replicas.every(r => r.mirror === false && r.kind !== 'directory' && (r.onConflict || 'error') === 'error' && remote(r.backend)));
     }
-    /** Copy staged content to content stores. The endpoint checks the bytes
-     * against the checksum sent with them, and the row it answers with carries
-     * that checksum; the transfer holds no lock. */
-    async #uploadBlob(op) {
+    /** Copy pinned cache content to remote backends without holding a lock.
+     * A key that already holds these bytes is the copy; one that holds other
+     * bytes is a conflict. A new object counts once the row the backend
+     * answers with carries the expected checksum. */
+    async #transfer(op) {
+        this.#assertOwnerActive(op);
         const sha256 = op.plan.contentId.slice(7);
         const info = await this.#stored.cache.getInfo(op.plan.sourceCacheKey);
         if (!info) throw failure('NO_SOURCE', 'The staged content of this copy is gone');
-        const rows = [];
+        const placed = [];
         for (const target of op.plan.replicas) {
-            const row = await this.#backend(target.backend).createFrom(target.key, info.path, { sha256 });
-            if (row?.sha256 !== sha256) throw failure('VERIFY_FAILED', 'Destination verification failed');
-            rows.push(row);
+            const backend = this.#backend(target.backend);
+            // A content store answers for its own keys: same key, same bytes.
+            const existing = backend.capabilities.blobs ? null : await this.#inspect(target);
+            if (existing && existing.id !== op.plan.contentId) throw failure('TARGET_CONFLICT', `Destination ${target.backend}:${target.key} contains different bytes`);
+            const row = existing?.stat || await backend.createFrom(target.key, info.path, { sha256 });
+            // A backend that vouches for no checksum is read back.
+            const created = existing ? null : this.#checked(backend, row) || (await this.#inspect(target))?.id.slice(7);
+            if (!existing && created !== sha256) throw failure('VERIFY_FAILED', 'Destination verification failed');
+            placed.push({ row, created: !existing });
         }
         await this.#stored.withStorageMutation(async () => {
             if (terminal(this.#ops.get(op.id)?.state)) return;
+            this.#assertOwnerActive(op);
             const origin = `replica:${op.id}`;
             const outcomes = [];
             for (const [i, target] of op.plan.replicas.entries()) {
-                await this.#stored.acknowledgeReplica(target.backend, target.key, op.plan.contentId, origin, rows[i]);
-                outcomes.push({ ...target, requestedKey: target.key, contentId: op.plan.contentId, state: 'verified', managed: true, expected: null, replaces: null });
+                await this.#stored.acknowledgeReplica(target.backend, target.key, op.plan.contentId, origin, placed[i].row);
+                outcomes.push({ ...target, requestedKey: target.key, contentId: op.plan.contentId, state: 'verified', managed: placed[i].created, expected: null, replaces: null });
             }
             const base = this.owner(op.owner) || { owner: op.owner, replicas: [] };
             const kept = base.replicas.filter(r => !outcomes.some(n => address(n) === address(r))).map(r => ({ ...r, mirror: false }));
@@ -563,15 +590,30 @@ export default class ReplicaService extends EventEmitter {
         if (!backend) throw failure('BACKEND_UNAVAILABLE', `Backend ${name} is unavailable`, true);
         return backend;
     }
+    /** The SHA-256 a remote itself vouches for in a row: recorded with an
+     * upload it checked (S3) or computed by the service from the bytes it
+     * holds (Drive). Local files are always read. */
+    #checked(backend, row) {
+        return backend.type === 'remote' ? (row?.sha256 || row?.checksums?.sha256 || null) : null;
+    }
+    async #reachable(backend) {
+        if (typeof backend.verifyRoot !== 'function') return;
+        // A local mount must be checked before every read: an unmounted share
+        // looks like an empty folder. A remote that is down fails the request
+        // itself, so its last answer is good for a moment.
+        const remote = backend.type === 'remote';
+        if (remote && Date.now() - (this.#alive.get(backend.name) || 0) < ALIVE_MS) return;
+        if (!(await backend.verifyRoot()).ok) { this.#alive.delete(backend.name); throw failure('BACKEND_UNAVAILABLE', `Backend ${backend.name} is offline`, true); }
+        if (remote) this.#alive.set(backend.name, Date.now());
+    }
     async #inspect(endpoint) {
         const backend = this.#backend(endpoint.backend);
-        if (typeof backend.verifyRoot === 'function' && !(await backend.verifyRoot()).ok) throw failure('BACKEND_UNAVAILABLE', `Backend ${endpoint.backend} is offline`, true);
+        await this.#reachable(backend);
         const stat = endpoint.kind === 'directory' ? await backend.statContainer(endpoint.key) : await backend.stat(endpoint.key);
         if (!stat) return null;
         if (endpoint.kind === 'directory') return { kind: 'directory' };
-        // A driver reports `sha256` only for bytes the remote verified on
-        // upload; anything else is read back and hashed.
-        if (stat.sha256) return { id: `sha256:${stat.sha256}`, stat };
+        const checked = this.#checked(backend, stat);
+        if (checked) return { id: `sha256:${checked}`, stat };
         const input = await backend.get(endpoint.key, { stream: true });
         if (!input) throw failure('SOURCE_CHANGED', `Cannot read ${endpoint.backend}:${endpoint.key}`, true);
         const hash = createHash('sha256');
@@ -646,6 +688,8 @@ export default class ReplicaService extends EventEmitter {
             const target = op.plan.replicas[i];
             let outcome = op.outcomes[i];
             const backend = this.#backend(target.backend);
+            // What the destination holds, when this pass has just looked.
+            let seen;
             if (!outcome) {
                 const previous = op.base.replicas.find(r => r.backend === target.backend && (r.requestedKey || r.key) === target.key);
                 const resolved = previous && target.onConflict === 'rename' ? { ...target, key: previous.key } : target;
@@ -668,7 +712,8 @@ export default class ReplicaService extends EventEmitter {
                     do { outcome.key = `${target.key.slice(0, split)}-${n++}${target.key.slice(split)}`; } while (await backend.stat(outcome.key));
                     outcome.expected = null;
                     outcome.managed = true;
-                }
+                    seen = null;
+                } else seen = current;
                 op.outcomes[i] = outcome;
                 this.#save(op, { outcomes: op.outcomes });
             }
@@ -676,7 +721,7 @@ export default class ReplicaService extends EventEmitter {
                 this.#assertOwnerActive(op);
                 await this.#stored.ensureDirectory(target.backend, outcome.key);
             } else {
-                const found = await this.#inspect(outcome);
+                const found = seen !== undefined ? seen : await this.#inspect(outcome);
                 if (found?.id !== op.plan.contentId) {
                     if (found && found.id !== outcome.replaces && target.onConflict !== 'overwrite') throw failure('TARGET_CONFLICT', `Destination ${outcome.backend}:${outcome.key} contains different bytes`);
                     if (found && this.#otherClaims(op, outcome) && found.id !== op.plan.contentId) throw failure('SHARED_REPLICA', 'Another owner or pending operation still needs this byte version');
@@ -700,6 +745,7 @@ export default class ReplicaService extends EventEmitter {
             this.#save(op, { outcomes: op.outcomes });
         }
         this.#save(op, { phase: 'retire' });
+        let retired = false;
         for (const old of op.base.replicas) {
             this.#assertOwnerActive(op);
             if (op.outcomes.some(r => address(r) === address(old)) || (op.plan.preserve || []).some(r => address(r) === address(old)) || old.mirror === false || !old.managed || this.#otherClaims(op, old)) continue;
@@ -715,11 +761,14 @@ export default class ReplicaService extends EventEmitter {
             if (!this.capabilities(old.backend).retire) throw failure('RECOVERY_UNAVAILABLE', 'Recoverable removal is unavailable');
             const res = await this.#stored.removeObject(old.backend, old.key, { ifMatch: old.contentId.slice(7), origin: `replica:${op.id}` });
             if (!res?.ok) throw failure(res?.reason || 'REMOVE_FAILED', 'Replica retirement failed');
+            retired = true;
         }
         // Verify ALL destinations again before releasing a single staging
         // location. Presence in the index, or a queued upload, is insufficient.
+        // With nothing retired and nothing to release, each destination was
+        // verified when it was placed and no other copy depends on it.
         const fileOutcomes = op.outcomes.filter(r => r.kind !== 'directory');
-        for (const target of fileOutcomes) {
+        if (retired || op.plan.release?.length) for (const target of fileOutcomes) {
             if ((await this.#inspect(target))?.id !== op.plan.contentId) throw failure('VERIFY_FAILED', 'A destination changed before completion');
         }
         if (fileOutcomes.length) for (const loc of op.plan.release || []) {

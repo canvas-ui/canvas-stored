@@ -96,6 +96,7 @@ export default class GdriveBackend extends StorageBackend {
     #pollTimer = null;
     #polling = false;
     #creates = new Map();
+    #folderTasks = new Map();
     #pageToken = null;
 
     constructor(name, config = {}) {
@@ -112,6 +113,8 @@ export default class GdriveBackend extends StorageBackend {
     }
     get remote() { return true; }
     get transport() { return DEV; }
+    // Drive throttles writes per account well below what a bucket takes.
+    get uploadConcurrency() { return 2; }
     get watching() { return !!this.#pollTimer; }
     get rootFolderId() { return this.#rootId; }
 
@@ -381,6 +384,16 @@ export default class GdriveBackend extends StorageBackend {
         if (!clean) return this.#root();
         const cached = this.#folderIdByPath.get(clean);
         if (cached) return cached;
+        if (!create) return this.#resolveFolder(clean, false);
+        // Drive allows duplicate names: uploads that need the same new folder
+        // at the same time share one lookup-or-create.
+        const pending = this.#folderTasks.get(clean);
+        if (pending) return pending;
+        const task = this.#resolveFolder(clean, true).finally(() => this.#folderTasks.delete(clean));
+        this.#folderTasks.set(clean, task);
+        return task;
+    }
+    async #resolveFolder(clean, create) {
         const { dir, name } = splitKey(clean);
         const parentId = await this.#folderId(dir, { create });
         if (!parentId) return null;

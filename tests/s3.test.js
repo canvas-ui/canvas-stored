@@ -301,3 +301,59 @@ test('Stored uploads to a content store side by side, two requests each, and blo
     assert.equal(client.objects.get(`scope/${blobKey(refused)}`).data.toString(), 'refused');
     assert.deepEqual(stored.replicas.list({ active: true }).operations, []);
 });
+
+test('Stored uploads to chosen S3 paths side by side, outside the write lock, and a taken name blocks only its own copy', async t => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'stored-s3-paths-'));
+    const client = new FakeS3();
+    let active = 0, peak = 0, release = null;
+    const send = client.send.bind(client);
+    client.send = async command => {
+        active++; peak = Math.max(peak, active);
+        try {
+            if (release && command.constructor.name === 'PutObjectCommand') await release;
+            await new Promise(resolve => setTimeout(resolve, 5));
+            return await send(command);
+        } finally { active--; }
+    };
+    const stored = new Stored({ root, checksums: ['sha256'], replication: { autoStart: false } });
+    t.after(async () => { await stored.stop(); await fs.rm(root, { recursive: true, force: true }); });
+    stored.addBackend('data', { driver: 'cacache', root: path.join(root, 'data') });
+    stored.addBackend('s3:test', { driver: 's3', bucket: 'test', prefix: 'scope', client });
+    await stored.getBackend('s3:test').verifyWrites();
+    await stored.getBackend('s3:test').verifyRoot();
+    client.calls.length = 0;
+    const uploads = [];
+    for (let i = 0; i < 12; i++) uploads.push(await stored.put(Buffer.from(`report ${i}`), { backends: ['s3:test'], key: `Reports/${i}.txt` }));
+    await stored.replicas.drain();
+    assert.ok(peak > 1, 'uploads overlap');
+    // One liveness check for the batch, then a HEAD and a PUT per file.
+    assert.deepEqual(client.calls.reduce((n, c) => ({ ...n, [c.op]: (n[c.op] || 0) + 1 }), {}), { ListObjectsV2Command: 1, HeadObjectCommand: 12, PutObjectCommand: 12 });
+    assert.equal(client.objects.get('scope/Reports/7.txt').data.toString(), 'report 7');
+    assert.equal(client.objects.get('scope/Reports/7.txt').Metadata.sha256, hash('report 7'));
+    for (const upload of uploads) assert.equal((await stored.stat(upload.id)).locations[0].synced, true);
+
+    // While an upload is in flight, other writes are not queued behind it.
+    let open; release = new Promise(resolve => { open = resolve; });
+    const slow = await stored.put(Buffer.from('slow upload'), { backends: ['s3:test'], key: 'Reports/slow.txt' });
+    const draining = stored.replicas.drain();
+    const local = await stored.put(Buffer.from('local write'), { backends: ['data'] });
+    assert.equal(local.ok, true);
+    assert.equal((await stored.stat(slow.id)).locations[0].synced, false);
+    open(); release = null;
+    await draining;
+    assert.equal((await stored.stat(slow.id)).locations[0].synced, true);
+
+    // A name that already holds other bytes is a conflict; the same bytes are the copy.
+    client.add('scope/Reports/taken.txt', 'someone else');
+    client.add('scope/Reports/same.txt', 'already there');
+    client.objects.get('scope/Reports/same.txt').Metadata = { sha256: hash('already there') };
+    const taken = await stored.put(Buffer.from('mine'), { backends: ['s3:test'], key: 'Reports/taken.txt' });
+    const same = await stored.put(Buffer.from('already there'), { backends: ['s3:test'], key: 'Reports/same.txt' });
+    await stored.replicas.drain();
+    const open2 = stored.replicas.list({ active: true }).operations;
+    assert.deepEqual(open2.map(op => [op.state, op.error.code]), [['blocked', 'TARGET_CONFLICT']]);
+    assert.equal(client.objects.get('scope/Reports/taken.txt').data.toString(), 'someone else');
+    assert.equal((await stored.stat(taken.id)).locations[0].synced, false);
+    assert.equal((await stored.stat(same.id)).locations[0].synced, true);
+    assert.equal(client.calls.filter(c => c.op === 'PutObjectCommand' && c.input.Key === 'scope/Reports/same.txt').length, 0);
+});

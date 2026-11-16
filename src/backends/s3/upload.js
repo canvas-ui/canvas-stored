@@ -66,7 +66,7 @@ export async function uploadFile(client, { Bucket, Key, file, size, ContentType,
         const actual = whole.digest('hex');
         if (known && actual !== known) throw corrupt(actual);
         const result = await send(CompleteMultipartUploadCommand, { UploadId, MultipartUpload: { Parts } });
-        return { ETag: result.ETag, VersionId: result.VersionId, sha256: known };
+        return { ETag: result.ETag, VersionId: result.VersionId, sha256: actual };
     } catch (error) {
         await send(AbortMultipartUploadCommand, { UploadId }).catch(() => {});
         throw error;

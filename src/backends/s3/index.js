@@ -102,6 +102,7 @@ export default class S3Backend extends StorageBackend {
     /** A content store is never listed; a scan is no evidence about its keys. */
     listed() { return !this.#cas; }
     get transport() { return 's3'; }
+    get uploadConcurrency() { return 6; }
     get watching() { return Boolean(this.#timer); }
     #safe(key) { return ![...key].some(c => c < ' ' || c === '\\') && !key.split('/').some(s => !s || s === '.' || s === '..'); }
     #key(key) {
@@ -241,9 +242,10 @@ export default class S3Backend extends StorageBackend {
             head = buffer.subarray(0, bytesRead);
         } finally { await handle.close(); }
         const native = (await this.verifyWrites()).sha256;
-        await this.#upload({ Key, file, size, ContentType: await detectMimeFromHead(head, key), sha256, native, IfNoneMatch: '*' });
+        const ContentType = await detectMimeFromHead(head, key);
+        const result = await this.#upload({ Key, file, size, ContentType, sha256, native, IfNoneMatch: '*' });
         this.#hashes.delete(key);
-        return this.stat(key);
+        return this.#accepted(key, size, ContentType, result);
     }
     /** A blob's key ends in its SHA-256, so the same key always holds the same
      * bytes: an object already recorded with that checksum is the upload, and
@@ -256,10 +258,13 @@ export default class S3Backend extends StorageBackend {
         const multipart = size > PART;
         const native = !multipart && await this.#nativeSha256();
         const result = await this.#upload({ Key, file, size, ContentType: 'application/octet-stream', sha256: named, native, multipart });
-        // The endpoint accepted bytes it checked against the checksum sent
-        // with them, so the row is built from its answer without another HEAD.
-        return this.#row(key, { ContentLength: size, LastModified: new Date(), ContentType: 'application/octet-stream',
-            ETag: result.ETag, VersionId: result.VersionId, Metadata: { sha256: named } });
+        return this.#accepted(key, size, 'application/octet-stream', result);
+    }
+    /** The row of an upload the endpoint just accepted. It checked the bytes
+     * against the checksum sent with them, so no HEAD follows. */
+    #accepted(key, size, ContentType, result) {
+        return this.#row(key, { ContentLength: size, LastModified: new Date(), ContentType,
+            ETag: result.ETag, VersionId: result.VersionId, Metadata: { sha256: result.sha256 } });
     }
     /** Write the JSON sidecar of a blob once; an existing one is kept. */
     async writeSidecar(blobKey, document) {
