@@ -14,6 +14,9 @@ const PAGE = 1000;
 // source answers in full, however slowly the reader consumes the file.
 export const READ_WINDOW = 4 * 1024 * 1024;
 const MAX_WAIT_MS = 50_000;
+// Windows asked of the source at one time. Further reads wait here, before
+// their timeout starts, instead of piling up on the machine that holds the files.
+const READ_CONCURRENCY = 4;
 
 function fault(code, message) { return Object.assign(new Error(message), { code }); }
 
@@ -44,6 +47,8 @@ export default class ShareBackend extends StorageBackend {
     #cursor = null;
     #tailing = null;
     #stopped = false;
+    #reading = 0;
+    #readWaiters = [];
 
     constructor(name, config = {}) {
         super(name, config);
@@ -290,7 +295,15 @@ export default class ShareBackend extends StorageBackend {
     async #read(key, start = 0, end = null) {
         const window = async (from) => {
             const last = end != null ? Math.min(end, from + READ_WINDOW - 1) : from + READ_WINDOW - 1;
-            return { bytes: await this.#request('read', { key, start: from, end: last }, { timeout: 120_000 }), asked: last - from + 1 };
+            if (this.#reading < READ_CONCURRENCY) this.#reading += 1;
+            else await new Promise((resolve) => this.#readWaiters.push(resolve));
+            try {
+                return { bytes: await this.#request('read', { key, start: from, end: last }, { timeout: 120_000 }), asked: last - from + 1 };
+            } finally {
+                // The slot goes straight to the next waiting read, if any.
+                const next = this.#readWaiters.shift();
+                if (next) next(); else this.#reading -= 1;
+            }
         };
         let first;
         try { first = await window(start); }

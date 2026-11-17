@@ -50,6 +50,11 @@ export function filesystemIdentity(root) {
  * nothing and the deletions the watcher reports are dropped, so an unmounted
  * drive is never read as "every file was deleted". Emptying a share for real
  * therefore does not empty its catalog; removing the share does.
+ *
+ * Events: `change` (the index moved), `offline` (reason), `error`, and for
+ * whoever reports on a pass over the folder: `walk:start`, `file`
+ * (`{ key, size, scanned }`, every file the pass visits), `progress`
+ * (`{ scanned }`, every 500 files), `walk:done` (`{ count, complete, ms }`).
  */
 export default class ShareSource extends EventEmitter {
     #root;
@@ -175,16 +180,23 @@ export default class ShareSource extends EventEmitter {
                 this.#watchStale = false;
             }
             let seen = 0;
+            const startedAt = Date.now();
+            this.emit('walk:start');
             const result = await this.#stored.scan(BACKEND, {
                 // The drive can go away mid-walk: stop before the walk reports its files gone.
                 isCancelled: () => !this.liveness().ok,
-                onFile: () => { if (++seen % 500 === 0) this.emit('progress', { scanned: seen }); },
+                onFile: (file) => {
+                    seen += 1;
+                    this.emit('file', { key: file?.key, size: file?.size ?? null, scanned: seen });
+                    if (seen % 500 === 0) this.emit('progress', { scanned: seen });
+                },
             });
             const unusable = result.errors?.[BACKEND]?.root;
             if (unusable) { this.emit('offline', unusable); return { ok: false, reason: unusable }; }
             this.#files = result.count;
             this.#walks += 1;
             debug(`Scan of ${this.#root}: ${result.count} files (${result.complete ? 'complete' : 'partial'})`);
+            this.emit('walk:done', { count: result.count, complete: result.complete, ms: Date.now() - startedAt });
             return { ok: true, count: result.count, complete: result.complete };
         })().catch((error) => {
             if (error.code !== 'RESYNC_CANCELLED') this.emit('error', error);
