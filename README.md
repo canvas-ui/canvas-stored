@@ -316,7 +316,7 @@ for (const request of requests) backend.respond(request.id, await source.handle(
 ```
 
 `poll()` hands out queued requests (`list`, `changes`, `shape`, `stat`,
-`read`) and doubles as the heartbeat: a source silent for 60 s, or one that
+`read`, `rescan`) and doubles as the heartbeat: a source silent for 60 s, or one that
 called `leave()`, is offline. `respond()` takes `{ body }`, `{ stream }` (at
 most `READ_WINDOW`, 4 MiB; larger reads are fetched window by window) or
 `{ error, code }`.
@@ -326,7 +326,9 @@ it reports `errors.root` while the source is offline and `complete: false`
 while the source is still hashing for the first time, so neither removes
 anything. With `watch: true` it tails the source's change log between scans
 and emits `file:add` / `file:unlink`, a moved file as a pair with one inode
-(its content digest). `verifyRoot(fsid)` checks the source is online and
+(its content digest). `rescanSource()` asks the source to walk its folder again; every pass
+the source finishes (`walks` in what it reports) raises `backend:state` with
+`rescan: true`, the cue to call `scan()`. `verifyRoot(fsid)` checks the source is online and
 still the filesystem the share was bound to. `nativeUrl(key)` is
 `file://<share>/<key>`.
 

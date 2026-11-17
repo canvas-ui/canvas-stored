@@ -178,3 +178,18 @@ test('a share bound to one filesystem refuses a source on another', async (t) =>
     assert.deepEqual(await backend.poll({ epoch: 'e1', fsid: 'uuid:aaaa', head: 0 }, { wait: 0 }), { requests: [] });
     assert.deepEqual(await backend.verifyRoot(), { ok: true, fsid: { id: 'uuid:aaaa' } });
 });
+
+test('a rescan asked of the backend makes the source walk its folder, and the listing follows', async (t) => {
+    const { folder, source, stored, backend } = await setup(t);
+    await stored.scan('wd1t.home');
+    const states = [];
+    backend.on('backend:state', (state) => states.push(state));
+    // Not watched: only a pass over the folder finds this file.
+    await fs.writeFile(path.join(folder, 'found-by-rescan.txt'), 'new');
+    const walks = source.describe().walks;
+    await backend.rescanSource();
+    await until(() => states.some((state) => state.rescan === true));
+    assert.equal(source.describe().walks, walks + 1);
+    const result = await stored.scan('wd1t.home');
+    assert.ok(result.files.some((file) => file.key === 'found-by-rescan.txt'));
+});

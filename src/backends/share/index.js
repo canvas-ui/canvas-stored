@@ -59,7 +59,7 @@ export default class ShareBackend extends StorageBackend {
     get online() { return !this.#stopped && this.#seenAt > 0 && Date.now() - this.#seenAt < OFFLINE_AFTER_MS; }
     /** Changes arrive on their own while the source is connected. */
     get watching() { return this.config.watch === true && this.online; }
-    /** What the source last said about itself: `{ epoch, fsid, head, scanning, files, device, version, seenAt }`. */
+    /** What the source last said about itself: `{ epoch, fsid, head, scanning, files, walks, device, version, seenAt }`. */
     get source() { return this.#source ? { ...this.#source, seenAt: this.#seenAt, online: this.online } : null; }
     nativeUrl(key) { return `file://${this.config.share || this.name}/${String(key).split('/').map(encodeURIComponent).join('/')}`; }
 
@@ -69,9 +69,10 @@ export default class ShareBackend extends StorageBackend {
 
     /**
      * The source checks in and collects queued requests. `source` is
-     * `{ epoch, fsid?, head, scanning?, files?, device?, version? }`: `epoch`
+     * `{ epoch, fsid?, head, scanning?, files?, walks?, device?, version? }`: `epoch`
      * names the source's index (a new one invalidates the cursor), `fsid` the
-     * filesystem behind the folder, `head` the newest entry of its change log.
+     * filesystem behind the folder, `head` the newest entry of its change log,
+     * `walks` how many passes over the folder it has finished.
      * Resolves with `{ requests }` at once when requests are queued, otherwise
      * after `wait` ms or as soon as one is.
      */
@@ -86,7 +87,7 @@ export default class ShareBackend extends StorageBackend {
         const previous = this.#source;
         this.#source = {
             epoch: String(source.epoch), fsid: source.fsid || null, head: Number(source.head) || 0,
-            scanning: source.scanning === true, files: source.files ?? null,
+            scanning: source.scanning === true, files: source.files ?? null, walks: Number(source.walks) || 0,
             device: source.device || null, version: source.version || null,
         };
         this.#seenAt = Date.now();
@@ -96,9 +97,9 @@ export default class ShareBackend extends StorageBackend {
 
         if (previous && previous.epoch !== this.#source.epoch) this.#cursor = null;
         // A listing is due when nothing is known about the source's log, and
-        // once more when its first hashing pass is over (only then is a
-        // listing complete enough to tell what is gone).
-        const finishedScan = previous?.scanning === true && !this.#source.scanning;
+        // after every pass the source finishes over its folder (only then is
+        // a listing complete enough to tell what is gone).
+        const finishedScan = previous != null && previous.walks !== this.#source.walks;
         if (!wasOnline || this.#cursor == null || finishedScan) {
             if (!wasOnline) debug(`"${this.name}" source online (epoch ${this.#source.epoch}, head ${this.#source.head})`);
             this.emit('backend:state', { backend: this.name, reason: wasOnline ? 'rescan' : 'attached', online: true, rescan: this.#cursor == null || finishedScan });
@@ -201,6 +202,14 @@ export default class ShareBackend extends StorageBackend {
         const bound = expected?.id || this.config.fsid?.id || null;
         if (bound && fsid && fsid.id !== bound) return { ok: false, reason: 'filesystem-changed', fsid };
         return { ok: true, fsid };
+    }
+
+    /**
+     * Ask the source to walk and hash its folder again now. Resolves once the
+     * pass has started; the listing follows by itself when it is done.
+     */
+    async rescanSource() {
+        await this.#request('rescan');
     }
 
     #row(o) {

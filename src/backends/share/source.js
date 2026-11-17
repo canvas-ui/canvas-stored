@@ -60,6 +60,7 @@ export default class ShareSource extends EventEmitter {
     #record = null;
     #scanning = null;
     #files = null;
+    #walks = 0;
     #live = { at: 0, ok: false, reason: null };
     #heldUnlinks = [];
     // Watches do not survive the folder going away; they are set up again when it is back.
@@ -143,12 +144,16 @@ export default class ShareSource extends EventEmitter {
         void this.rescan();
     }
 
-    /** `{ epoch, fsid, head, scanning, files }` for `ShareBackend.poll()`, or null when not live. */
+    /**
+     * `{ epoch, fsid, head, scanning, files, walks }` for `ShareBackend.poll()`, or null
+     * when not live. `walks` counts the finished passes over the folder: a new
+     * value tells the backend to list again.
+     */
     describe() {
         if (!this.#stored || !this.liveness().ok) return null;
         return {
             epoch: this.#record.epoch, fsid: this.#record.fsid, head: this.#stored.index.head(),
-            scanning: this.scanning, files: this.#files,
+            scanning: this.scanning, files: this.#files, walks: this.#walks,
         };
     }
 
@@ -178,6 +183,7 @@ export default class ShareSource extends EventEmitter {
             const unusable = result.errors?.[BACKEND]?.root;
             if (unusable) { this.emit('offline', unusable); return { ok: false, reason: unusable }; }
             this.#files = result.count;
+            this.#walks += 1;
             debug(`Scan of ${this.#root}: ${result.count} files (${result.complete ? 'complete' : 'partial'})`);
             return { ok: true, count: result.count, complete: result.complete };
         })().catch((error) => {
@@ -189,7 +195,8 @@ export default class ShareSource extends EventEmitter {
 
     /**
      * Answer one request of a `ShareBackend`: `{ body }` for list / changes /
-     * shape / stat, `{ stream }` for read. Throws with `code` NOT_FOUND,
+     * shape / stat / rescan, `{ stream }` for read. `rescan` starts a pass over
+     * the folder and answers at once. Throws with `code` NOT_FOUND,
      * OFFLINE or INVALID_REQUEST.
      */
     async handle(request = {}) {
@@ -218,6 +225,7 @@ export default class ShareSource extends EventEmitter {
             });
             return { body: { changes, head: page.head, cursor: page.cursor, cursorTooOld: page.cursorTooOld } };
         }
+        case 'rescan': void this.rescan(); return { body: { scanning: true } };
         case 'shape': return { body: await this.#stored.getBackend(BACKEND).shape() };
         case 'stat': {
             const stat = await this.#stored.getBackend(BACKEND).stat(this.#key(request.key));
