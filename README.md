@@ -292,6 +292,51 @@ other providers/versions still need qualification. See [TODO.md](TODO.md).
 Protocol references: [AWS conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)
 and [SDK checksum behavior](https://docs.aws.amazon.com/sdk-for-javascript/v3/developer-guide/s3-checksums.html).
 
+### Share backend
+
+`driver: 'share'` is a folder on another machine. The machine runs a
+`ShareSource` over the folder (canvas-edge's share unit): it hashes and
+optionally watches the folder into its own Stored index and answers the
+backend's requests. The source dials in, so the backend holds no address and
+no credentials. Whoever hosts the backend carries two calls for it:
+
+```js
+import Stored, { ShareSource } from 'canvas-stored';
+
+// On the machine that has the folder. Nothing is written into it.
+const source = new ShareSource({ root: '/mnt/mywd', stateDir: '/var/lib/canvas/wd1t', watch: true, ignored: ['**/.*'] });
+await source.start();
+
+// Where the catalog lives.
+const backend = stored.addBackend('wd1t.home', { driver: 'share', share: 'wd1t.home', watch: true });
+
+// The transport between them, in a loop on the source's side:
+const { requests } = await backend.poll(source.describe(), { wait: 25000 });
+for (const request of requests) backend.respond(request.id, await source.handle(request));
+```
+
+`poll()` hands out queued requests (`list`, `changes`, `shape`, `stat`,
+`read`) and doubles as the heartbeat: a source silent for 60 s, or one that
+called `leave()`, is offline. `respond()` takes `{ body }`, `{ stream }` (at
+most `READ_WINDOW`, 4 MiB; larger reads are fetched window by window) or
+`{ error, code }`.
+
+The backend is read-only and enumerable. `scan()` lists the source's index;
+it reports `errors.root` while the source is offline and `complete: false`
+while the source is still hashing for the first time, so neither removes
+anything. With `watch: true` it tails the source's change log between scans
+and emits `file:add` / `file:unlink`, a moved file as a pair with one inode
+(its content digest). `verifyRoot(fsid)` checks the source is online and
+still the filesystem the share was bound to. `nativeUrl(key)` is
+`file://<share>/<key>`.
+
+A `ShareSource` records the filesystem it indexed (`filesystemIdentity`: the
+filesystem uuid, or the mount source). When the folder is missing, on another
+filesystem, or empty while the index lists files, it is not live:
+`describe()` is null, `handle()` fails with `OFFLINE`, a scan removes nothing
+and the deletions the watcher reports are dropped. That is what an unplugged
+drive looks like, and it must never read as "every file was deleted".
+
 ### Canvas hub backend
 
 ```js

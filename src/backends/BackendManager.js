@@ -5,6 +5,7 @@ import S3Backend from './s3/index.js';
 import HttpBackend from './http/index.js';
 import GdriveBackend from './gdrive/index.js';
 import CanvasBackend from './canvas/index.js';
+import ShareBackend from './share/index.js';
 
 const debug = Debug('stored:backends');
 
@@ -12,9 +13,10 @@ const debug = Debug('stored:backends');
 // scheme names with no driver yet — register a driver class here (or at
 // runtime via BackendManager.register) when implemented. `gdrive` is the first
 // real remote driver; `canvas` mirrors one backend of a workspace on another
-// canvas-server over the objects protocol (docs/sync-protocol.md). Non-blob connectors (mail/git/…) are NOT stored drivers;
+// canvas-server over the objects protocol (docs/sync-protocol.md); `share` is a
+// folder on another machine whose ShareSource dials in. Non-blob connectors (mail/git/…) are NOT stored drivers;
 // they live in separate workspace services and only use stored to persist blobs.
-const DRIVERS = { file: FileBackend, cacache: CacacheBackend, s3: S3Backend, http: HttpBackend, gdrive: GdriveBackend, canvas: CanvasBackend };
+const DRIVERS = { file: FileBackend, cacache: CacacheBackend, s3: S3Backend, http: HttpBackend, gdrive: GdriveBackend, canvas: CanvasBackend, share: ShareBackend };
 
 export default class BackendManager {
     #backends = new Map();

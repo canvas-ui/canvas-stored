@@ -2760,3 +2760,4 @@ export default class Stored extends EventEmitter2 {
 }
 
 export { Mirror, JobQueue, Ledger, BackendManager, Index };
+export { default as ShareSource, filesystemIdentity } from './backends/share/source.js';

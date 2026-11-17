@@ -54,6 +54,22 @@ driver. Still open, most serious first:
 - A remote unlink is held 1 s for rename pairing while the cursor is already
   persisted; a crash in that window loses the delete until a relist.
 
+## Share driver: open items
+
+- A first pass over a large drive lists nothing until a file is hashed. Add a
+  stat-only listing (size and mtime, no checksum) so the tree fills in at
+  once, and report hashing progress (bytes done of bytes total) in
+  `ShareSource.describe()`.
+- `ShareBackend.scan()` and `Stored.scan()` hold every row of a listing in
+  memory; a share of a few million files needs a streamed absence pass.
+- `filesystemIdentity` is Linux-only (mount table and `/dev/disk/by-uuid`).
+  On macOS and Windows a share is not bound to a filesystem and only the
+  empty-folder check stands between an unmounted drive and its catalog.
+- The watcher on a network mount needs `usePolling`; `ShareSource` does not
+  pass it, so a share of an NFS/CIFS mount only follows rescans.
+- `rw` and `worm`: `put`, `delete` and container operations over the same
+  request queue, refused by the source according to its mode.
+
 ## Storage policies — remaining gaps and deployment limits
 
 The implemented boundary is: Stored owns physical bytes, exact replica
