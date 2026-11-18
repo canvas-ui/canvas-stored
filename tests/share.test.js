@@ -193,3 +193,41 @@ test('a rescan asked of the backend makes the source walk its folder, and the li
     const result = await stored.scan('wd1t.home');
     assert.ok(result.files.some((file) => file.key === 'found-by-rescan.txt'));
 });
+
+test('a source whose poll connection breaks is offline within seconds and the read in flight fails', async (t) => {
+    const keepAlive = setInterval(() => {}, 1000);
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'stored-share-'));
+    const stored = new Stored({ root: dir, replication: { autoStart: false } });
+    t.after(async () => { await stored.stop(); await fs.rm(dir, { recursive: true, force: true }); clearInterval(keepAlive); });
+    const backend = stored.addBackend('nas.home', { driver: 'share' });
+    const connection = new AbortController();
+    // The machine holding the files long-polls, then loses power: nothing answers, nothing says goodbye.
+    const poll = backend.poll({ epoch: 'e1', head: 0 }, { wait: 25000, signal: connection.signal });
+    assert.equal(backend.online, true);
+    const read = backend.get('Music/a.mp3');
+    assert.equal((await poll).requests[0].op, 'read');
+    const started = Date.now();
+    connection.abort();
+    await assert.rejects(read, { code: 'OFFLINE' });
+    assert.ok(Date.now() - started < 5000, `the read hung for ${Date.now() - started} ms`);
+    assert.equal(backend.online, false);
+    await assert.rejects(backend.get('Music/a.mp3'), { code: 'OFFLINE' });
+});
+
+test('a source that stops polling between two polls is offline ten seconds after its last answer', async (t) => {
+    const keepAlive = setInterval(() => {}, 1000);
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'stored-share-'));
+    const stored = new Stored({ root: dir, replication: { autoStart: false } });
+    t.after(async () => { await stored.stop(); await fs.rm(dir, { recursive: true, force: true }); clearInterval(keepAlive); });
+    const backend = stored.addBackend('nas.home', { driver: 'share' });
+    // A zero-wait check-in beside a long poll does not cut the long poll short.
+    const long = backend.poll({ epoch: 'e1', head: 0 }, { wait: 12000 });
+    await backend.poll({ epoch: 'e1', head: 0 }, { wait: 0 });
+    await sleep(10500);
+    assert.equal(backend.online, true, 'the long poll is still waiting');
+    await long;
+    const answered = Date.now();
+    await until(() => !backend.online, 15000);
+    const silence = Date.now() - answered;
+    assert.ok(silence > 9000 && silence < 12000, `offline after ${silence} ms`);
+});

@@ -6,8 +6,12 @@ import StorageBackend from '../StorageBackend.js';
 const debug = Debug('stored:backend:share');
 
 export const SHARE_DEV = 'canvas-share';
-// A source that has not polled for this long is offline.
-const OFFLINE_AFTER_MS = 60_000;
+// A source says how long its poll may wait; it is offline when no next poll
+// has arrived this long after that wait ran out. A machine that is switched
+// off or unplugged is the ordinary case, so requests must fail soon, not hang.
+const POLL_GRACE_MS = 10_000;
+// A poll whose connection broke is followed by another within this time, or the source is gone.
+const DROPPED_POLL_MS = 3_000;
 const REQUEST_TIMEOUT_MS = 30_000;
 const PAGE = 1000;
 // Bytes are fetched in windows of this size: each is one short request the
@@ -43,6 +47,7 @@ export default class ShareBackend extends StorageBackend {
     #waiter = null;
     #source = null;
     #seenAt = 0;
+    #aliveUntil = 0;
     #offlineTimer = null;
     #cursor = null;
     #tailing = null;
@@ -61,7 +66,7 @@ export default class ShareBackend extends StorageBackend {
     }
     get remote() { return true; }
     get transport() { return 'canvas-edge'; }
-    get online() { return !this.#stopped && this.#seenAt > 0 && Date.now() - this.#seenAt < OFFLINE_AFTER_MS; }
+    get online() { return !this.#stopped && Date.now() < this.#aliveUntil; }
     /** Changes arrive on their own while the source is connected. */
     get watching() { return this.config.watch === true && this.online; }
     /** What the source last said about itself: `{ epoch, fsid, head, scanning, files, walks, device, version, seenAt }`. */
@@ -79,9 +84,11 @@ export default class ShareBackend extends StorageBackend {
      * filesystem behind the folder, `head` the newest entry of its change log,
      * `walks` how many passes over the folder it has finished.
      * Resolves with `{ requests }` at once when requests are queued, otherwise
-     * after `wait` ms or as soon as one is.
+     * after `wait` ms or as soon as one is. `signal` aborts when the
+     * connection that carries the poll breaks: unless the source polls again
+     * right away it is offline, without waiting for the silence to say so.
      */
-    async poll(source = {}, { wait = 25_000 } = {}) {
+    async poll(source = {}, { wait = 25_000, signal = null } = {}) {
         if (this.#stopped) throw fault('STOPPED', 'Backend is stopped');
         if (!source.epoch) throw fault('INVALID_SOURCE', 'poll requires source.epoch');
         const expected = this.config.fsid?.id || null;
@@ -95,10 +102,15 @@ export default class ShareBackend extends StorageBackend {
             scanning: source.scanning === true, files: source.files ?? null, walks: Number(source.walks) || 0,
             device: source.device || null, version: source.version || null,
         };
-        this.#seenAt = Date.now();
-        clearTimeout(this.#offlineTimer);
-        this.#offlineTimer = setTimeout(() => this.#wentOffline(), OFFLINE_AFTER_MS);
-        this.#offlineTimer.unref?.();
+        const waiting = Math.min(MAX_WAIT_MS, Math.max(0, Number(wait) || 0));
+        const seenAt = this.#seenAt = Date.now();
+        // A zero-wait check-in beside a long poll in flight does not shorten that poll's deadline.
+        this.#aliveUntil = Math.max(this.#aliveUntil, seenAt + waiting + POLL_GRACE_MS);
+        this.#armOfflineTimer();
+        signal?.addEventListener('abort', () => {
+            const timer = setTimeout(() => { if (this.#seenAt === seenAt) this.leave(); }, DROPPED_POLL_MS);
+            timer.unref?.();
+        }, { once: true });
 
         if (previous && previous.epoch !== this.#source.epoch) this.#cursor = null;
         // A listing is due when nothing is known about the source's log, and
@@ -111,16 +123,25 @@ export default class ShareBackend extends StorageBackend {
         }
         if (this.config.watch === true && this.#cursor != null && this.#source.head > this.#cursor) this.#tail();
 
-        if (this.#queue.length) return { requests: this.#queue.splice(0) };
-        if (!(Number(wait) > 0)) return { requests: [] };
+        if (this.#queue.length) return this.#answered(this.#queue.splice(0));
+        if (!(Number(wait) > 0)) return this.#answered([]);
         // One waiting poll at a time: a newer one releases the older.
         this.#waiter?.([]);
         const requests = await new Promise((resolve) => {
-            const timer = setTimeout(() => { if (this.#waiter === done) this.#waiter = null; resolve([]); }, Math.min(MAX_WAIT_MS, Number(wait)));
+            const timer = setTimeout(() => { if (this.#waiter === done) this.#waiter = null; resolve([]); }, waiting);
             timer.unref?.();
             const done = (list) => { clearTimeout(timer); resolve(list); };
             this.#waiter = done;
         });
+        return this.#answered(requests);
+    }
+
+    // A poll is answered: unless another one is waiting, the next is due within the grace period.
+    #answered(requests) {
+        if (!this.#waiter && this.online) {
+            this.#aliveUntil = Date.now() + POLL_GRACE_MS;
+            this.#armOfflineTimer();
+        }
         return { requests };
     }
 
@@ -157,6 +178,7 @@ export default class ShareBackend extends StorageBackend {
     leave() {
         if (!this.online) return;
         this.#seenAt = 0;
+        this.#aliveUntil = 0;
         clearTimeout(this.#offlineTimer);
         this.#waiter?.([]);
         this.#waiter = null;
@@ -177,6 +199,12 @@ export default class ShareBackend extends StorageBackend {
             this.#queue.push({ id, op, ...args });
             if (this.#waiter) { const deliver = this.#waiter; this.#waiter = null; deliver(this.#queue.splice(0)); }
         });
+    }
+
+    #armOfflineTimer() {
+        clearTimeout(this.#offlineTimer);
+        this.#offlineTimer = setTimeout(() => this.#wentOffline(), Math.max(0, this.#aliveUntil - Date.now()) + 5);
+        this.#offlineTimer.unref?.();
     }
 
     #wentOffline() {

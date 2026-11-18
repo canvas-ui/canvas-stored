@@ -316,8 +316,11 @@ for (const request of requests) backend.respond(request.id, await source.handle(
 ```
 
 `poll()` hands out queued requests (`list`, `changes`, `shape`, `stat`,
-`read`, `rescan`) and doubles as the heartbeat: a source silent for 60 s, or one that
-called `leave()`, is offline. `respond()` takes `{ body }`, `{ stream }` (at
+`read`, `rescan`) and doubles as the heartbeat. A source is offline when it
+called `leave()`, when no next poll arrived within 10 s of the previous one
+being answered, or when the connection of a poll broke (`signal`) and no
+other poll followed within 3 s. Requests in flight fail with `OFFLINE` at
+that moment. `respond()` takes `{ body }`, `{ stream }` (at
 most `READ_WINDOW`, 4 MiB; larger reads are fetched window by window) or
 `{ error, code }`.
 
