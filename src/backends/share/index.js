@@ -241,7 +241,8 @@ export default class ShareBackend extends StorageBackend {
      * Everything the source has indexed. `complete` is false while the source
      * is still hashing its folder for the first time, and `errors.root` is set
      * when it is offline or failed mid-listing; neither may be read as "the
-     * rest is gone".
+     * rest is gone". `errors.pending` says the listing is incomplete only
+     * because the source has not finished its pass: a state, not a failure.
      */
     async scan({ onFile } = {}) {
         const files = [], errors = { root: null, dirs: [], files: [] };
@@ -262,6 +263,7 @@ export default class ShareBackend extends StorageBackend {
             }
         }
         const complete = !errors.root && before?.scanning !== true && this.#source?.epoch === before?.epoch;
+        if (!errors.root && before?.scanning === true) errors.pending = 'source-scanning';
         this.emit('scan:complete', { backend: this.name, count: files.length, complete, errors });
         return { files, complete, errors, fsid: this.#source?.fsid ? { id: this.#source.fsid } : null };
     }
