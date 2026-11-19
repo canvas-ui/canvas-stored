@@ -44,3 +44,10 @@ test('registered drivers declare their own features, unknown drivers fail closed
     assert.equal(backend.capabilities.paths, true);
     assert.equal(getBackendCapabilities({ driver: 'not-registered' }).write, false);
 });
+
+test('S3 declares path support from its storage mode, including read-only instances', () => {
+    for (const readOnly of [false, true]) {
+        assert.equal(getBackendCapabilities({ driver: 's3', mode: 'path', readOnly }).paths, true);
+        assert.equal(getBackendCapabilities({ driver: 's3', mode: 'cas', readOnly }).paths, false);
+    }
+});
