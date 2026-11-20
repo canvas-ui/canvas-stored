@@ -229,6 +229,10 @@ endpoint requires a new backend to preserve existing locations and pending plans
   is refused. A new blob costs one HEAD and one PUT. A CAS backend lists nothing (`canEnumerate`, `paths` and
   `upload` are false, `blobs` is true) and a scan never removes its index
   locations.
+- `usage({ onProgress })` returns `{ bytes, objects }` for every current object
+  under the prefix, in both modes (sidecars included), at one LIST request per
+  1000 objects. Noncurrent versions and unfinished multipart uploads are billed
+  by the provider and are in no object listing, so they are not counted.
 - Each driver instance probes once whether the endpoint checks
   `x-amz-checksum-sha256`: it must refuse a wrong value and report the right
   one back (`verifyWrites()` returns this as `sha256`). If so, an upload sends

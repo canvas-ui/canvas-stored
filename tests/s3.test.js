@@ -27,6 +27,20 @@ test('S3 prefix, Unicode and percent keys round-trip without treating ETags as c
     assert.equal(Buffer.concat(chunks).toString(), '2026');
     for (const key of ['../x', '/x', 'a//b', '.canvas-probe/x']) await assert.rejects(s3.get(key), { code: 'INVALID_KEY' });
 });
+test('S3 usage sums every object under the prefix in both modes, across pages', async t => {
+    for (const mode of ['path', 'cas']) {
+        const client = new FakeS3(), s3 = driver(client, { mode }); t.after(() => s3.stop());
+        const sum = hash('blob');
+        client.add('scope/' + blobKey(sum), 'blob'); client.add('scope/' + blobKey(sum) + '.json', '{}'); client.add('scope/a/b.txt', 'four');
+        client.add('scope-other/hidden', 'hidden');
+        const pages = [];
+        assert.deepEqual(await s3.usage({ onProgress: p => pages.push(p.objects) }), { bytes: 10, objects: 3 });
+        assert.deepEqual(pages, [2, 3]);
+    }
+    const client = new FakeS3(), s3 = driver(client); t.after(() => s3.stop());
+    client.listFailure = true;
+    await assert.rejects(s3.usage());
+});
 test('S3 probes conditional creation, preserves a collision and deletes unless that is turned off', async t => {
     const client = new FakeS3(), s3 = driver(client, { permanentDelete: false }); t.after(() => s3.stop());
     await s3.put('invoice.txt', Buffer.from('invoice'));

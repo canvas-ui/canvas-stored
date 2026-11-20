@@ -309,6 +309,24 @@ export default class S3Backend extends StorageBackend {
             seen.add(token);
         } while (true);
     }
+    /** What the prefix holds in the bucket: every current object under it, in
+     * both modes, including sidecars and keys this driver would not index. One
+     * LIST request per 1000 objects; `onProgress` gets the running totals after
+     * each page. Noncurrent versions and unfinished multipart uploads are
+     * billed by the provider but appear in no object listing. */
+    async usage({ onProgress } = {}) {
+        let bytes = 0, objects = 0, token;
+        const seen = new Set();
+        for (;;) {
+            const result = await this.#send(ListObjectsV2Command, { Prefix: this.#prefix, ContinuationToken: token });
+            for (const item of result.Contents || []) { bytes += Number(item.Size) || 0; objects++; }
+            onProgress?.({ bytes, objects });
+            if (!result.IsTruncated) return { bytes, objects };
+            token = result.NextContinuationToken;
+            if (!token || seen.has(token)) throw fault('INVALID_PAGINATION', 'S3 returned an incomplete listing without a new continuation token');
+            seen.add(token);
+        }
+    }
     async shape() {
         const dirs = new Set(); let files = 0;
         for await (const row of this.list()) {

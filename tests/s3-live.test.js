@@ -40,6 +40,7 @@ test('real S3 server: signed streaming writes, Unicode listing, conflicts, polli
     await s3.createFrom(key, file);
     assert.deepEqual(await s3.get(key), bytes);
     await assert.rejects(s3.put(key, 'collision'), { code: 'EEXIST' });
+    assert.deepEqual(await s3.usage(), { bytes: bytes.length, objects: 1 });
     const scan = await s3.scan(); assert.equal(scan.complete, true);
     assert.equal(scan.files[0].key, key);
     assert.equal(scan.files[0].checksums.sha256, createHash('sha256').update(bytes).digest('hex'));
